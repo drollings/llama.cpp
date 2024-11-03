@@ -1368,6 +1368,7 @@ add_library(ggml
             ../include/ggml.h
             ../include/ggml-alloc.h
             ../include/ggml-backend.h
+            ../include/ggml-cpp.h
             ggml.c
             ggml-alloc.c
             ggml-backend.cpp
@@ -1402,7 +1403,7 @@ list(APPEND GGML_EXTRA_LIBS_PRIVATE Threads::Threads)
 
 find_library(MATH_LIBRARY m)
 if (MATH_LIBRARY)
-    if (NOT WIN32 OR NOT GGML_SYCL)
+    if (NOT WIN32 OR NOT DEFINED ENV{ONEAPI_ROOT})
         list(APPEND GGML_EXTRA_LIBS_PRIVATE m)
     endif()
 endif()
