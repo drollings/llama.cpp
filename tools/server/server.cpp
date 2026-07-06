@@ -91,8 +91,37 @@ int llama_server(int argc, char ** argv) {
         return 1;
     }
 
-    llama_backend_init();
-    llama_numa_init(params.numa);
+    // Pre-apply router detection: if neither a model path nor an HF repo was
+    // given, this is definitely a router. Skip llama_backend_init() so the
+    // CUDA primary context stays uncreated.  Child processes spawned by the
+    // router call llama_backend_init() on their own.
+    // Note: when a preset repo is supplied via -hf-repo, the apply below may
+    // turn it into a router; in that case backend init has already happened,
+    // which is harmless (the router's children run in their own processes).
+    const bool is_router_server_pre = params.model.path.empty()
+                                   && params.model.hf_repo.empty();
+    if (!is_router_server_pre) {
+        // Set an abort callback that prints a structured error message to
+        // stdout before abort() kills the process.  The parent's log thread
+        // (in router mode) reads stdout via a pipe and parses
+        // CMD_CHILD_TO_ROUTER_ERROR to capture the error for /v1/models.
+        // fflush(stdout) is essential: abort() does not flush stdio buffers.
+        ggml_set_abort_callback([](const char * msg) {
+            // Flatten multi-line messages so the fgets parser captures
+            // the full error, not just the first line.
+            char flat[4096];
+            size_t i;
+            for (i = 0; i < sizeof(flat) - 1 && msg[i]; i++) {
+                flat[i] = (msg[i] == '\n') ? ' ' : msg[i];
+            }
+            flat[i] = '\0';
+            fprintf(stdout, "%s%s\n", CMD_CHILD_TO_ROUTER_ERROR, flat);
+            fflush(stdout);
+        });
+
+        llama_backend_init();
+        llama_numa_init(params.numa);
+    }
 
     common_models_handler models_handler;
     try {
@@ -106,11 +135,10 @@ int llama_server(int argc, char ** argv) {
         return 1;
     }
 
-    // router server never loads a model and must not touch the GPU
+    // Final router detection: a preset-repo apply may have cleared
+    // params.model, turning a previously non-router invocation into a router.
     const bool is_router_server = params.model.path.empty()
                                && params.model.hf_repo.empty();
-
-    // skip device enumeration so the CUDA primary context stays uncreated
     common_params_print_info(params, !is_router_server);
 
     if (!is_router_server) {
@@ -209,6 +237,7 @@ int llama_server(int argc, char ** argv) {
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models)); // public endpoint (no API key check)
     ctx_http.get ("/v1/models",                ex_wrapper(routes.get_models)); // public endpoint (no API key check)
+    ctx_http.get ("/v1/memory",                ex_wrapper(routes.get_memory));
     ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
     ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
     ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
