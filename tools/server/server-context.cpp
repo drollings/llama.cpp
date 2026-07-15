@@ -3797,6 +3797,9 @@ public:
                     }
 
                     if (slot.prompt_checkpoint_restored || (!slot.prompt.checkpoints.empty() && near_prompt_end)) {
+                        if (!slot_batched) {
+                            slot_batched = &slot;
+                        }
                         add_ok = false;
                         return;
                     }
