@@ -3657,7 +3657,7 @@ public:
                             continue;
                         }
 
-                        if (ctx_dft && llama_get_ctx_other(ctx_dft.get()) != ctx_tgt) {
+                        if (ctx_dft && llama_get_ctx_other(ctx_dft) != ctx_tgt) {
                             // TODO: in the future, figure out how to infuse target embeddings to the images
                             //       for now, we skip this for simplicity
                             //       maybe we simply need to call `common_speculative_process()` ?
@@ -3739,6 +3739,13 @@ public:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+
+                    // mark this slot as the batch owner as soon as it contributes tokens, so that any
+                    // early return below (e.g. after creating a context checkpoint near the prompt end)
+                    // does not leave the batch non-empty while slot_batched is still null
+                    if (n_tokens_cur > 0 && !slot_batched) {
+                        slot_batched = &slot;
+                    }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
