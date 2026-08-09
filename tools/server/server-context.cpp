@@ -17,6 +17,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "../../src/llama-ext.h" // llama_get_memory_breakdown for the manager memory-reporting API
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -913,6 +915,11 @@ public:
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
 
+    // shared-model mode: weights owned externally (the server_instances manager).
+    // remembered so resize() can rebuild this instance's context from the same
+    // weights without reloading them from disk; not owned, never freed.
+    llama_model * model_shared = nullptr;
+
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
@@ -987,6 +994,28 @@ private:
     std::set<std::string> model_aliases; // additional names for the model
     std::set<std::string> model_tags;    // informational tags
 
+    // set by the manager (server_instances) to wake group-waiting requests; called on
+    // the scheduler thread whenever a slot becomes idle
+    std::function<void(int /* id_slot */)> callback_on_slot_release;
+
+    // cached memory breakdown, fixed at context creation. computed once in load_model
+    // (after ctx_tgt is set), zeroed in destroy(). read/written under mutex_mem so the
+    // HTTP reporting path never touches ctx_tgt (which the scheduler frees on destroy).
+    std::mutex mutex_mem;
+    uint64_t   mem_model = 0, mem_context = 0, mem_compute = 0;
+
+    void update_memory_breakdown() {
+        std::lock_guard<std::mutex> lock(mutex_mem);
+        mem_model = mem_context = mem_compute = 0;
+        if (ctx_tgt != nullptr) {
+            for (const auto & [buft, data] : llama_get_memory_breakdown(ctx_tgt)) {
+                mem_model   += data.model;
+                mem_context += data.context;
+                mem_compute += data.compute;
+            }
+        }
+    }
+
     bool sleeping = false;
 
     int64_t t_last_load_progress_ms = 0;
@@ -1002,6 +1031,11 @@ private:
 
         ctx_tgt = nullptr;
         model_tgt = nullptr;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_mem);
+            mem_model = mem_context = mem_compute = 0;
+        }
 
         mtmd_free(mctx);
         mctx = nullptr;
@@ -1055,11 +1089,20 @@ private:
 
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
-    bool load_model(common_params & params) {
+    bool load_model(common_params & params, llama_model * shared_model = nullptr, bool skip_init = false) {
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
 
+        // remember the borrowed weights so a later resize rebuilds from the same
+        // pointers instead of reloading the file
+        if (shared_model != nullptr) {
+            model_shared = shared_model;
+        }
+        // a resize passes a null pointer but reuses the remembered borrowed weights
+        const bool shared = model_shared != nullptr;
+
+        // resuming from sleep re-runs this with `sleeping` still set; init() may only run once
         const bool is_resume = sleeping;
 
         params_base = params;
@@ -1200,7 +1243,11 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        if (shared) {
+            llama_init = common_init_from_model_params(params_base, model_shared);
+        } else {
+            llama_init = common_init_from_params(params_base);
+        }
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1214,6 +1261,8 @@ private:
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
         }
+
+        update_memory_breakdown();
 
         vocab = llama_model_get_vocab(model_tgt);
 
@@ -1259,7 +1308,7 @@ private:
                 callback_state(SERVER_STATE_LOADING, {{"stage", "mmproj_model"}});
             }
 
-            if (!is_resume) {
+            if (!skip_init && !is_resume) {
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
 
@@ -1371,6 +1420,9 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+                if (callback_on_slot_release) {
+                    callback_on_slot_release(id_slot);
+                }
             };
 
             slot.reset();
@@ -1440,14 +1492,15 @@ private:
         // propagate new defaults back to caller
         params = params_base;
 
-        if (!is_resume) {
+        if (!skip_init && !is_resume) {
             return init();
         }
 
-        if (callback_state) {
+        // resume from sleep / resize skip init() (queue callbacks are registered once);
+        // a resume still reports READY, a resize never does
+        if (is_resume && callback_state) {
             callback_state(SERVER_STATE_READY, {});
         }
-
         return true;
     }
 
@@ -2733,6 +2786,96 @@ private:
                     res->id = task.id;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SLOT_SAVE_COPY:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (!check_slot_no_media(*slot, task.id)) {
+                        break;
+                    }
+                    // atomic in-task idle check: the scheduler is the authority. the
+                    // manager re-verified idleness before posting, but a slot that started
+                    // generating since then gets a retriable error instead of a deferred task,
+                    // so the HTTP thread does not block on a snapshot switch
+                    if (slot->is_processing()) {
+                        send_error(task, "slot is busy, retry the snapshot switch", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+
+                    // bounded GPU->host transfer only; the file write runs on the pool I/O worker
+                    const size_t n_state = llama_state_seq_get_size(ctx_tgt, slot->id);
+                    std::vector<uint8_t> buffer(n_state);
+                    llama_state_seq_get_data(ctx_tgt, buffer.data(), n_state, slot->id);
+
+                    auto res = std::make_unique<server_task_result_slot_copy>();
+                    res->id      = task.id;
+                    res->id_slot = id_slot;
+                    res->buffer  = std::move(buffer);
+                    res->tokens  = slot->prompt.tokens.get_text_tokens();
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_RESTORE_APPLY:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (!check_slot_no_media(*slot, task.id)) {
+                        break;
+                    }
+                    // atomic in-task idle check: same reasoning as SLOT_SAVE_COPY
+                    if (slot->is_processing()) {
+                        send_error(task, "slot is busy, retry the snapshot switch", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+
+                    // bounded host->GPU transfer only; the file read ran on the pool I/O worker
+                    const size_t n_state = llama_state_seq_set_data(ctx_tgt, task.slot_buffer.data(), task.slot_buffer.size(), slot->id);
+                    if (n_state == 0) {
+                        // apply-failure safety: never leave a partially-loaded KV behind.
+                        // the manager drops the slot's snapshot binding when it sees this error.
+                        slot->prompt_clear();
+                        slot->prompt.clear();
+                        send_error(task, "Unable to restore slot: invalid or incompatible snapshot data", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    slot->prompt.clear();
+                    slot->prompt.tokens.insert(task.slot_tokens);
+
+                    auto res = std::make_unique<server_task_result_slot_save_load>();
+                    res->id       = task.id;
+                    res->id_slot  = id_slot;
+                    res->filename = task.slot_action.filename;
+                    res->is_save  = false;
+                    res->n_tokens = task.slot_tokens.size();
+                    res->n_bytes  = n_state;
+                    res->t_ms     = 0;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_INSTANCE_OP:
+                {
+                    // manager-invoked lifecycle op: runs on the scheduler thread, so it is
+                    // serialized with all other tasks and with update_slots(). context
+                    // lifetime changes made by the op can never race the scheduler.
+                    try {
+                        auto res = std::make_unique<server_task_result_instance>();
+                        res->id = task.id;
+                        res->data = task.instance_op();
+                        queue_results.send(std::move(res));
+                    } catch (const std::exception & e) {
+                        auto res = std::make_unique<server_task_result_error>();
+                        res->id       = task.id;
+                        res->err_type = ERROR_TYPE_SERVER;
+                        res->err_msg  = e.what();
+                        queue_results.send(std::move(res));
+                    }
+                } break;
         }
     }
 
@@ -4005,8 +4148,8 @@ private:
 server_context::server_context() : impl(new server_context_impl()) {}
 server_context::~server_context() = default;
 
-bool server_context::load_model(common_params & params) {
-    return impl->load_model(params);
+bool server_context::load_model(common_params & params, llama_model * shared_model) {
+    return impl->load_model(params, shared_model);
 }
 
 void server_context::start_loop() {
@@ -4102,6 +4245,110 @@ void server_context::set_state_callback(server_state_callback_t callback) {
         }
         // for sleeping == false, event is emitted by load_model()
     });
+}
+
+void server_context::set_model_name(const std::string & name) {
+    impl->model_name = name;
+}
+
+void server_context::set_model_aliases(const std::set<std::string> & aliases) {
+    impl->model_aliases = aliases;
+}
+
+std::vector<server_slot_info> server_context::get_slot_info() const {
+    std::vector<server_slot_info> out;
+    const auto & slots = impl->slots;
+    out.reserve(slots.size());
+    for (const auto & slot : slots) {
+        out.push_back({ slot.id, !slot.is_processing(), slot.t_last_used });
+    }
+    return out;
+}
+
+void server_context::set_slot_release_callback(std::function<void(int)> callback) {
+    impl->callback_on_slot_release = std::move(callback);
+}
+
+server_task_result_ptr server_context::run_scheduler_task(server_task && task, const std::function<bool()> & should_stop) {
+    // no-op when the queue is not sleeping, which is always the case in this branch
+    impl->queue_tasks.wait_until_no_sleep();
+    server_response_reader rd = impl->get_response_reader();
+    task.id                  = rd.get_new_id();
+    rd.post_task(std::move(task));
+    return rd.next(should_stop);
+}
+
+server_task_result_ptr server_context::slot_save_copy(int id_slot, int64_t deadline_ms) {
+    server_task task(SERVER_TASK_TYPE_SLOT_SAVE_COPY);
+    task.slot_action.id_slot = id_slot;
+    task.id_slot = id_slot; // lets pop_deferred_task match the task to the freed slot
+
+    // the compose deadline is passed by the manager; -1 waits forever
+    return run_scheduler_task(std::move(task), [deadline_ms]() {
+        return deadline_ms >= 0 && ggml_time_ms() >= deadline_ms;
+    });
+}
+
+server_task_result_ptr server_context::slot_restore_apply(int id_slot, std::vector<uint8_t> buffer, llama_tokens tokens, int64_t deadline_ms) {
+    server_task task(SERVER_TASK_TYPE_SLOT_RESTORE_APPLY);
+    task.slot_action.id_slot = id_slot;
+    task.id_slot = id_slot;
+    task.slot_buffer = std::move(buffer);
+    task.slot_tokens = std::move(tokens);
+
+    return run_scheduler_task(std::move(task), [deadline_ms]() {
+        return deadline_ms >= 0 && ggml_time_ms() >= deadline_ms;
+    });
+}
+
+server_task_result_ptr server_context::instance_op(const std::function<json()> & op) {
+    server_task task(SERVER_TASK_TYPE_INSTANCE_OP);
+    task.instance_op = op;
+
+    return run_scheduler_task(std::move(task), [] { return false; });
+}
+
+server_task_result_ptr server_context::abort_slots(const std::string & reason) {
+    return instance_op([this, reason]() {
+        impl->abort_all_slots(reason);
+        return json{{ "success", true }};
+    });
+}
+
+server_task_result_ptr server_context::resize(int32_t new_ctx) {
+    return instance_op([this, new_ctx]() {
+        // abort anything still running, then rebuild the context at the new size.
+        // skip_init skips init() (so the queue callbacks registered on the first load are
+        // not registered twice) without touching `sleeping` and without emitting READY.
+        impl->abort_all_slots("instance resized");
+        impl->params_base.n_ctx = new_ctx;
+        // destroy() nulls model_tgt; model_shared survives and carries the borrowed
+        // weights across the rebuild (no reload from disk)
+        impl->destroy();
+        if (!impl->load_model(impl->params_base, impl->model_shared, true)) {
+            throw std::runtime_error("failed to rebuild the instance context");
+        }
+        return json{{ "success", true }, { "n_ctx", llama_n_ctx(impl->ctx_tgt) }};
+    });
+}
+
+int server_context::get_slot_n_ctx() const {
+    return impl->get_slot_n_ctx();
+}
+
+size_t server_context::get_model_bytes() const {
+    std::lock_guard<std::mutex> lock(impl->mutex_mem);
+    return impl->mem_model;
+}
+
+size_t server_context::get_context_bytes() const {
+    std::lock_guard<std::mutex> lock(impl->mutex_mem);
+    return impl->mem_context;
+}
+
+size_t server_context::get_compute_bytes() const {
+    std::lock_guard<std::mutex> lock(impl->mutex_mem);
+    return impl->mem_compute;
 }
 
 //

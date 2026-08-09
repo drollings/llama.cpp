@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <functional>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -25,8 +26,11 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_SLOT_SAVE_COPY,     // two-phase snapshot: copy slot KV to a host buffer
+    SERVER_TASK_TYPE_SLOT_RESTORE_APPLY, // two-phase snapshot: apply a host KV buffer to a slot
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_INSTANCE_OP, // manager-invoked lifecycle op, runs on the scheduler thread
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -174,6 +178,16 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_SLOT_RESTORE_APPLY: the host KV buffer and the prompt tokens
+    // it was copied from (read from disk by the manager's pool I/O worker, never the scheduler)
+    std::vector<uint8_t> slot_buffer;
+    llama_tokens         slot_tokens;
+
+    // used by SERVER_TASK_TYPE_INSTANCE_OP
+    // runs on the scheduler thread; returns the JSON result payload (throws with a message
+    // to signal an error). keeps context lifetime changes serialized with the scheduler.
+    std::function<json()> instance_op;
 
     server_task() = default;
 
@@ -555,6 +569,21 @@ struct server_task_result_slot_save_load : server_task_result {
     virtual json to_json() override;
 };
 
+// result of SERVER_TASK_TYPE_SLOT_SAVE_COPY: the slot KV copied to a host buffer plus the
+// prompt tokens matching that state. the manager writes this to disk on its pool I/O worker.
+struct server_task_result_slot_copy : server_task_result {
+    std::vector<uint8_t> buffer;
+    llama_tokens         tokens;
+
+    virtual json to_json() override {
+        return json {
+            { "id_slot",  id_slot },
+            { "n_tokens", tokens.size() },
+            { "n_bytes",  buffer.size() },
+        };
+    }
+};
+
 struct server_task_result_slot_erase : server_task_result {
     size_t n_erased;
 
@@ -667,4 +696,10 @@ struct server_task_result_router : server_task_result {
     virtual server_task_result * clone() const override {
         return new server_task_result_router(*this);
     }
+};
+
+// used by SERVER_TASK_TYPE_INSTANCE_OP
+struct server_task_result_instance : server_task_result {
+    json data;
+    virtual json to_json() override { return data; }
 };
