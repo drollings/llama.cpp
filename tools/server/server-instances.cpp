@@ -247,7 +247,9 @@ std::optional<size_t> server_instances::pick_best_available(const std::string & 
     // caller must hold mutex_dispatch
     for (size_t i = 0; i < instances.size(); ++i) {
         const server_instance & inst = *instances[i];
-        if (inst.cfg.group != group || inst.removing) {
+        // removing = a management op owns the instance; running = false once a destroy or
+        // a pool-wide shutdown has begun, so a group waiter never picks a dying instance
+        if (inst.cfg.group != group || inst.removing || !inst.running) {
             continue;
         }
 
@@ -523,13 +525,19 @@ server_instances::server_snapshot_read_result server_instances::snapshot_io_read
     auto future = snapshot_io_post([result, path]() {
         *result = server_snapshot_read_status(path);
     });
+    if (!future) {
+        // the I/O queue is full (hard-bound on queued host memory); a retriable 503
+        server_snapshot_read_result busy;
+        busy.busy = true;
+        return busy;
+    }
     const int64_t remain = deadline_ms - ggml_time_ms();
-    if (remain <= 0 || future.wait_for(std::chrono::milliseconds(remain)) != std::future_status::ready) {
+    if (remain <= 0 || future->wait_for(std::chrono::milliseconds(remain)) != std::future_status::ready) {
         server_snapshot_read_result timed_out;
         timed_out.timed_out = true;
         return timed_out;
     }
-    future.get();
+    future->get();
     server_snapshot_read_result done;
     done.status = (*result)->status;
     done.data   = std::move((*result)->data);
@@ -546,15 +554,22 @@ server_instances::server_snapshot_write_result server_instances::snapshot_io_wri
             IST_WRN("failed to write snapshot '%s'\n", path.c_str());
         }
     });
+    if (!future) {
+        // the I/O queue is full; the slot must not be bound to a snapshot whose file was
+        // never written
+        server_snapshot_write_result busy;
+        busy.busy = true;
+        return busy;
+    }
     const int64_t remain = deadline_ms - ggml_time_ms();
-    if (remain <= 0 || future.wait_for(std::chrono::milliseconds(remain)) != std::future_status::ready) {
+    if (remain <= 0 || future->wait_for(std::chrono::milliseconds(remain)) != std::future_status::ready) {
         // timed out: the write still completes in the background on the pool I/O worker;
         // the caller must not bind the slot to this snapshot, it may not exist on disk yet
         server_snapshot_write_result timed_out;
         timed_out.timed_out = true;
         return timed_out;
     }
-    future.get();
+    future->get();
     server_snapshot_write_result done;
     done.ok = *result;
     return done;
@@ -624,6 +639,9 @@ server_http_res_ptr server_instances::apply_snapshot(server_instance &   inst,
         // conversation that happened while it was bound. on failure the switch is aborted
         // and the slot keeps its live KV bound to `current`.
         auto write = snapshot_io_write(cur_path, std::move(data), deadline_ms);
+        if (write.busy) {
+            return make_error("snapshot io worker is busy, retry", ERROR_TYPE_UNAVAILABLE);
+        }
         if (write.timed_out) {
             return make_error("snapshot switch timed out while saving", ERROR_TYPE_UNAVAILABLE);
         }
@@ -635,6 +653,9 @@ server_http_res_ptr server_instances::apply_snapshot(server_instance &   inst,
     // 5. MISSING (404) vs CORRUPT (400) is decided by the snapshot module, not an
     //    HTTP-thread existence check (no TOCTOU with a concurrent fire-and-forget write).
     auto read = snapshot_io_read(filepath, deadline_ms);
+    if (read.busy) {
+        return make_error("snapshot io worker is busy, retry", ERROR_TYPE_UNAVAILABLE);
+    }
     if (read.timed_out) {
         return make_error("snapshot read timed out", ERROR_TYPE_UNAVAILABLE);
     }
@@ -829,6 +850,11 @@ std::shared_ptr<server_instance> server_instances::build_instance(const common_i
         IST_INF("instance '%s' inherits the model's default context size\n", cfg.name.c_str());
     }
 
+    // shared ownership of the pool's weights: the context borrows `model`, so this copy
+    // guarantees the model outlives the context (and any transient shared_ptr reference
+    // to this instance held by an aggregate handler) even after the pool frees its copy
+    inst->model_owner = model_init;
+
     // allocate only this instance's KV + compute buffers from the already-loaded weights
     inst->ctx_server = std::make_unique<server_context>();
     if (!inst->ctx_server->load_model(inst->effective, model)) {
@@ -853,18 +879,12 @@ std::shared_ptr<server_instance> server_instances::build_instance(const common_i
 }
 
 server_http_res_ptr server_instances::create_instance(const common_instance & cfg) {
-    // reload the shared weights first when the pool went cold (last instance destroyed)
-    if (model == nullptr) {
-        common_params model_params = params;
-        model_init                 = common_init_from_params(model_params, true);
-        model                      = model_init ? model_init->model() : nullptr;
-        if (model == nullptr) {
-            IST_ERR("failed to reload model weights '%s'\n", params.model.path.c_str());
-            return make_error(507, "insufficient_memory_error", "failed to reload shared weights");
-        }
-        IST_INF("reloaded shared model weights '%s'\n", params.model.path.c_str());
-    }
+    // management ops serialize on mutex_mgmt, so the duplicate check below stays
+    // authoritative through the push at the bottom (no concurrent create/destroy can
+    // interleave) and the weight reload never races a last-instance unload
+    std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
 
+    // reject duplicates before any expensive weight reload
     {
         std::lock_guard<std::mutex> lock(mutex_dispatch);
         for (const auto & inst : instances) {
@@ -878,6 +898,18 @@ server_http_res_ptr server_instances::create_instance(const common_instance & cf
         }
     }
 
+    // reload the shared weights first when the pool went cold (last instance destroyed)
+    if (model == nullptr) {
+        common_params model_params = params;
+        model_init                 = common_init_from_params(model_params, true);
+        model                      = model_init ? model_init->model() : nullptr;
+        if (model == nullptr) {
+            IST_ERR("failed to reload model weights '%s'\n", params.model.path.c_str());
+            return make_error(507, "insufficient_memory_error", "failed to reload shared weights");
+        }
+        IST_INF("reloaded shared model weights '%s'\n", params.model.path.c_str());
+    }
+
     auto inst = build_instance(cfg);
     if (!inst) {
         IST_ERR("failed to allocate instance '%s', shared model stays loaded\n", cfg.name.c_str());
@@ -888,19 +920,35 @@ server_http_res_ptr server_instances::create_instance(const common_instance & cf
     IST_INF("creating instance '%s' (group '%s', ctx = %d, parallel = %d)\n", cfg.name.c_str(), cfg.group.c_str(),
             inst->effective.n_ctx, inst->effective.n_parallel);
 
+    // start the scheduler BEFORE registering the instance: a terminate() that runs
+    // after the push (but before the thread was created) would otherwise leak an
+    // un-joined thread. the terminated check under the same lock closes that race.
+    inst->loop_thread = std::thread([inst]() { inst->ctx_server->start_loop(); });
+
     {
         std::lock_guard<std::mutex> lock(mutex_dispatch);
+        if (terminated) {
+            // the server is shutting down mid-create: stop the scheduler we just started
+            // and join it so nothing is left joinable when the pool is destroyed
+            inst->ctx_server->terminate();
+            if (inst->loop_thread.joinable()) {
+                inst->loop_thread.join();
+            }
+            return make_error(503, "unavailable_error", "server is shutting down");
+        }
         instances.push_back(inst);
         cond_dispatch.notify_all();  // wake group waiters so the new member can be picked
     }
-
-    inst->loop_thread = std::thread([inst]() { inst->ctx_server->start_loop(); });
 
     IST_INF("instance '%s' created at runtime\n", cfg.name.c_str());
     return make_ok(instance_to_json(*inst), 201);
 }
 
 server_http_res_ptr server_instances::destroy_instance(const std::string & name, bool) {
+    // serialized with the other management ops so this can never race a resize or a
+    // concurrent create/destroy of the same (or any) instance
+    std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
+
     // pinned is advisory in this branch; the force flag is accepted and ignored
     std::shared_ptr<server_instance> inst;
     {
@@ -936,6 +984,13 @@ server_http_res_ptr server_instances::destroy_instance(const std::string & name,
         }
     }
 
+    // release this manager reference now; the weights are NOT freed here if any other
+    // reference is still alive. each instance holds a shared copy of the pool model
+    // (model_owner) that outlives its context, so the model is freed only when the last
+    // reference -- including a transient shared_ptr held by an in-flight aggregate
+    // handler -- actually drops, never while a context can still dereference it.
+    inst.reset();
+
     // delete-last: no live instances remain, so free the shared weights
     bool last_instance;
     {
@@ -958,6 +1013,10 @@ server_http_res_ptr server_instances::resize_instance(const std::string & name, 
     if (new_ctx <= 0) {
         return make_error("ctx_size must be positive", ERROR_TYPE_INVALID_REQUEST);
     }
+
+    // serialized with the other management ops: a resize and a destroy of the same
+    // instance can no longer race (destroy must never stop the queue under resize)
+    std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
 
     std::shared_ptr<server_instance> inst;
     {
@@ -998,6 +1057,7 @@ server_http_res_ptr server_instances::resize_instance(const std::string & name, 
 }
 
 server_http_res_ptr server_instances::set_instance_pinned(const std::string & name, bool pinned) {
+    std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
     std::shared_ptr<server_instance> inst;
     {
         std::lock_guard<std::mutex> lock(mutex_dispatch);
@@ -1403,6 +1463,10 @@ server_http_res_ptr server_instances::handle_delete_instance(const server_http_r
 
 server_http_res_ptr server_instances::handle_post_instance_snapshot(const server_http_req & req) {
     // POST /instances/:name/snapshot  body { "name": "<snapshot>" }
+    // serialized with resize/destroy so the slot-save task on the scheduler never races a
+    // context rebuild that destroys the very context it is copying from
+    std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
+
     const std::string name = req.get_param("name");
     json              body;
     try {
@@ -1458,6 +1522,9 @@ server_http_res_ptr server_instances::handle_post_instance_snapshot(const server
         // await the write so a failed save never binds the slot to a file that does not
         // exist on disk (the slot KV is unchanged either way)
         auto write = snapshot_io_write(filepath, std::move(data), deadline_ms);
+        if (write.busy) {
+            return make_error("snapshot io worker is busy, retry", ERROR_TYPE_UNAVAILABLE);
+        }
         if (write.timed_out) {
             return make_error("snapshot save timed out", ERROR_TYPE_UNAVAILABLE);
         }
@@ -1489,6 +1556,10 @@ server_http_res_ptr server_instances::handle_get_instance_snapshots(const server
 }
 
 server_http_res_ptr server_instances::handle_delete_instance_snapshot(const server_http_req & req) {
+    // serialized with resize so a binding cleanup can never race a context rebuild that
+    // re-allocates the slot-snapshot bookkeeping
+    std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
+
     const std::string name     = req.get_param("name");
     const std::string snapshot = req.get_param("snapshot");
     if (!fs_validate_filename(snapshot)) {
@@ -1538,11 +1609,39 @@ void server_instances::start_loops() {
     start_io_worker();
 }
 
+server_instances::~server_instances() {
+    // last-resort shutdown on any exit path (e.g. an exception after start_loops): joins
+    // every scheduler thread so no joinable thread survives pool destruction (a joinable
+    // std::thread destructor would std::terminate the process). a no-op after a normal
+    // terminate(), which the flag below makes one-shot.
+    terminate();
+}
+
 void server_instances::terminate() {
-    for (auto & inst : instances) {
+    // one-shot: the signal handler, the main path, and the destructor may each call
+    // terminate(); only the first call tears anything down. runs under mutex_dispatch so
+    // no concurrent create_instance can slip a new instance past the teardown.
+    std::vector<std::shared_ptr<server_instance>> live;
+    {
+        std::lock_guard<std::mutex> lock(mutex_dispatch);
+        if (terminated) {
+            return;
+        }
+        terminated = true;
+        // reject any dispatch that arrives during teardown (group waiters re-pick and
+        // find nothing)
+        for (const auto & inst : instances) {
+            inst->running = false;
+        }
+        cond_dispatch.notify_all();
+        // snapshot so teardown never iterates a vector that a management op may mutate
+        live = instances;
+    }
+
+    for (const auto & inst : live) {
         inst->ctx_server->terminate();
     }
-    for (auto & inst : instances) {
+    for (const auto & inst : live) {
         if (inst->loop_thread.joinable()) {
             inst->loop_thread.join();
         }
@@ -1569,11 +1668,16 @@ void server_instances::io_loop() {
     }
 }
 
-std::future<void> server_instances::snapshot_io_post(std::function<void()> && fn) {
+std::optional<std::future<void>> server_instances::snapshot_io_post(std::function<void()> && fn) {
     std::packaged_task<void()> task(std::move(fn));
     auto                       future = task.get_future();
     {
         std::lock_guard<std::mutex> lock(mutex_io);
+        // hard bound on queued jobs: each queued write holds a full KV host buffer, so a
+        // full queue rejects with a retriable error instead of accumulating host memory
+        if (io_jobs.size() >= max_io_jobs) {
+            return std::nullopt;
+        }
         io_jobs.push_back(std::move(task));
     }
     cond_io.notify_one();

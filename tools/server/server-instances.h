@@ -24,6 +24,11 @@
 struct server_instance {
     common_instance                 cfg;
     common_params                   effective;
+    // shared ownership of the pool's weights: the context borrows the raw model, so this
+    // copy keeps the model alive until the instance (and its context) is gone. declared
+    // before ctx_server so it is destroyed AFTER the context, guaranteeing the model
+    // outlives every context that references it even when the pool is freed early.
+    std::shared_ptr<common_init_result> model_owner;
     std::unique_ptr<server_context> ctx_server;
     std::unique_ptr<server_routes>  routes;
 
@@ -54,9 +59,12 @@ struct server_instance {
 // owns the shared weights, resolves requests by model id, routes them to the
 // owning instance, and exposes the instance management API.
 struct server_instances {
-    // shared weights, loaded exactly once (model_only mode); the instances borrow it
-    common_init_result_ptr model_init = nullptr;
-    llama_model *          model      = nullptr;
+    // shared weights, loaded exactly once (model_only mode). shared_ptr so every
+    // instance holds a copy (server_instance::model_owner); the weights are freed only
+    // when the pool and every instance have released their copy, so a context that still
+    // references the model can never outlive it.
+    std::shared_ptr<common_init_result> model_init = nullptr;
+    llama_model *                       model      = nullptr;
 
     common_params params;  // base params (global defaults + instances config)
 
@@ -67,9 +75,18 @@ struct server_instances {
     // this pool's identity, parsed from the first alias (or the model name)
     std::string base_name;
 
-    // dispatch mutex: guards slot_snapshots and group waits
+    // dispatch mutex: guards slot_snapshots, the instances vector, and group waits
     mutable std::mutex      mutex_dispatch;
     std::condition_variable cond_dispatch;
+
+    // management mutex: serializes create/destroy/resize/pin/snapshot ops so two
+    // management calls can never race on the same instance (e.g. destroy + resize).
+    // dispatches never take this mutex; a management op holds it for its whole body
+    // and takes mutex_dispatch underneath. set once when the server shuts down.
+    std::mutex mutex_mgmt;
+
+    // one-shot teardown flag, guarded by mutex_dispatch (see terminate())
+    bool terminated = false;
 
     // load the shared model once and build one context per configured instance.
     // with no instances configured, a single default instance is created so the
@@ -132,6 +149,8 @@ struct server_instances {
     server_http_res_ptr handle_get_lora_adapters(const server_http_req & req);
     server_http_res_ptr handle_post_lora_adapters(const server_http_req & req);
 
+    ~server_instances();  // safe shutdown on any exit path: joins every scheduler thread
+
     void start_loops();
     void terminate();
 
@@ -154,26 +173,33 @@ struct server_instances {
     // --- two-phase snapshot compose ---
     // KV-size-scaled compose deadline: 1s floor + 1s per 64k context
     int64_t snapshot_deadline_ms(const server_instance & inst);
-    // deadline-bounded file read on the pool I/O worker. timed_out distinguishes a
-    // read that did not finish in time (503) from one that completed and classified the
+    // deadline-bounded file read on the pool I/O worker. busy = the I/O job queue was
+    // full (a retriable 503, not a timeout); timed_out distinguishes a read that did not
+    // finish in time (503) from one that completed and classified the
     // file (MISSING -> 404, CORRUPT -> 400, OK with data).
     struct server_snapshot_read_result {
+        bool                                busy      = false;
         bool                                timed_out = false;
         server_snapshot_status              status    = server_snapshot_status::MISSING;
         std::optional<server_snapshot_data> data;
     };
     server_snapshot_read_result snapshot_io_read(const std::string & path, int64_t deadline_ms);
-    // deadline-bounded snapshot file write on the pool I/O worker. timed_out
-    // distinguishes a write that did not finish in time (the write still completes in
-    // the background) from one that completed and failed or succeeded. bindings are
-    // only updated after a successful write, so a failure never leaves a slot bound to
-    // a file whose content does not match the slot's KV.
+    // deadline-bounded snapshot file write on the pool I/O worker. busy = the I/O job
+    // queue was full; timed_out distinguishes a write that did not finish in time (the
+    // write still completes in the background) from one that completed and failed or
+    // succeeded. bindings are only updated after a successful write, so a failure never
+    // leaves a slot bound to a file whose content does not match the slot's KV.
     struct server_snapshot_write_result {
+        bool busy      = false;
         bool timed_out = false;
         bool ok        = false;
     };
     server_snapshot_write_result snapshot_io_write(const std::string & path, server_snapshot_data data, int64_t deadline_ms);
-    std::future<void>           snapshot_io_post(std::function<void()> && fn);
+    // post a job to the single FIFO pool I/O worker. the queue is hard-bounded by
+    // max_io_jobs (a queued write holds a full KV host buffer); returns nullopt when the
+    // queue is full so a caller can reject with a retriable error instead of accumulating
+    // unbounded host memory.
+    std::optional<std::future<void>> snapshot_io_post(std::function<void()> && fn);
     // RAII switch-semaphore guard; acquisition bounded by the compose deadline
     struct switch_guard {
         server_instances & mgr;
@@ -229,9 +255,14 @@ struct server_instances {
     void                                   stop_io_worker();
     std::mutex                             mutex_io;
     std::condition_variable                cond_io;
-    std::deque<std::packaged_task<void()>> io_jobs;  // bounded by the switch semaphore
+    // hard-bounded job queue: each queued snapshot write holds a full KV host buffer, so
+    // the queue is capped at max_io_jobs (rejects with a retriable 503 when full) instead
+    // of accumulating unbounded host memory under slow-disk churn. 4 = two concurrent
+    // switches (max_concurrent_switches) times one job in flight each, plus headroom.
+    std::deque<std::packaged_task<void()>> io_jobs;
     std::thread                            io_thread;
     bool                                   io_stop = false;
+    static constexpr size_t                max_io_jobs = 4;
 
     // per-pool cap on concurrent snapshot switches: bounds peak host-buffer memory
     std::mutex              mutex_switch;
