@@ -55,6 +55,34 @@ struct instance_drain_guard {
     }
 };
 
+// RAII count of a direct route call on an instance (aggregate / management handlers
+// that address an instance without going through dispatch()). destroy/resize drain on
+// n_active_dispatch, so the guard keeps the scheduler alive until the route call
+// finishes. the check-and-increment is atomic with the `running` flip in destroy, so a
+// stale shared_ptr is rejected (acquired == false) instead of posting to a dead queue.
+struct active_route_guard {
+    server_instances & mgr;
+    server_instance &  inst;
+    bool               acquired = false;
+
+    active_route_guard(server_instances & m, server_instance & i) : mgr(m), inst(i) {
+        std::lock_guard<std::mutex> lock(mgr.mutex_dispatch);
+        if (inst.removing || !inst.running) {
+            return;
+        }
+        inst.n_active_dispatch++;
+        acquired = true;
+    }
+
+    ~active_route_guard() {
+        if (acquired) {
+            std::lock_guard<std::mutex> lock(mgr.mutex_dispatch);
+            inst.n_active_dispatch--;
+            mgr.cond_dispatch.notify_all();
+        }
+    }
+};
+
 bool server_instances::load(const common_params & params) {
     this->params = params;
 
@@ -327,6 +355,12 @@ server_http_res_ptr server_instances::dispatch_instance(const server_http_req & 
     {
         std::lock_guard<std::mutex> lock(mutex_dispatch);
         inst->n_active_dispatch++;
+        // check under the same lock that increments the count, so a destroy that starts
+        // after this point must drain this dispatch before stopping the scheduler
+        if (inst->removing || !inst->running) {
+            inst->n_active_dispatch--;
+            return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
+        }
     }
 
     const auto release_dispatch = [this, &inst]() {
@@ -334,11 +368,6 @@ server_http_res_ptr server_instances::dispatch_instance(const server_http_req & 
         inst->n_active_dispatch--;
         cond_dispatch.notify_all();
     };
-
-    if (inst->removing) {
-        release_dispatch();
-        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
-    }
 
     server_http_res_ptr err;
     if (!snapshot.empty()) {
@@ -397,6 +426,13 @@ server_http_res_ptr server_instances::dispatch_group(const server_http_req & req
             if (best) {
                 inst = instances[*best];
                 inst->n_active_dispatch++;
+                // the removing/running check stays under the same lock as the count, so a
+                // destroy that begins after this point must drain this dispatch first
+                if (inst->removing || !inst->running) {
+                    inst->n_active_dispatch--;
+                    cond_dispatch.notify_all();
+                    inst.reset();  // re-pick
+                }
             }
         }
 
@@ -406,10 +442,6 @@ server_http_res_ptr server_instances::dispatch_group(const server_http_req & req
                 inst->n_active_dispatch--;
                 cond_dispatch.notify_all();
             };
-            if (inst->removing) {
-                release_dispatch();
-                continue;  // re-pick
-            }
 
             server_http_res_ptr err;
             if (!snapshot.empty()) {
@@ -504,15 +536,28 @@ server_instances::server_snapshot_read_result server_instances::snapshot_io_read
     return done;
 }
 
-std::future<void> server_instances::snapshot_io_write(const std::string & path, server_snapshot_data data) {
-    // fire-and-forget by default: a late write is harmless (the binding is not updated on
-    // abort). the single FIFO pool I/O worker serializes all writes, so a caller that
-    // needs the future can await completion without worrying about a concurrent write.
-    return snapshot_io_post([path, data = std::move(data)]() {
-        if (!server_snapshot_write(path, data)) {
+server_instances::server_snapshot_write_result server_instances::snapshot_io_write(const std::string & path,
+                                                                                    server_snapshot_data data,
+                                                                                    int64_t             deadline_ms) {
+    auto result = std::make_shared<bool>(false);
+    auto future = snapshot_io_post([result, path, data = std::move(data)]() {
+        *result = server_snapshot_write(path, data);
+        if (!*result) {
             IST_WRN("failed to write snapshot '%s'\n", path.c_str());
         }
     });
+    const int64_t remain = deadline_ms - ggml_time_ms();
+    if (remain <= 0 || future.wait_for(std::chrono::milliseconds(remain)) != std::future_status::ready) {
+        // timed out: the write still completes in the background on the pool I/O worker;
+        // the caller must not bind the slot to this snapshot, it may not exist on disk yet
+        server_snapshot_write_result timed_out;
+        timed_out.timed_out = true;
+        return timed_out;
+    }
+    future.get();
+    server_snapshot_write_result done;
+    done.ok = *result;
+    return done;
 }
 
 server_http_res_ptr server_instances::apply_snapshot(server_instance &   inst,
@@ -574,7 +619,17 @@ server_http_res_ptr server_instances::apply_snapshot(server_instance &   inst,
         data.tokens    = copy->tokens;
         data.kv        = std::move(copy->buffer);
         const std::string cur_path = params.slot_save_path + model_key + "/" + current + ".bin";
-        snapshot_io_write(cur_path, std::move(data));
+        // await the save-back: the old snapshot file must match the slot's KV before we
+        // switch away, otherwise a later restore of `current` silently loses the
+        // conversation that happened while it was bound. on failure the switch is aborted
+        // and the slot keeps its live KV bound to `current`.
+        auto write = snapshot_io_write(cur_path, std::move(data), deadline_ms);
+        if (write.timed_out) {
+            return make_error("snapshot switch timed out while saving", ERROR_TYPE_UNAVAILABLE);
+        }
+        if (!write.ok) {
+            return make_error("failed to save snapshot '" + current + "' to disk", ERROR_TYPE_SERVER);
+        }
     }
 
     // 5. MISSING (404) vs CORRUPT (400) is decided by the snapshot module, not an
@@ -856,6 +911,10 @@ server_http_res_ptr server_instances::destroy_instance(const std::string & name,
             }
             inst = *it;
             instances.erase(it);
+            // flip running under the same lock as the erase: any dispatch that incremented
+            // before this point is drained by the guard below, any dispatch that checks
+            // after sees running == false and never posts to the about-to-stop scheduler
+            inst->running = false;
             cond_dispatch.notify_all();  // a group waiter must re-pick without this member
             break;
         }
@@ -977,6 +1036,10 @@ server_http_res_ptr server_instances::handle_get_health(const server_http_req & 
         });
     }
     // every remaining instance is loaded by construction; a destroyed instance is removed
+    active_route_guard guard(*this, *inst);
+    if (!guard.acquired) {
+        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
+    }
     return inst->routes->get_health(req);
 }
 
@@ -988,6 +1051,10 @@ server_http_res_ptr server_instances::handle_get_slots(const server_http_req & r
     if (model_id.empty() && instance_field.empty()) {
         json all_slots = json::array();
         for (const auto & inst : snapshot_instances()) {
+            active_route_guard guard(*this, *inst);
+            if (!guard.acquired) {
+                continue;  // being destroyed/resized; skip it
+            }
             auto res = inst->routes->get_slots(req);
             if (res->status != 200) {
                 return res;
@@ -1004,6 +1071,10 @@ server_http_res_ptr server_instances::handle_get_slots(const server_http_req & r
     const resolve_target target = resolve(model_id, instance_field, error);
     if (target.kind != target_kind::INSTANCE) {
         return make_error(error.empty() ? "invalid instance for slots" : error, ERROR_TYPE_INVALID_REQUEST);
+    }
+    active_route_guard guard(*this, *target.inst);
+    if (!guard.acquired) {
+        return make_error("instance '" + target.inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
     }
     return target.inst->routes->get_slots(req);
 }
@@ -1034,6 +1105,10 @@ server_http_res_ptr server_instances::handle_post_slots(const server_http_req & 
     if (target.kind != target_kind::INSTANCE) {
         return make_error(error.empty() ? "invalid instance for slot action" : error, ERROR_TYPE_INVALID_REQUEST);
     }
+    active_route_guard guard(*this, *target.inst);
+    if (!guard.acquired) {
+        return make_error("instance '" + target.inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
+    }
     return target.inst->routes->post_slots(req);
 }
 
@@ -1041,6 +1116,10 @@ server_http_res_ptr server_instances::handle_get_props(const server_http_req & r
     auto inst = default_instance();
     if (!inst) {
         return make_error("no instances loaded", ERROR_TYPE_SERVER);
+    }
+    active_route_guard guard(*this, *inst);
+    if (!guard.acquired) {
+        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
     }
     auto res = inst->routes->get_props(req);
     if (res->status != 200) {
@@ -1073,6 +1152,10 @@ server_http_res_ptr server_instances::handle_post_props(const server_http_req & 
     if (!inst) {
         return make_error("no instances loaded", ERROR_TYPE_SERVER);
     }
+    active_route_guard guard(*this, *inst);
+    if (!guard.acquired) {
+        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
+    }
     return inst->routes->post_props(req);
 }
 
@@ -1104,6 +1187,10 @@ server_http_res_ptr server_instances::handle_post_control(const server_http_req 
     auto inst = default_instance();
     if (!inst) {
         return make_error("no instances loaded", ERROR_TYPE_SERVER);
+    }
+    active_route_guard guard(*this, *inst);
+    if (!guard.acquired) {
+        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
     }
     return inst->routes->post_control(req);
 }
@@ -1139,6 +1226,10 @@ server_http_res_ptr server_instances::handle_post_apply_template(const server_ht
     if (!inst) {
         return make_error("no instances loaded", ERROR_TYPE_SERVER);
     }
+    active_route_guard guard(*this, *inst);
+    if (!guard.acquired) {
+        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
+    }
     return inst->routes->post_apply_template(req);
 }
 
@@ -1148,6 +1239,10 @@ server_http_res_ptr server_instances::handle_get_models(const server_http_req & 
     json models = json::array();
     json data   = json::array();
     for (const auto & inst : snapshot_instances()) {
+        active_route_guard guard(*this, *inst);
+        if (!guard.acquired) {
+            continue;  // being destroyed/resized; skip it
+        }
         auto res = inst->routes->get_models(req);
         if (res->status != 200) {
             return res;
@@ -1179,6 +1274,10 @@ server_http_res_ptr server_instances::handle_post_tokenize(const server_http_req
     if (!inst) {
         return make_error("no instances loaded", ERROR_TYPE_SERVER);
     }
+    active_route_guard guard(*this, *inst);
+    if (!guard.acquired) {
+        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
+    }
     return inst->routes->post_tokenize(req);
 }
 
@@ -1186,6 +1285,10 @@ server_http_res_ptr server_instances::handle_post_detokenize(const server_http_r
     auto inst = default_instance();
     if (!inst) {
         return make_error("no instances loaded", ERROR_TYPE_SERVER);
+    }
+    active_route_guard guard(*this, *inst);
+    if (!guard.acquired) {
+        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
     }
     return inst->routes->post_detokenize(req);
 }
@@ -1209,6 +1312,10 @@ server_http_res_ptr server_instances::handle_get_lora_adapters(const server_http
     if (!inst) {
         return make_error("no instances loaded", ERROR_TYPE_SERVER);
     }
+    active_route_guard guard(*this, *inst);
+    if (!guard.acquired) {
+        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
+    }
     return inst->routes->get_lora_adapters(req);
 }
 
@@ -1216,6 +1323,10 @@ server_http_res_ptr server_instances::handle_post_lora_adapters(const server_htt
     auto inst = default_instance();
     if (!inst) {
         return make_error("no instances loaded", ERROR_TYPE_SERVER);
+    }
+    active_route_guard guard(*this, *inst);
+    if (!guard.acquired) {
+        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
     }
     return inst->routes->post_lora_adapters(req);
 }
@@ -1344,7 +1455,15 @@ server_http_res_ptr server_instances::handle_post_instance_snapshot(const server
         data.n_ctx_seq = inst->ctx_server->get_slot_n_ctx();
         data.tokens    = copy->tokens;
         data.kv        = std::move(copy->buffer);
-        snapshot_io_write(filepath, std::move(data));
+        // await the write so a failed save never binds the slot to a file that does not
+        // exist on disk (the slot KV is unchanged either way)
+        auto write = snapshot_io_write(filepath, std::move(data), deadline_ms);
+        if (write.timed_out) {
+            return make_error("snapshot save timed out", ERROR_TYPE_UNAVAILABLE);
+        }
+        if (!write.ok) {
+            return make_error("failed to write snapshot '" + snapshot + "' to disk", ERROR_TYPE_SERVER);
+        }
 
         // the slot's KV now matches the snapshot content, so bind it to the snapshot
         std::lock_guard<std::mutex> lock(mutex_dispatch);

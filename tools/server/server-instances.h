@@ -42,8 +42,11 @@ struct server_instance {
 
     // manager-internal lifecycle state, guarded by server_instances::mutex_dispatch:
     // removing = a management op owns the instance (new requests get a retriable error)
+    // running  = the scheduler thread is alive; set false the moment destroy begins so a
+    //            stale shared_ptr can never post a task to a terminated queue
     // n_active_dispatch = in-flight requests routed to this instance
     bool removing          = false;
+    bool running           = true;
     int  n_active_dispatch = 0;
 };
 
@@ -160,7 +163,16 @@ struct server_instances {
         std::optional<server_snapshot_data> data;
     };
     server_snapshot_read_result snapshot_io_read(const std::string & path, int64_t deadline_ms);
-    std::future<void>           snapshot_io_write(const std::string & path, server_snapshot_data data);
+    // deadline-bounded snapshot file write on the pool I/O worker. timed_out
+    // distinguishes a write that did not finish in time (the write still completes in
+    // the background) from one that completed and failed or succeeded. bindings are
+    // only updated after a successful write, so a failure never leaves a slot bound to
+    // a file whose content does not match the slot's KV.
+    struct server_snapshot_write_result {
+        bool timed_out = false;
+        bool ok        = false;
+    };
+    server_snapshot_write_result snapshot_io_write(const std::string & path, server_snapshot_data data, int64_t deadline_ms);
     std::future<void>           snapshot_io_post(std::function<void()> && fn);
     // RAII switch-semaphore guard; acquisition bounded by the compose deadline
     struct switch_guard {
