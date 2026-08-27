@@ -1,5 +1,6 @@
 #include "server-context.h"
 #include "server-http.h"
+#include "server-instances.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
 #include "server-stream.h"
@@ -169,6 +170,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // struct that contains llama context and inference
     server_context ctx_server;
 
+    // multi-instance mode: many named contexts sharing one weight load
+    server_instances instances_mgr;
+    const bool use_instances = !params.instances.empty();
+
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {
         SRV_ERR("%s", "failed to initialize HTTP server\n");
@@ -183,6 +188,38 @@ int llama_server(common_params & params, int argc, char ** argv) {
     server_child child; // only used in non-router mode
     server_routes routes(params, ctx_server);
     server_tools tools;
+
+    // multi-instance mode: replace the single-context handlers with the manager's dispatch
+    // handlers. the route table below references routes.*, so the swap happens before
+    // registration. the manager handlers are registered as lambdas because they are member
+    // functions of instances_mgr.
+    if (use_instances) {
+        routes.get_health             = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_health(req); };
+        routes.get_slots              = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_slots(req); };
+        routes.post_slots             = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_slots(req); };
+        routes.get_props              = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_props(req); };
+        routes.post_props             = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_props(req); };
+        routes.post_infill            = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_infill(req); };
+        routes.post_completions       = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_completions(req); };
+        routes.post_completions_oai   = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_completions_oai(req); };
+        routes.post_chat_completions  = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_chat_completions(req); };
+        routes.post_chat_completions_tok = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_chat_completions_tok(req); };
+        routes.post_control           = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_control(req); };
+        routes.post_responses_oai     = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_responses_oai(req); };
+        routes.post_responses_tok_oai = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_responses_tok_oai(req); };
+        routes.post_transcriptions_oai = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_transcriptions_oai(req); };
+        routes.post_anthropic_messages = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_anthropic_messages(req); };
+        routes.post_anthropic_count_tokens = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_anthropic_count_tokens(req); };
+        routes.post_apply_template    = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_apply_template(req); };
+        routes.get_models             = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_models(req); };
+        routes.post_tokenize          = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_tokenize(req); };
+        routes.post_detokenize        = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_detokenize(req); };
+        routes.post_embeddings        = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_embeddings(req); };
+        routes.post_embeddings_oai    = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_embeddings_oai(req); };
+        routes.post_rerank            = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_rerank(req); };
+        routes.get_lora_adapters      = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_lora_adapters(req); };
+        routes.post_lora_adapters     = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_lora_adapters(req); };
+    }
 
     std::optional<server_models_routes> models_routes{};
     if (is_router_server) {
@@ -272,6 +309,19 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+
+    // instance management API (multi-instance mode)
+    if (use_instances) {
+        ctx_http.get  ("/instances",                    ex_wrapper([&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_instances(req); }));
+        ctx_http.post ("/instances",                    ex_wrapper([&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_instances(req); }));
+        ctx_http.post ("/instances/:name/pin",          ex_wrapper([&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_instance_pin(req); }));
+        ctx_http.post ("/instances/:name/unpin",        ex_wrapper([&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_instance_unpin(req); }));
+        ctx_http.post ("/instances/:name/resize",       ex_wrapper([&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_instance_resize(req); }));
+        ctx_http.del  ("/instances/:name",              ex_wrapper([&instances_mgr](const server_http_req & req) { return instances_mgr.handle_delete_instance(req); }));
+        ctx_http.post ("/instances/:name/snapshot",     ex_wrapper([&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_instance_snapshot(req); }));
+        ctx_http.get  ("/instances/:name/snapshots",    ex_wrapper([&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_instance_snapshots(req); }));
+        ctx_http.del  ("/instances/:name/snapshot/:snapshot", ex_wrapper([&instances_mgr](const server_http_req & req) { return instances_mgr.handle_delete_instance_snapshot(req); }));
+    }
 
     // resumable streaming: a child binds the local session factories, the router binds
     // proxies that resolve the owning child, see server-stream.h
@@ -462,25 +512,44 @@ int llama_server(common_params & params, int argc, char ** argv) {
             });
         }
 
-        if (!ctx_server.load_model(params)) {
-            clean_up();
-            if (ctx_http.thread.joinable()) {
-                ctx_http.thread.join();
+        if (use_instances) {
+            if (!instances_mgr.load(params)) {
+                clean_up();
+                if (ctx_http.thread.joinable()) {
+                    ctx_http.thread.join();
+                }
+                SRV_ERR("%s", "exiting due to instance loading error\n");
+                return 1;
             }
-            SRV_ERR("%s", "exiting due to model loading error\n");
-            return 1;
+            ctx_http.is_ready.store(true);
+            SRV_INF("%s", "instances loaded\n");
+
+            shutdown_handler = [&](int) {
+                mcp_mgr.shutdown();
+                instances_mgr.terminate();
+                ctx_http.stop();
+            };
+        } else {
+            if (!ctx_server.load_model(params)) {
+                clean_up();
+                if (ctx_http.thread.joinable()) {
+                    ctx_http.thread.join();
+                }
+                SRV_ERR("%s", "exiting due to model loading error\n");
+                return 1;
+            }
+
+            routes.update_meta(ctx_server);
+            ctx_http.is_ready.store(true);
+
+            SRV_INF("%s", "model loaded\n");
+
+            shutdown_handler = [&](int) {
+                mcp_mgr.shutdown();
+                // this will unblock start_loop()
+                ctx_server.terminate();
+            };
         }
-
-        routes.update_meta(ctx_server);
-        ctx_http.is_ready.store(true);
-
-        SRV_INF("%s", "model loaded\n");
-
-        shutdown_handler = [&](int) {
-            mcp_mgr.shutdown();
-            // this will unblock start_loop()
-            ctx_server.terminate();
-        };
     }
 
     // register signal handler if not running by CLI
@@ -529,20 +598,37 @@ int llama_server(common_params & params, int argc, char ** argv) {
             child.notify_to_router(server_state_to_str(SERVER_STATE_READY), routes.get_model_info());
         }
 
-        // this call blocks the main thread until queue_tasks.terminate() is called
-        ctx_server.start_loop();
+        if (use_instances) {
+            // the manager owns one scheduler thread per instance (also needed for runtime
+            // create/destroy/resize via the management API)
+            instances_mgr.start_loops();
 
-        clean_up();
-        if (ctx_http.thread.joinable()) {
-            ctx_http.thread.join();
-        }
-        if (monitor_thread.joinable()) {
-            monitor_thread.join();
-        }
+            // this call blocks the main thread until the HTTP server stops
+            if (ctx_http.thread.joinable()) {
+                ctx_http.thread.join();
+            }
 
-        auto * ll_ctx = ctx_server.get_llama_context();
-        if (ll_ctx != nullptr) {
-            common_memory_breakdown_print(ll_ctx);
+            instances_mgr.terminate();
+            clean_up();
+            if (monitor_thread.joinable()) {
+                monitor_thread.join();
+            }
+        } else {
+            // this call blocks the main thread until queue_tasks.terminate() is called
+            ctx_server.start_loop();
+
+            clean_up();
+            if (ctx_http.thread.joinable()) {
+                ctx_http.thread.join();
+            }
+            if (monitor_thread.joinable()) {
+                monitor_thread.join();
+            }
+
+            auto * ll_ctx = ctx_server.get_llama_context();
+            if (ll_ctx != nullptr) {
+                common_memory_breakdown_print(ll_ctx);
+            }
         }
     }
 

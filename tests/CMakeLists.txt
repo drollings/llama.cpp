@@ -162,6 +162,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
+
+    llama_build_and_test(test-server-snapshot.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    target_include_directories(test-server-snapshot PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-snapshot PRIVATE server-context)
     # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
     if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
         llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -302,6 +306,9 @@ set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED 
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+llama_build_and_test(test-common-instances.cpp ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-common-instances PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 if (APPLE)
     llama_build(test-rset-release.cpp)
