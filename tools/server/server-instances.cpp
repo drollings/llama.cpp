@@ -591,8 +591,12 @@ server_http_res_ptr server_instances::apply_snapshot(server_instance &   inst,
         return make_error("invalid slot id", ERROR_TYPE_INVALID_REQUEST);
     }
 
-    const std::string model_key = server_instance_model_key(base_name);
-    const std::string filepath  = params.slot_save_path + model_key + "/" + snapshot + ".bin";
+    // per-instance resolve: the instance-scoped file wins, the legacy flat
+    // file is the migration fallback ("" when neither exists, read as 404).
+    const std::string filepath = resolve_snapshot_path(inst.cfg.name, snapshot);
+    if (filepath.empty()) {
+        return make_error(format_error_response("snapshot not found: '" + snapshot + "'", ERROR_TYPE_NOT_FOUND));
+    }
 
     // 1. per-slot lock: switching different slots of one instance do not serialize
     std::lock_guard<std::mutex> slot_lock(*inst.mutex_snapshot[id_slot]);
@@ -633,11 +637,17 @@ server_http_res_ptr server_instances::apply_snapshot(server_instance &   inst,
         data.n_ctx_seq = inst.ctx_server->get_slot_n_ctx();
         data.tokens    = copy->tokens;
         data.kv        = std::move(copy->buffer);
-        const std::string cur_path = params.slot_save_path + model_key + "/" + current + ".bin";
-        // await the save-back: the old snapshot file must match the slot's KV before we
-        // switch away, otherwise a later restore of `current` silently loses the
-        // conversation that happened while it was bound. on failure the switch is aborted
-        // and the slot keeps its live KV bound to `current`.
+        // save the old snapshot back where it was read from: the
+        // instance-scoped file when present, else the legacy flat file it was
+        // restored from (migration), else the instance-scoped path. the old
+        // snapshot file must match the slot's KV before we switch away,
+        // otherwise a later restore of `current` silently loses the
+        // conversation that happened while it was bound. on failure the switch
+        // is aborted and the slot keeps its live KV bound to `current`.
+        std::string cur_path = resolve_snapshot_path(inst.cfg.name, current);
+        if (cur_path.empty()) {
+            cur_path = snapshot_instance_path(inst.cfg.name, current);
+        }
         auto write = snapshot_io_write(cur_path, std::move(data), deadline_ms);
         if (write.busy) {
             return make_error("snapshot io worker is busy, retry", ERROR_TYPE_UNAVAILABLE);
@@ -821,20 +831,133 @@ json server_instances::get_instances_json() const {
 }
 
 json server_instances::pool_snapshots_json() const {
-    json snapshots = json::array();
-    if (params.slot_save_path.empty()) {
-        return snapshots;
+    // null-safe string field read for ordering (common_json::value() throws
+    // on a null, and legacy entries are explicitly tagged null)
+    const auto str_field = [](const json & e, const std::string & key) -> std::string {
+        if (!e.is_object() || !e.contains(key) || !e.at(key).is_string()) {
+            return "";
+        }
+        return e.at(key).get<std::string>();
+    };
+    std::vector<json> entries;
+    if (!params.slot_save_path.empty()) {
+        const std::string model_key = server_instance_model_key(base_name);
+        const std::string dir       = params.slot_save_path + model_key;
+        const auto push = [&entries](const server_snapshot_meta & meta, const json & instance_tag) {
+            entries.push_back({
+                { "name",      meta.name      },
+                { "size",      meta.size      },
+                { "mtime",     meta.mtime     },
+                { "n_ctx_seq", meta.n_ctx_seq },
+                { "instance",  instance_tag   },
+            });
+        };
+        // legacy flat files (pre-per-instance layout), tagged with a null instance
+        for (const auto & meta : server_snapshot_list(dir)) {
+            push(meta, nullptr);
+        }
+        // per-instance subdirectories, tagged with the owning instance name. a
+        // snapshot outlives its instance (cold-pool discoverability), so every
+        // subdirectory is listed, not just live instances.
+        std::error_code          ec;
+        std::vector<std::string> subdirs;
+        std::filesystem::directory_iterator it(dir, ec);
+        if (!ec) {
+            for (const auto & entry : it) {
+                if (ec) {
+                    break;
+                }
+                if (entry.is_directory(ec)) {
+                    subdirs.push_back(entry.path().filename().string());
+                }
+            }
+        }
+        std::sort(subdirs.begin(), subdirs.end());
+        for (const auto & sub : subdirs) {
+            for (const auto & meta : server_snapshot_list(dir + "/" + sub)) {
+                push(meta, sub);
+            }
+        }
     }
-    const std::string dir = params.slot_save_path + server_instance_model_key(base_name);
-    for (const auto & meta : server_snapshot_list(dir)) {
-        snapshots.push_back({
-            { "name",      meta.name      },
-            { "size",      meta.size      },
-            { "mtime",     meta.mtime     },
-            { "n_ctx_seq", meta.n_ctx_seq },
-        });
+    // deterministic envelope: order by (instance, name), legacy (null) first
+    std::sort(entries.begin(), entries.end(), [&str_field](const json & a, const json & b) {
+        const std::string ai = str_field(a, "instance");
+        const std::string bi = str_field(b, "instance");
+        return ai != bi ? ai < bi : str_field(a, "name") < str_field(b, "name");
+    });
+    json snapshots = json::array();
+    for (auto & e : entries) {
+        snapshots.push_back(std::move(e));
     }
     return snapshots;
+}
+
+// snapshots visible to one instance: its own instance-scoped directory plus
+// the legacy flat files (migration read path, tagged with a null instance).
+json server_instances::instance_snapshots_json(const std::string & instance) const {
+    std::vector<json> entries;
+    if (!params.slot_save_path.empty()) {
+        const std::string model_key = server_instance_model_key(base_name);
+        const std::string dir       = params.slot_save_path + model_key;
+        for (const auto & meta : server_snapshot_list(dir + "/" + instance)) {
+            entries.push_back({
+                { "name",      meta.name      },
+                { "size",      meta.size      },
+                { "mtime",     meta.mtime     },
+                { "n_ctx_seq", meta.n_ctx_seq },
+                { "instance",  instance       },
+            });
+        }
+        for (const auto & meta : server_snapshot_list(dir)) {
+            entries.push_back({
+                { "name",      meta.name      },
+                { "size",      meta.size      },
+                { "mtime",     meta.mtime     },
+                { "n_ctx_seq", meta.n_ctx_seq },
+                { "instance",  nullptr        },
+            });
+        }
+    }
+    std::stable_sort(entries.begin(), entries.end(), [](const json & a, const json & b) {
+        const auto str_field = [](const json & e) -> std::string {
+            if (!e.is_object() || !e.contains("name") || !e.at("name").is_string()) {
+                return "";
+            }
+            return e.at("name").get<std::string>();
+        };
+        return str_field(a) < str_field(b);
+    });
+    json snapshots = json::array();
+    for (auto & e : entries) {
+        snapshots.push_back(std::move(e));
+    }
+    return snapshots;
+}
+
+std::string server_instances::snapshot_instance_path(const std::string & instance,
+                                                     const std::string & snapshot) const {
+    return server_snapshot_instance_path(params.slot_save_path, server_instance_model_key(base_name),
+                                         instance, snapshot);
+}
+
+std::string server_instances::snapshot_legacy_path(const std::string & snapshot) const {
+    return server_snapshot_legacy_path(params.slot_save_path, server_instance_model_key(base_name), snapshot);
+}
+
+// resolve a snapshot for read (and save-back): the instance-scoped file wins;
+// the legacy flat file is the migration fallback. "" when neither exists.
+std::string server_instances::resolve_snapshot_path(const std::string & instance,
+                                                    const std::string & snapshot) const {
+    std::error_code ec;
+    const std::string inst_path = snapshot_instance_path(instance, snapshot);
+    if (std::filesystem::exists(inst_path, ec)) {
+        return inst_path;
+    }
+    const std::string leg_path = snapshot_legacy_path(snapshot);
+    if (std::filesystem::exists(leg_path, ec)) {
+        return leg_path;
+    }
+    return "";
 }
 
 std::shared_ptr<server_instance> server_instances::build_instance(const common_instance & cfg) {
@@ -1462,9 +1585,13 @@ server_http_res_ptr server_instances::handle_delete_instance(const server_http_r
 }
 
 server_http_res_ptr server_instances::handle_post_instance_snapshot(const server_http_req & req) {
-    // POST /instances/:name/snapshot  body { "name": "<snapshot>" }
-    // serialized with resize/destroy so the slot-save task on the scheduler never races a
-    // context rebuild that destroys the very context it is copying from
+    // POST /instances/:name/snapshot  body { "name": "<snapshot>", "id_slot": N? }
+    // saves one slot's KV into the instance's own snapshot namespace
+    // (<slot_save_path>/<model_key>/<instance>/<snapshot>.bin). id_slot selects
+    // the slot (default 0); snapshots are per-instance, never silently slot 0
+    // of another instance's namespace. serialized with resize/destroy so the
+    // slot-save task on the scheduler never races a context rebuild that
+    // destroys the very context it is copying from
     std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
 
     const std::string name = req.get_param("name");
@@ -1475,6 +1602,7 @@ server_http_res_ptr server_instances::handle_post_instance_snapshot(const server
         return make_error("invalid JSON body", ERROR_TYPE_INVALID_REQUEST);
     }
     const std::string snapshot = json_value(body, "name", std::string());
+    const int         id_slot  = json_value(body, "id_slot", 0);
     if (!fs_validate_filename(snapshot)) {
         return make_error("invalid snapshot name", ERROR_TYPE_INVALID_REQUEST);
     }
@@ -1486,18 +1614,20 @@ server_http_res_ptr server_instances::handle_post_instance_snapshot(const server
     if (!inst) {
         return make_error(format_error_response("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND));
     }
+    if (id_slot < 0 || (size_t) id_slot >= inst->slot_snapshots.size()) {
+        return make_error("invalid slot id", ERROR_TYPE_INVALID_REQUEST);
+    }
 
-    const std::string model_key = server_instance_model_key(base_name);
-    const std::string dir       = params.slot_save_path + model_key;
+    const std::string dir = server_snapshot_instance_dir(params.slot_save_path,
+                                                         server_instance_model_key(base_name), name);
     std::error_code   ec;
     std::filesystem::create_directories(dir, ec);
 
-    const std::string filepath = dir + "/" + snapshot + ".bin";
+    const std::string filepath = snapshot_instance_path(name, snapshot);
 
     // the same compose pipeline as a request-time switch: per-slot lock, switch
-    // semaphore, deadline-bounded KV copy on the scheduler, then a fire-and-forget
+    // semaphore, deadline-bounded KV copy on the scheduler, then an awaited
     // file write on the pool I/O worker
-    const int id_slot = 0;
     {
         std::lock_guard<std::mutex> slot_lock(*inst->mutex_snapshot[id_slot]);
         const int64_t               deadline_ms = snapshot_deadline_ms(*inst);
@@ -1532,6 +1662,14 @@ server_http_res_ptr server_instances::handle_post_instance_snapshot(const server
             return make_error("failed to write snapshot '" + snapshot + "' to disk", ERROR_TYPE_SERVER);
         }
 
+        // the instance-scoped file is now authoritative: drop a legacy flat
+        // file of the same name (migration dedup) so listings never show the
+        // snapshot twice and future reads cannot ambiguate.
+        {
+            std::error_code lec;
+            std::filesystem::remove(snapshot_legacy_path(snapshot), lec);
+        }
+
         // the slot's KV now matches the snapshot content, so bind it to the snapshot
         std::lock_guard<std::mutex> lock(mutex_dispatch);
         inst->slot_snapshots[id_slot] = snapshot;
@@ -1551,7 +1689,7 @@ server_http_res_ptr server_instances::handle_get_instance_snapshots(const server
     }
 
     return make_ok({
-        { "snapshots", pool_snapshots_json() }
+        { "snapshots", instance_snapshots_json(name) }
     });
 }
 
@@ -1574,21 +1712,38 @@ server_http_res_ptr server_instances::handle_delete_instance_snapshot(const serv
         return make_error(format_error_response("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND));
     }
 
-    const std::string model_key = server_instance_model_key(base_name);
-    const std::string filepath  = params.slot_save_path + model_key + "/" + snapshot + ".bin";
+    // per-instance delete: the instance-scoped file first, then the legacy
+    // flat file (migration). each removed file unbinds slots: the named
+    // instance's slots for its own file, every instance's slots for a legacy
+    // file (which any instance may have restored before scoping existed).
+    const std::string inst_path = snapshot_instance_path(name, snapshot);
+    const std::string leg_path  = snapshot_legacy_path(snapshot);
 
     std::error_code ec;
-    if (!std::filesystem::exists(filepath, ec)) {
+    const bool removed_inst = std::filesystem::remove(inst_path, ec);
+    ec.clear();
+    const bool removed_leg = std::filesystem::remove(leg_path, ec);
+
+    if (!removed_inst && !removed_leg) {
         return make_error(format_error_response("snapshot not found: '" + snapshot + "'", ERROR_TYPE_NOT_FOUND));
     }
-    std::filesystem::remove(filepath, ec);
 
     // unbind any slot that was bound to the deleted snapshot
     {
         std::lock_guard<std::mutex> lock(mutex_dispatch);
-        for (auto & s : inst->slot_snapshots) {
-            if (s == snapshot) {
-                s.clear();
+        if (removed_leg) {
+            for (const auto & it : instances) {
+                for (auto & s : it->slot_snapshots) {
+                    if (s == snapshot) {
+                        s.clear();
+                    }
+                }
+            }
+        } else {
+            for (auto & s : inst->slot_snapshots) {
+                if (s == snapshot) {
+                    s.clear();
+                }
             }
         }
     }

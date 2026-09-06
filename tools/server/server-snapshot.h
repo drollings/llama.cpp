@@ -59,3 +59,23 @@ struct server_snapshot_meta {
 // list *.bin in dir, header-parsed n_ctx_seq (read header only), mtime in unix
 // seconds. skips unreadable files (n_ctx_seq = 0 on an unreadable header).
 std::vector<server_snapshot_meta> server_snapshot_list(const std::string & dir);
+
+// per-instance on-disk layout. snapshots are scoped to their instance:
+//   <slot_save_path>/<model_key>/<instance>/<snapshot>.bin
+// where model_key is the sanitized pool identity and instance/snapshot are
+// validated [A-Za-z0-9._-] names (safe as path segments, no traversal).
+//
+// files written before per-instance scoping live flat at
+//   <slot_save_path>/<model_key>/<snapshot>.bin
+// (legacy layout). readers fall back to it for migration; new saves always
+// write the instance-scoped path.
+std::string server_snapshot_instance_dir(const std::string & slot_save_path,
+                                         const std::string & model_key,
+                                         const std::string & instance);
+std::string server_snapshot_instance_path(const std::string & slot_save_path,
+                                          const std::string & model_key,
+                                          const std::string & instance,
+                                          const std::string & snapshot);
+std::string server_snapshot_legacy_path(const std::string & slot_save_path,
+                                        const std::string & model_key,
+                                        const std::string & snapshot);

@@ -235,11 +235,19 @@ struct server_instances {
     // slot-save-path. surfaced in the /instances envelope so a cold pool's snapshots
     // stay discoverable for reactivation.
     json                             pool_snapshots_json() const;
+    // snapshots visible to one instance: its own instance-scoped directory plus
+    // legacy flat files (migration read path), each tagged with "instance"
+    // (the owning name, or null for legacy files).
+    json                             instance_snapshots_json(const std::string & instance) const;
     std::string                      instance_id(const server_instance & inst) const;
     std::set<std::string>            instance_aliases(const std::string & name, const std::string & group) const;
     void                             apply_identity(server_instance & inst);
-
-    std::shared_ptr<server_instance> default_instance();
+    // per-instance snapshot paths under <slot_save_path>/<model_key>/. the
+    // instance-scoped path is the only write target; resolve_snapshot_path
+    // prefers it and falls back to the legacy flat file for migration reads.
+    std::string snapshot_instance_path(const std::string & instance, const std::string & snapshot) const;
+    std::string snapshot_legacy_path(const std::string & snapshot) const;
+    std::string resolve_snapshot_path(const std::string & instance, const std::string & snapshot) const;    std::shared_ptr<server_instance> default_instance();
     std::shared_ptr<server_instance> default_instance() const;
 
     server_http_res_ptr make_error(const std::string & message, error_type type) const;

@@ -256,6 +256,9 @@ struct server_lru_sched {
 // delete). distinct from params.timeout_read/write which only applies to the generation proxy
 static constexpr int STREAM_LOOKUP_TIMEOUT_MS = 250;
 
+// per-child GET /instances fan-out budget for the router aggregate below
+static constexpr int INSTANCES_AGG_TIMEOUT_MS = 5000;
+
 static std::filesystem::path get_server_exec_path() {
 #if defined(_WIN32)
     wchar_t buf[32768] = { 0 };  // Large buffer to handle long paths
@@ -1487,6 +1490,119 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
     return true;
 }
 
+// pure merge for GET /instances aggregation across children. each entry pairs
+// a child model name with its GET /instances envelope. instance rows pass
+// through untouched (child ids are already <alias>:<name> qualified);
+// snapshot rows gain their owning "model"; totals sum with 64-bit saturation
+// (each child loads its own weights, so model bytes sum across children).
+// envelopes that are not objects (pre-envelope forks) contribute nothing.
+json server_models_merge_instances(const std::vector<std::pair<std::string, json>> & per_model) {
+    json instances = json::array();
+    json snapshots = json::array();
+    uint64_t total_model = 0, total_context = 0, total_compute = 0, total_total = 0;
+    const auto sat_add = [](uint64_t a, uint64_t b) {
+        return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+    };
+    const auto as_u64 = [](const json & v) -> uint64_t {
+        // common_json only exposes is_number_integer (true for unsigned too),
+        // and get<>() static_casts without range checks — so a negative cast
+        // result is either truly negative or >= 2^63. the dump disambiguates
+        // exactly (a leading '-' is a genuine negative).
+        if (!v.is_number_integer()) {
+            return 0;
+        }
+        const int64_t n = v.get<int64_t>();
+        if (n >= 0) {
+            return (uint64_t) n;
+        }
+        return v.dump().rfind('-', 0) == 0 ? 0 : UINT64_MAX;
+    };
+    const auto field_u64 = [&](const json & obj, const std::string & key) -> uint64_t {
+        if (!obj.is_object() || !obj.contains(key)) {
+            return 0;
+        }
+        return as_u64(obj.at(key));
+    };
+    for (const auto & item : per_model) {
+        const std::string & model    = item.first;
+        const json &        envelope = item.second;
+        if (!envelope.is_object()) {
+            continue;
+        }
+        if (envelope.contains("instances") && envelope.at("instances").is_array()) {
+            instances.insert(envelope.at("instances"));
+        }
+        if (envelope.contains("snapshots") && envelope.at("snapshots").is_array()) {
+            for (const json & entry : envelope.at("snapshots")) {
+                json tagged = entry;
+                if (tagged.is_object()) {
+                    tagged["model"] = model;
+                }
+                snapshots.push_back(tagged);
+            }
+        }
+        // the child envelope nests its sums under "total"
+        if (envelope.contains("total") && envelope.at("total").is_object()) {
+            const json & t = envelope.at("total");
+            total_model   = sat_add(total_model,   field_u64(t, "model"));
+            total_context = sat_add(total_context, field_u64(t, "context"));
+            total_compute = sat_add(total_compute, field_u64(t, "compute"));
+            total_total   = sat_add(total_total,   field_u64(t, "total"));
+        }
+    }
+    return {
+        { "instances", std::move(instances) },
+        { "snapshots", std::move(snapshots) },
+        { "total",
+          {
+              { "model",   total_model   },
+              { "context", total_context },
+              { "compute", total_compute },
+              { "total",   total_total   },
+          }                                     },
+    };
+}
+
+json server_models::get_instances_aggregate(const std::string & only) {
+    // running children to query: just `only` when it names a live model, else
+    // every running child. resolve under the models lock via copies only.
+    std::vector<server_model_meta> targets;
+    if (!only.empty()) {
+        auto meta = get_meta(only);
+        if (!meta.has_value() || !meta->is_running()) {
+            return nullptr;  // caller maps to 404
+        }
+        targets.push_back(*meta);
+    } else {
+        for (const auto & meta : get_all_meta()) {
+            if (meta.is_running()) {
+                targets.push_back(meta);
+            }
+        }
+    }
+
+    std::vector<std::pair<std::string, json>> per_model;
+    for (const auto & meta : targets) {
+        httplib::Client cli(CHILD_ADDR, meta.port);
+        cli.set_connection_timeout(0, INSTANCES_AGG_TIMEOUT_MS * 1000);
+        cli.set_read_timeout(0, INSTANCES_AGG_TIMEOUT_MS * 1000);
+        cli.set_write_timeout(0, INSTANCES_AGG_TIMEOUT_MS * 1000);
+        auto resp = cli.Get("/instances");
+        // a child without instance grammar 404s, a dead child refuses: both
+        // are skipped, never fatal to the aggregate
+        if (!resp || resp->status != 200) {
+            continue;
+        }
+        try {
+            json envelope = json::parse(resp->body);
+            per_model.emplace_back(meta.name, std::move(envelope));
+        } catch (const std::exception &) {
+            continue;
+        }
+    }
+    return server_models_merge_instances(per_model);
+}
+
 server_http_res_ptr server_models::proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached) {
     auto meta = get_meta(name);
     if (!meta.has_value()) {
@@ -2272,6 +2388,26 @@ void server_models_routes::init_routes() {
         models.conv_models.forget(conv_id);
         res->status = 204;
         res->content_type = "application/json";
+        return res;
+    };
+
+    this->get_router_instances = [this](const server_http_req & req) {
+        // GET /instances[?model=<child>]: the aggregate instance envelope
+        // across children. a named child that is unknown or not running is a
+        // 404; children without instance grammar are skipped inside the
+        // aggregate, never fatal.
+        auto res = std::make_unique<server_http_res>();
+        std::string only = req.get_param("model");
+        if (!only.empty() && !models.has_model(only)) {
+            res_err(res, format_error_response("model not found: '" + only + "'", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        json envelope = models.get_instances_aggregate(only);
+        if (envelope.is_null()) {
+            res_err(res, format_error_response("model is not running: '" + only + "'", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        res_ok(res, envelope);
         return res;
     };
 }

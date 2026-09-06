@@ -266,6 +266,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.post("/models/unload",        ex_wrapper(models_routes->post_router_models_unload));
         ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
+        // aggregate instance pools across children (per-model, per-instance
+        // envelopes merged; snapshots tagged with their owning model). the
+        // router itself has no pool: when --instance flags were also passed,
+        // the manager's own /instances routes above already own the path.
+        if (!use_instances) {
+            ctx_http.get ("/instances",        ex_wrapper(models_routes->get_router_instances));
+        }
     }
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)

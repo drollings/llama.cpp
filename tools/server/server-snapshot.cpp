@@ -132,6 +132,34 @@ std::optional<server_snapshot_data> server_snapshot_read(const std::string & pat
     return server_snapshot_read_status(path).data;
 }
 
+// join helper: exactly one '/' between segments regardless of a trailing slash
+// on the root (slot_save_path may or may not end in '/').
+static std::string snapshot_join(const std::string & root, const std::string & rest) {
+    if (!root.empty() && root.back() == '/') {
+        return root + rest;
+    }
+    return root + "/" + rest;
+}
+
+std::string server_snapshot_instance_dir(const std::string & slot_save_path,
+                                         const std::string & model_key,
+                                         const std::string & instance) {
+    return snapshot_join(slot_save_path, model_key + "/" + instance);
+}
+
+std::string server_snapshot_instance_path(const std::string & slot_save_path,
+                                          const std::string & model_key,
+                                          const std::string & instance,
+                                          const std::string & snapshot) {
+    return snapshot_join(slot_save_path, model_key + "/" + instance + "/" + snapshot + ".bin");
+}
+
+std::string server_snapshot_legacy_path(const std::string & slot_save_path,
+                                        const std::string & model_key,
+                                        const std::string & snapshot) {
+    return snapshot_join(slot_save_path, model_key + "/" + snapshot + ".bin");
+}
+
 std::vector<server_snapshot_meta> server_snapshot_list(const std::string & dir) {
     std::vector<server_snapshot_meta> out;
     std::error_code                   ec;
