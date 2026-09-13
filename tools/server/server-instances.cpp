@@ -119,18 +119,39 @@ bool server_instances::load(const common_params & params) {
 
     instances.reserve(inst_cfgs.size());
 
+    // register every configured instance WITHOUT materializing it: each context window
+    // (KV + compute) is allocated on first demand for that instance, so declaring N
+    // instances never costs N windows upfront. the weights loaded above are the only
+    // thing this function loads.
+    const bool legacy_default = params.instances.empty();
     for (const auto & cfg : inst_cfgs) {
-        auto inst = build_instance(cfg);
-        if (!inst) {
-            IST_ERR("failed to load instance '%s'\n", cfg.name.c_str());
-            return false;
+        auto inst       = std::make_shared<server_instance>();
+        inst->cfg       = cfg;
+        inst->effective = common_instance_params(params, cfg);
+
+        if (inst->effective.n_parallel < 1) {
+            IST_WRN("instance '%s' has no valid n_parallel, defaulting to 1\n", cfg.name.c_str());
+            inst->effective.n_parallel = 1;
+        }
+        if (inst->effective.n_ctx == 0) {
+            IST_INF("instance '%s' inherits the model's default context size\n", cfg.name.c_str());
         }
 
-        IST_INF("instance '%s' (group '%s', ctx = %d, parallel = %d%s%s) ready\n", cfg.name.c_str(), cfg.group.c_str(),
-                inst->effective.n_ctx, inst->effective.n_parallel, cfg.pinned ? ", pinned" : "",
-                cfg.is_default ? ", default" : "");
-
         instances.push_back(std::move(inst));
+
+        IST_INF("instance '%s' (group '%s', ctx = %d, parallel = %d%s%s) registered, builds on first demand\n",
+                cfg.name.c_str(), cfg.group.c_str(), instances.back()->effective.n_ctx,
+                instances.back()->effective.n_parallel, cfg.pinned ? ", pinned" : "",
+                cfg.is_default ? ", default" : "");
+    }
+
+    // legacy drop-in: with no instances configured the single default instance is built
+    // eagerly, preserving stock single-context startup behavior (exactly one window).
+    if (legacy_default) {
+        if (auto err = ensure_built_instance(instances.front())) {
+            IST_ERR("failed to build default instance '%s'\n", instances.front()->cfg.name.c_str());
+            return false;
+        }
     }
 
     return true;
@@ -248,8 +269,10 @@ std::optional<size_t> server_instances::pick_best_available(const std::string & 
     for (size_t i = 0; i < instances.size(); ++i) {
         const server_instance & inst = *instances[i];
         // removing = a management op owns the instance; running = false once a destroy or
-        // a pool-wide shutdown has begun, so a group waiter never picks a dying instance
-        if (inst.cfg.group != group || inst.removing || !inst.running) {
+        // a pool-wide shutdown has begun, so a group waiter never picks a dying instance.
+        // unbuilt members have no slots yet; group demand materializes the first one
+        // (see dispatch_group) instead of picking it here.
+        if (inst.cfg.group != group || inst.removing || !inst.running || !inst.built) {
             continue;
         }
 
@@ -354,6 +377,12 @@ server_http_res_ptr server_instances::dispatch_instance(const server_http_req & 
                                                         const std::string &                      snapshot,
                                                         int                                      id_slot,
                                                         const forward_fn &                       forward) {
+    // first demand for this window materializes it: exactly one context is ever built
+    // per demand, never the whole pool upfront
+    if (auto err = ensure_built_instance(inst)) {
+        return err;
+    }
+
     {
         std::lock_guard<std::mutex> lock(mutex_dispatch);
         inst->n_active_dispatch++;
@@ -422,6 +451,7 @@ server_http_res_ptr server_instances::dispatch_group(const server_http_req & req
 
     while (true) {
         std::shared_ptr<server_instance> inst;
+        std::shared_ptr<server_instance> unbuilt;
         {
             std::lock_guard<std::mutex> lock(mutex_dispatch);
             const auto                  best = pick_best_available(group);
@@ -435,6 +465,26 @@ server_http_res_ptr server_instances::dispatch_group(const server_http_req & req
                     cond_dispatch.notify_all();
                     inst.reset();  // re-pick
                 }
+            } else {
+                // no built member has a free slot: materialize the first registered
+                // member instead of waiting. one demand builds exactly one window.
+                for (const auto & it : instances) {
+                    if (it->cfg.group == group && !it->built && !it->removing && it->running) {
+                        unbuilt = it;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (unbuilt) {
+            // a persistently failing build degrades to the 503 deadline below, never a hang
+            // and never a hot spin: only a successful build re-picks immediately
+            if (auto err = ensure_built_instance(unbuilt)) {
+                IST_WRN("on-demand build of instance '%s' failed, waiting for a free member\n",
+                        unbuilt->cfg.name.c_str());
+            } else {
+                continue;
             }
         }
 
@@ -742,7 +792,11 @@ void server_instances::apply_identity(server_instance & inst) {
 }
 
 // most recent slot use across an instance (max t_last_used over its slots), -1 when unused
+// (or unbuilt: a registered window has no slots yet)
 static int64_t instance_last_used(const server_instance & inst) {
+    if (!inst.built) {
+        return -1;
+    }
     int64_t t_last_used = -1;
     for (const auto & slot : inst.ctx_server->get_slot_info()) {
         if (slot.t_last_used >= 0) {
@@ -753,6 +807,10 @@ static int64_t instance_last_used(const server_instance & inst) {
 }
 
 json server_instances::instance_to_json(const server_instance & inst) const {
+    // an unbuilt (registered but never demanded) window owns no buffers yet
+    if (!inst.built) {
+        return instance_to_json(inst, 0, 0, 0);
+    }
     // all memory fields derive from the three instance getters (single source of truth)
     const uint64_t model_bytes   = inst.ctx_server->get_model_bytes();
     const uint64_t context_bytes = inst.ctx_server->get_context_bytes();
@@ -774,8 +832,8 @@ json server_instances::instance_to_json(const server_instance & inst,
         { "parallel", inst.effective.n_parallel },
         { "pinned", inst.cfg.pinned },
         { "is_default", inst.cfg.is_default },
-        // this branch has no auto-sleep: an instance is always loaded
-        { "state", "loaded" },
+        // unbuilt = registered but never demanded; its window (and bytes) do not exist yet
+        { "state", inst.built ? "loaded" : "unloaded" },
         // memory breakdown
         { "model_bytes", model_bytes },
         { "context_bytes", context_bytes },
@@ -798,9 +856,10 @@ json server_instances::get_instances_json() const {
     {
         std::lock_guard<std::mutex> lock(mutex_dispatch);
         for (const auto & inst : instances) {
-            const uint64_t model_bytes   = inst->ctx_server->get_model_bytes();
-            const uint64_t context_bytes = inst->ctx_server->get_context_bytes();
-            const uint64_t compute_bytes = inst->ctx_server->get_compute_bytes();
+            // unbuilt windows own no buffers; they contribute identity with zero bytes
+            const uint64_t model_bytes   = inst->built ? inst->ctx_server->get_model_bytes()   : 0;
+            const uint64_t context_bytes = inst->built ? inst->ctx_server->get_context_bytes() : 0;
+            const uint64_t compute_bytes = inst->built ? inst->ctx_server->get_compute_bytes() : 0;
 
             instances_arr.push_back(instance_to_json(*inst, model_bytes, context_bytes, compute_bytes));
 
@@ -1001,6 +1060,90 @@ std::shared_ptr<server_instance> server_instances::build_instance(const common_i
     return inst;
 }
 
+// materialize one registered instance on first demand. the expensive work (weight
+// reload, context alloc) runs under mutex_mgmt with NO other lock held, so concurrent
+// first demands for one instance collapse onto a single build and a reload can never
+// race create_instance's reload (lock order everywhere is mgmt -> dispatch). the built
+// context is installed under mutex_dispatch; terminate() null-guards unbuilt instances
+// and create_instance's shutdown check is mirrored here, so a build that loses a race
+// with teardown frees what it allocated and reports unavailable instead of leaking a
+// scheduler thread.
+server_http_res_ptr server_instances::ensure_built_instance(const std::shared_ptr<server_instance> & inst) {
+    std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_dispatch);
+        if (inst->built) {
+            return nullptr;
+        }
+        bool registered = false;
+        for (const auto & it : instances) {
+            if (it == inst) {
+                registered = true;
+                break;
+            }
+        }
+        if (!registered) {
+            return make_error("instance '" + inst->cfg.name + "' no longer exists", ERROR_TYPE_NOT_FOUND);
+        }
+        if (inst->removing || !inst->running || terminated) {
+            return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
+        }
+    }
+
+    // reload the shared weights when the pool went cold (last instance destroyed)
+    if (model == nullptr) {
+        common_params model_params = params;
+        model_init                 = common_init_from_params(model_params, true);
+        model                      = model_init ? model_init->model() : nullptr;
+        if (model == nullptr) {
+            IST_ERR("failed to reload model weights '%s'\n", params.model.path.c_str());
+            return make_error(507, "insufficient_memory_error", "failed to reload shared weights");
+        }
+        IST_INF("reloaded shared model weights '%s'\n", params.model.path.c_str());
+    }
+
+    // allocate only this instance's KV + compute buffers from the already-loaded weights
+    auto ctx_server = std::make_unique<server_context>();
+    if (!ctx_server->load_model(inst->effective, model)) {
+        IST_ERR("failed to allocate instance '%s', shared model stays loaded\n", inst->cfg.name.c_str());
+        return make_error(507, "insufficient_memory_error",
+                          "failed to allocate instance '" + inst->cfg.name + "', not enough device memory");
+    }
+
+    auto routes = std::make_unique<server_routes>(inst->effective, *ctx_server);
+    routes->update_meta(*ctx_server);
+    ctx_server->set_slot_release_callback([this](int) {
+        std::lock_guard<std::mutex> lock(mutex_dispatch);
+        cond_dispatch.notify_all();
+    });
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_dispatch);
+        if (inst->removing || !inst->running || terminated) {
+            // lost a race with teardown after the build: the locals free the fresh
+            // context on return, nothing is installed, no scheduler is started
+            ctx_server->terminate();
+            return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
+        }
+        inst->model_owner = model_init;
+        inst->ctx_server  = std::move(ctx_server);
+        inst->routes      = std::move(routes);
+        apply_identity(*inst);
+        inst->slot_snapshots.resize((size_t) inst->effective.n_parallel);
+        server_instance_size_slot_locks(inst->mutex_snapshot, inst->effective.n_parallel);
+        // start the scheduler only now that the instance is fully installed; mirrors
+        // create_instance's shutdown check so a racing terminate() cannot leak the thread
+        inst->loop_thread = std::thread([inst]() { inst->ctx_server->start_loop(); });
+        inst->built       = true;
+        cond_dispatch.notify_all();  // wake group waiters so the new window can be picked
+    }
+
+    IST_INF("instance '%s' (group '%s', ctx = %d, parallel = %d) built on demand\n", inst->cfg.name.c_str(),
+            inst->cfg.group.c_str(), inst->effective.n_ctx, inst->effective.n_parallel);
+    return nullptr;
+}
+
 server_http_res_ptr server_instances::create_instance(const common_instance & cfg) {
     // management ops serialize on mutex_mgmt, so the duplicate check below stays
     // authoritative through the push at the bottom (no concurrent create/destroy can
@@ -1059,6 +1202,8 @@ server_http_res_ptr server_instances::create_instance(const common_instance & cf
             }
             return make_error(503, "unavailable_error", "server is shutting down");
         }
+        // explicitly created means explicitly demanded: the window exists from here on
+        inst->built = true;
         instances.push_back(inst);
         cond_dispatch.notify_all();  // wake group waiters so the new member can be picked
     }
@@ -1095,15 +1240,20 @@ server_http_res_ptr server_instances::destroy_instance(const std::string & name,
         return make_error(format_error_response("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND));
     }
 
-    // abort in-flight generation, then drain the remaining dispatched requests so no
-    // HTTP reader is left hanging when the scheduler is stopped below
-    inst->ctx_server->abort_slots("instance '" + name + "' evicted");
+    // an unbuilt window never started a scheduler and owns no context: nothing to
+    // abort, drain or join (no dispatch can be inside it: ensure_built_instance only
+    // reports success once built is set)
+    if (inst->built) {
+        // abort in-flight generation, then drain the remaining dispatched requests so no
+        // HTTP reader is left hanging when the scheduler is stopped below
+        inst->ctx_server->abort_slots("instance '" + name + "' evicted");
 
-    {
-        instance_drain_guard guard(*this, inst);
-        inst->ctx_server->terminate();
-        if (inst->loop_thread.joinable()) {
-            inst->loop_thread.join();
+        {
+            instance_drain_guard guard(*this, inst);
+            inst->ctx_server->terminate();
+            if (inst->loop_thread.joinable()) {
+                inst->loop_thread.join();
+            }
         }
     }
 
@@ -1152,6 +1302,14 @@ server_http_res_ptr server_instances::resize_instance(const std::string & name, 
         }
         if (!inst) {
             return make_error(format_error_response("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND));
+        }
+        // an unbuilt window has no context to rebuild: record the new size, it applies
+        // when the window materializes on first demand
+        if (!inst->built) {
+            inst->cfg.ctx_size = new_ctx;
+            inst->effective     = common_instance_params(params, inst->cfg);
+            IST_INF("instance '%s' resized to ctx = %d (applies on first demand)\n", name.c_str(), new_ctx);
+            return make_ok(instance_to_json(*inst));
         }
     }
 
@@ -1218,6 +1376,15 @@ server_http_res_ptr server_instances::handle_get_health(const server_http_req & 
             { "instances", 0         },
         });
     }
+    // a registered-but-undemanded default is healthy too, and probing it must NOT
+    // materialize its window: orchestrators poll /health constantly, and a probe
+    // is not a demand
+    if (!inst->built) {
+        return make_ok({
+            { "status",    "ok"      },
+            { "instances", (int) snapshot_instances().size() },
+        });
+    }
     // every remaining instance is loaded by construction; a destroyed instance is removed
     active_route_guard guard(*this, *inst);
     if (!guard.acquired) {
@@ -1234,6 +1401,10 @@ server_http_res_ptr server_instances::handle_get_slots(const server_http_req & r
     if (model_id.empty() && instance_field.empty()) {
         json all_slots = json::array();
         for (const auto & inst : snapshot_instances()) {
+            // unbuilt windows have no slots yet; listing them must not build them
+            if (!inst->built) {
+                continue;
+            }
             active_route_guard guard(*this, *inst);
             if (!guard.acquired) {
                 continue;  // being destroyed/resized; skip it
@@ -1254,6 +1425,9 @@ server_http_res_ptr server_instances::handle_get_slots(const server_http_req & r
     const resolve_target target = resolve(model_id, instance_field, error);
     if (target.kind != target_kind::INSTANCE) {
         return make_error(error.empty() ? "invalid instance for slots" : error, ERROR_TYPE_INVALID_REQUEST);
+    }
+    if (auto err = ensure_built_instance(target.inst)) {
+        return err;
     }
     active_route_guard guard(*this, *target.inst);
     if (!guard.acquired) {
@@ -1288,6 +1462,9 @@ server_http_res_ptr server_instances::handle_post_slots(const server_http_req & 
     if (target.kind != target_kind::INSTANCE) {
         return make_error(error.empty() ? "invalid instance for slot action" : error, ERROR_TYPE_INVALID_REQUEST);
     }
+    if (auto err = ensure_built_instance(target.inst)) {
+        return err;
+    }
     active_route_guard guard(*this, *target.inst);
     if (!guard.acquired) {
         return make_error("instance '" + target.inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
@@ -1299,6 +1476,9 @@ server_http_res_ptr server_instances::handle_get_props(const server_http_req & r
     auto inst = default_instance();
     if (!inst) {
         return make_error("no instances loaded", ERROR_TYPE_SERVER);
+    }
+    if (auto err = ensure_built_instance(inst)) {
+        return err;
     }
     active_route_guard guard(*this, *inst);
     if (!guard.acquired) {
@@ -1335,6 +1515,9 @@ server_http_res_ptr server_instances::handle_post_props(const server_http_req & 
     if (!inst) {
         return make_error("no instances loaded", ERROR_TYPE_SERVER);
     }
+    if (auto err = ensure_built_instance(inst)) {
+        return err;
+    }
     active_route_guard guard(*this, *inst);
     if (!guard.acquired) {
         return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
@@ -1370,6 +1553,9 @@ server_http_res_ptr server_instances::handle_post_control(const server_http_req 
     auto inst = default_instance();
     if (!inst) {
         return make_error("no instances loaded", ERROR_TYPE_SERVER);
+    }
+    if (auto err = ensure_built_instance(inst)) {
+        return err;
     }
     active_route_guard guard(*this, *inst);
     if (!guard.acquired) {
@@ -1409,6 +1595,9 @@ server_http_res_ptr server_instances::handle_post_apply_template(const server_ht
     if (!inst) {
         return make_error("no instances loaded", ERROR_TYPE_SERVER);
     }
+    if (auto err = ensure_built_instance(inst)) {
+        return err;
+    }
     active_route_guard guard(*this, *inst);
     if (!guard.acquired) {
         return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
@@ -1422,6 +1611,17 @@ server_http_res_ptr server_instances::handle_get_models(const server_http_req & 
     json models = json::array();
     json data   = json::array();
     for (const auto & inst : snapshot_instances()) {
+        // a registered-but-undemanded window is listed without building it: a mere
+        // listing must never materialize a context
+        if (!inst->built) {
+            data.push_back({
+                { "id",       instance_id(*inst)        },
+                { "n_ctx",    inst->effective.n_ctx     },
+                { "parallel", inst->effective.n_parallel },
+                { "status",   "unloaded"                },
+            });
+            continue;
+        }
         active_route_guard guard(*this, *inst);
         if (!guard.acquired) {
             continue;  // being destroyed/resized; skip it
@@ -1457,6 +1657,9 @@ server_http_res_ptr server_instances::handle_post_tokenize(const server_http_req
     if (!inst) {
         return make_error("no instances loaded", ERROR_TYPE_SERVER);
     }
+    if (auto err = ensure_built_instance(inst)) {
+        return err;
+    }
     active_route_guard guard(*this, *inst);
     if (!guard.acquired) {
         return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
@@ -1468,6 +1671,9 @@ server_http_res_ptr server_instances::handle_post_detokenize(const server_http_r
     auto inst = default_instance();
     if (!inst) {
         return make_error("no instances loaded", ERROR_TYPE_SERVER);
+    }
+    if (auto err = ensure_built_instance(inst)) {
+        return err;
     }
     active_route_guard guard(*this, *inst);
     if (!guard.acquired) {
@@ -1495,6 +1701,9 @@ server_http_res_ptr server_instances::handle_get_lora_adapters(const server_http
     if (!inst) {
         return make_error("no instances loaded", ERROR_TYPE_SERVER);
     }
+    if (auto err = ensure_built_instance(inst)) {
+        return err;
+    }
     active_route_guard guard(*this, *inst);
     if (!guard.acquired) {
         return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
@@ -1506,6 +1715,9 @@ server_http_res_ptr server_instances::handle_post_lora_adapters(const server_htt
     auto inst = default_instance();
     if (!inst) {
         return make_error("no instances loaded", ERROR_TYPE_SERVER);
+    }
+    if (auto err = ensure_built_instance(inst)) {
+        return err;
     }
     active_route_guard guard(*this, *inst);
     if (!guard.acquired) {
@@ -1613,6 +1825,12 @@ server_http_res_ptr server_instances::handle_post_instance_snapshot(const server
     auto inst = get_instance(name);
     if (!inst) {
         return make_error(format_error_response("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND));
+    }
+    // saving needs live KV; unlike a generation request, a save must not materialize
+    // a window as a side effect
+    if (!inst->built) {
+        return make_error(format_error_response("instance '" + name + "' has no loaded context",
+                                                ERROR_TYPE_NOT_FOUND));
     }
     if (id_slot < 0 || (size_t) id_slot >= inst->slot_snapshots.size()) {
         return make_error("invalid slot id", ERROR_TYPE_INVALID_REQUEST);
@@ -1759,6 +1977,10 @@ server_http_res_ptr server_instances::handle_delete_instance_snapshot(const serv
 
 void server_instances::start_loops() {
     for (const auto & inst : instances) {
+        // unbuilt windows have no scheduler yet; their loop starts on first demand
+        if (!inst->ctx_server) {
+            continue;
+        }
         inst->loop_thread = std::thread([inst]() { inst->ctx_server->start_loop(); });
     }
     start_io_worker();
@@ -1794,7 +2016,10 @@ void server_instances::terminate() {
     }
 
     for (const auto & inst : live) {
-        inst->ctx_server->terminate();
+        // unbuilt windows never started a scheduler and own no context
+        if (inst->ctx_server) {
+            inst->ctx_server->terminate();
+        }
     }
     for (const auto & inst : live) {
         if (inst->loop_thread.joinable()) {

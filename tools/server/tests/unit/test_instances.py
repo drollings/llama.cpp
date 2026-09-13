@@ -41,7 +41,8 @@ def test_instances_two_pool_list():
         "tinyllama-2:ledger",
     }
 
-    # each entry carries the memory breakdown and an always-loaded state
+    # no demand yet: every configured window is registered but unbuilt, so the
+    # entries carry identity with zero bytes and an unloaded state
     for inst in body["instances"]:
         assert "model_bytes" in inst
         assert "context_bytes" in inst
@@ -50,10 +51,27 @@ def test_instances_two_pool_list():
         assert inst["total_bytes"] == inst["model_bytes"] + inst["context_bytes"] + inst["compute_bytes"]
         assert "vram_bytes" in inst
         assert inst["vram_bytes"] == inst["context_bytes"] + inst["compute_bytes"]
-        assert inst["state"] == "loaded"
+        assert inst["state"] == "unloaded"
+        assert inst["context_bytes"] == 0
+        assert inst["compute_bytes"] == 0
         # this branch has no auto-sleep: neither field may be reported
         assert "sleep_idle_seconds" not in inst
         assert "no_sleep" not in inst
+
+    # one demand builds exactly one window: swarm0 loads, the rest stay unloaded
+    res = server.make_request("POST", "/completion", data={
+        "model": "tinyllama-2:swarm0",
+        "prompt": "What is the capital of France?",
+        "n_predict": 4,
+    })
+    assert res.status_code == 200
+
+    states = {inst["id"]: inst["state"] for inst in _get_instances()["instances"]}
+    assert states == {
+        "tinyllama-2:swarm0": "loaded",
+        "tinyllama-2:swarm1": "unloaded",
+        "tinyllama-2:ledger": "unloaded",
+    }
 
     # the envelope sums a 64-bit total; the shared model bytes are counted once
     assert "total" in body
@@ -160,7 +178,10 @@ def test_instances_envelope():
 
     inst = body["instances"][0]
     assert inst["total_bytes"] == inst["model_bytes"] + inst["context_bytes"] + inst["compute_bytes"]
-    assert inst["state"] == "loaded"
+    # no demand yet: registered but unbuilt
+    assert inst["state"] == "unloaded"
+    assert inst["context_bytes"] == 0
+    assert inst["compute_bytes"] == 0
 
 
 def test_instances_concurrency_overlap():
@@ -188,6 +209,12 @@ def test_instances_concurrency_overlap():
         })
         assert res.status_code == 200
         return time.time() - t0
+
+    # windows materialize on first demand (and first demands serialize on the pool
+    # lock), so warm both windows first: this test measures scheduler overlap,
+    # not build time
+    generate("a")
+    generate("b")
 
     # two requests to different instances, fired concurrently
     results = parallel_function_calls([(generate, ("a",)), (generate, ("b",))])
@@ -439,6 +466,13 @@ def test_instances_delete_last_unloads():
     server.n_ctx = 512
     server.start()
 
+    # one demand materializes the window, so the shared weights are counted
+    res = server.make_request("POST", "/completion", data={
+        "model": "tinyllama-2:a",
+        "prompt": "demand",
+        "n_predict": 1,
+    })
+    assert res.status_code == 200
     assert _get_instances()["total"]["model"] > 0
 
     res = server.make_request("DELETE", "/instances/a")

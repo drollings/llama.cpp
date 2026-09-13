@@ -50,9 +50,13 @@ struct server_instance {
     // running  = the scheduler thread is alive; set false the moment destroy begins so a
     //            stale shared_ptr can never post a task to a terminated queue
     // n_active_dispatch = in-flight requests routed to this instance
+    // built    = the context window (KV + compute), routes and scheduler exist. a
+    //            registered instance starts unbuilt; the first demand for it
+    //            materializes exactly one window (see ensure_built_instance).
     bool removing          = false;
     bool running           = true;
     int  n_active_dispatch = 0;
+    bool built             = false;
 };
 
 // manages the pool: one shared model load, many named contexts (instances).
@@ -88,9 +92,12 @@ struct server_instances {
     // one-shot teardown flag, guarded by mutex_dispatch (see terminate())
     bool terminated = false;
 
-    // load the shared model once and build one context per configured instance.
-    // with no instances configured, a single default instance is created so the
+    // load the shared model once and register one entry per configured instance.
+    // with no instances configured, a single default instance is created AND built so the
     // manager can act as a drop-in replacement for the legacy single-context server.
+    // configured instances are NOT built here: each context window materializes on
+    // first demand for that instance (see ensure_built_instance), so declaring N
+    // instances never costs N windows upfront.
     bool load(const common_params & params);
 
     // --- name resolution ---
@@ -157,6 +164,12 @@ struct server_instances {
   private:
     resolve_target        resolve_instance_or_group(const std::string & target, std::string & error) const;
     std::optional<size_t> pick_best_available(const std::string & group) const;
+    // materialize one registered instance on first demand: reloads the shared weights
+    // when the pool went cold, allocates only this instance's context window from them,
+    // and starts its scheduler. serializes on mutex_mgmt (lock order everywhere is
+    // mgmt -> dispatch), so concurrent first demands for one instance collapse onto a
+    // single build. call with NO locks held. nullptr = ready to serve.
+    server_http_res_ptr ensure_built_instance(const std::shared_ptr<server_instance> & inst);
     server_http_res_ptr   dispatch_group(const server_http_req & req,
                                          const std::string &     group,
                                          const std::string &     snapshot,
