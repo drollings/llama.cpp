@@ -34,6 +34,34 @@ static void server_instance_size_slot_locks(std::vector<std::unique_ptr<std::mut
     }
 }
 
+// guardrail: a context window this large that nobody asked for explicitly almost
+// always means the train-ctx default fired on a long-context model (e.g. a 9B model
+// with 262144 train ctx silently reserving ~10 GiB of KV on a 21 GiB card). warn
+// loudly, before the allocation, with the remedy. explicit sizes stay silent: the
+// operator asked for those.
+static constexpr int32_t HUGE_CTX_WARN_TOKENS = 32768;
+
+static void warn_if_huge_implicit_ctx(const llama_model * model, const common_params & effective, const char * instance_name) {
+    if (model == nullptr || effective.n_ctx != 0) {
+        return; // explicit size (or nothing to compare against): not the footgun
+    }
+    const int32_t n_ctx_train = llama_model_n_ctx_train(model);
+    if (n_ctx_train < HUGE_CTX_WARN_TOKENS) {
+        return;
+    }
+    // rough KV footprint for the message: layers * kv_heads * head_dim * K+V * cache
+    // bytes. head_dim ~= n_embd / n_head holds for the GQA families this branch serves;
+    // hybrid (SSM) state is extra, so this is a lower bound.
+    const int64_t n_layer   = llama_model_n_layer(model);
+    const int64_t n_head    = llama_model_n_head(model);
+    const int64_t head_dim  = n_head > 0 ? llama_model_n_embd(model) / n_head : 0;
+    const int64_t kv_elems  = (int64_t) n_ctx_train * n_layer * llama_model_n_head_kv(model) * head_dim * 2;
+    const double  bytes_per = (double) ggml_type_size(effective.cache_type_k) / (double) ggml_blck_size(effective.cache_type_k);
+    IST_WRN("instance '%s' has no explicit context size and inherits the full train context (%d tokens, KV cache alone ~%.1f GiB): "
+            "pass --ctx-size or instance ctx= to avoid filling device memory\n",
+            instance_name, n_ctx_train, (double) kv_elems * bytes_per / 1073741824.0);
+}
+
 // RAII exclusive access for destroy/resize: set removing = true, wait for in-flight
 // dispatches to drain, then restore the flag on scope exit.
 struct instance_drain_guard {
@@ -136,6 +164,10 @@ bool server_instances::load(const common_params & params) {
         if (inst->effective.n_ctx == 0) {
             IST_INF("instance '%s' inherits the model's default context size\n", cfg.name.c_str());
         }
+
+        // guardrail at registration: a huge implicit window is almost never intended,
+        // and this is the first line an operator sees for it (before any demand builds it)
+        warn_if_huge_implicit_ctx(model, inst->effective, cfg.name.c_str());
 
         instances.push_back(std::move(inst));
 
@@ -1032,6 +1064,9 @@ std::shared_ptr<server_instance> server_instances::build_instance(const common_i
         IST_INF("instance '%s' inherits the model's default context size\n", cfg.name.c_str());
     }
 
+    // guardrail before the allocation: a huge implicit window is almost never intended
+    warn_if_huge_implicit_ctx(model, inst->effective, cfg.name.c_str());
+
     // shared ownership of the pool's weights: the context borrows `model`, so this copy
     // guarantees the model outlives the context (and any transient shared_ptr reference
     // to this instance held by an aggregate handler) even after the pool frees its copy
@@ -1102,6 +1137,9 @@ server_http_res_ptr server_instances::ensure_built_instance(const std::shared_pt
         }
         IST_INF("reloaded shared model weights '%s'\n", params.model.path.c_str());
     }
+
+    // guardrail before the allocation: a huge implicit window is almost never intended
+    warn_if_huge_implicit_ctx(model, inst->effective, inst->cfg.name.c_str());
 
     // allocate only this instance's KV + compute buffers from the already-loaded weights
     auto ctx_server = std::make_unique<server_context>();
