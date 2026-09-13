@@ -16,6 +16,13 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
+
+// pure merge for GET /instances aggregation across children (implemented in
+// server-models.cpp). each entry pairs a child model name with its
+// GET /instances envelope; see server_models::get_instances_aggregate.
+json server_models_merge_instances(const std::vector<std::pair<std::string, json>> & per_model);
 
 /**
  * state diagram:
@@ -301,6 +308,13 @@ public:
     // proxy an HTTP request to the model instance
     server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached = false);
 
+    // aggregate GET /instances across every running child (or just `only`
+    // when non-empty): concatenated instance rows, snapshots tagged with
+    // their owning "model", 64-bit-summed totals. children without the
+    // management API (no --instance flags) or unreachable children are
+    // skipped, never fatal. thread-safe.
+    json get_instances_aggregate(const std::string & only = "");
+
     // handle message sent from server_child::notify_to_router()
     // raw input must starts with CMD_CHILD_TO_ROUTER_STATE, followed by a JSON string
     // called from the monitor thread
@@ -372,6 +386,10 @@ struct server_models_routes {
     server_http_context::handler_t router_stream_get;
     server_http_context::handler_t router_streams_lookup;
     server_http_context::handler_t router_stream_delete;
+
+    // GET /instances[?model=<child>]: the aggregate instance envelope across
+    // children (see server_models::get_instances_aggregate)
+    server_http_context::handler_t get_router_instances;
 };
 
 /**

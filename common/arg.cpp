@@ -824,7 +824,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
             }
             if (!seen_args.insert(arg).second) {
-                const bool skip = (arg == "--spec-type");
+                const bool skip = (arg == "--spec-type" || arg == "--instance");
 
                 if (!skip) {
                     LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
@@ -1644,13 +1644,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE"));
     add_opt(common_arg(
-        { "--kv-unified-per-slot" }, "N",
-        "context limit per parallel slot (default: unset, behavior unchanged).\n"
-        "when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N",
-        [](common_params & params, int value) {
-            params.kv_unified_per_slot = value;
+        {"--instance"}, "INSTANCE",
+        "define a named context instance sharing this model's weights, format: "
+        "name[:group=G][:ctx=N][:parallel=M][:pinned][:default] (repeatable, comma-separated values also accepted)",
+        [](common_params & params, const std::string & value) {
+            for (auto & inst : common_instances_parse(value)) {
+                params.instances.push_back(std::move(inst));
+            }
         }
-    ).set_env("LLAMA_ARG_KV_UNIFIED_PER_SLOT").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_INSTANCES"));
+    add_opt(common_arg(
+        {"--instance-wait"}, "SECONDS",
+        "how long a group-targeted request waits for a free instance before returning 503 "
+        "(default: 60; -1 = wait forever)",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("invalid value: cannot be less than -1");
+            }
+            params.instance_wait_seconds = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_INSTANCE_WAIT"));
     add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
