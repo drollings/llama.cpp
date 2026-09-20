@@ -20,6 +20,7 @@
 #include "../../src/llama-ext.h" // llama_get_memory_breakdown for the manager memory-reporting API
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -267,6 +268,8 @@ struct server_slot {
 
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
+    // wall-clock twin of t_last_used for cross-process idle accounting; seconds, -1 = never
+    int64_t t_last_used_wall_s = -1;
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
@@ -550,6 +553,8 @@ struct server_slot {
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
             t_last_used = ggml_time_us();
+            t_last_used_wall_s = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
 
             state = SLOT_STATE_IDLE;
 
@@ -4418,7 +4423,7 @@ std::vector<server_slot_info> server_context::get_slot_info() const {
     const auto & slots = impl->slots;
     out.reserve(slots.size());
     for (const auto & slot : slots) {
-        out.push_back({ slot.id, !slot.is_processing(), slot.t_last_used });
+        out.push_back({ slot.id, !slot.is_processing(), slot.t_last_used, slot.t_last_used_wall_s });
     }
     return out;
 }

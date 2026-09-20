@@ -838,6 +838,22 @@ static int64_t instance_last_used(const server_instance & inst) {
     return t_last_used;
 }
 
+// wall-clock twin of instance_last_used: unix epoch seconds of the most recent slot
+// release, -1 when unused or unbuilt. safe to compare against the caller's own clock
+// and across processes, unlike the monotonic last_used.
+static int64_t instance_last_used_epoch(const server_instance & inst) {
+    if (!inst.built) {
+        return -1;
+    }
+    int64_t t_last_used_epoch = -1;
+    for (const auto & slot : inst.ctx_server->get_slot_info()) {
+        if (slot.t_last_used_wall_s >= 0) {
+            t_last_used_epoch = std::max(t_last_used_epoch, slot.t_last_used_wall_s);
+        }
+    }
+    return t_last_used_epoch;
+}
+
 json server_instances::instance_to_json(const server_instance & inst) const {
     // an unbuilt (registered but never demanded) window owns no buffers yet
     if (!inst.built) {
@@ -855,6 +871,7 @@ json server_instances::instance_to_json(const server_instance & inst,
                                         uint64_t                context_bytes,
                                         uint64_t                compute_bytes) const {
     const int64_t t_last_used = instance_last_used(inst);
+    const int64_t t_last_used_epoch = instance_last_used_epoch(inst);
 
     return json{
         { "id", instance_id(inst) },
@@ -874,6 +891,7 @@ json server_instances::instance_to_json(const server_instance & inst,
         // documented alias kept for the list() contract: context + compute
         { "vram_bytes", context_bytes + compute_bytes },
         { "last_used", t_last_used },
+        { "last_used_epoch", t_last_used_epoch },
     };
 }
 

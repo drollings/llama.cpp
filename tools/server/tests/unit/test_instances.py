@@ -54,6 +54,8 @@ def test_instances_two_pool_list():
         assert inst["state"] == "unloaded"
         assert inst["context_bytes"] == 0
         assert inst["compute_bytes"] == 0
+        assert inst["last_used"] == -1
+        assert inst["last_used_epoch"] == -1
         # this branch has no auto-sleep: neither field may be reported
         assert "sleep_idle_seconds" not in inst
         assert "no_sleep" not in inst
@@ -72,6 +74,18 @@ def test_instances_two_pool_list():
         "tinyllama-2:swarm1": "unloaded",
         "tinyllama-2:ledger": "unloaded",
     }
+
+    # last_used_epoch is the wall-clock twin of the monotonic last_used: unix epoch
+    # seconds of the most recent slot release, so a router can compute idle time
+    # against its own clock. unused/unbuilt instances report -1 for both.
+    import time
+    now = int(time.time())
+    epochs = {inst["id"]: inst["last_used_epoch"] for inst in _get_instances()["instances"]}
+    assert epochs["tinyllama-2:swarm1"] == -1
+    assert epochs["tinyllama-2:ledger"] == -1
+    assert now - 300 <= epochs["tinyllama-2:swarm0"] <= now + 60
+    used = {inst["id"]: inst for inst in _get_instances()["instances"]}["tinyllama-2:swarm0"]
+    assert used["last_used"] >= 0
 
     # the envelope sums a 64-bit total; the shared model bytes are counted once
     assert "total" in body
