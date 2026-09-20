@@ -1,8 +1,18 @@
+#include "server-instances.h"
 #include "server-snapshot.h"
 #include "server-models.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <future>
+#include <memory>
+#include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -92,10 +102,310 @@ static void test_merge_saturates() {
     assert(out["total"]["total"] == UINT64_MAX);
 }
 
-int main() {
-    test_layout_paths();
+// golden for the /instances envelope shape: exact key sets and value types as
+// served today. later changes must keep this green unless they state a new shape.
+static void test_instances_envelope_shape() {
+    server_instances mgr;
+    mgr.base_name = "tinyllama-2";
+    mgr.params.slot_save_path = "";
+
+    auto inst = std::make_shared<server_instance>();
+    inst->cfg.name       = "ledger";
+    inst->cfg.group      = "ledger";
+    inst->cfg.pinned     = true;
+    inst->cfg.is_default = true;
+    inst->effective.n_ctx      = 512;
+    inst->effective.n_parallel = 1;
+    inst->built = false;
+    mgr.instances.push_back(inst);
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req req { {}, {}, "/instances", "", "", {}, no_stop };
+
+    auto res = mgr.handle_get_instances(req);
+    assert(res->status == 200);
+
+    const json body = json::parse(res->data);
+    assert(body.is_object());
+    assert(body.size() == 3);
+    assert(body.contains("instances"));
+    assert(body.contains("snapshots"));
+    assert(body.contains("total"));
+
+    assert(body["instances"].is_array());
+    assert(body["instances"].size() == 1);
+    assert(body["snapshots"].is_array());
+
+    const json total = body["total"];
+    assert(total.is_object());
+    assert(total.size() == 4);
+    assert(total.contains("model") && total["model"].is_number_integer());
+    assert(total.contains("context") && total["context"].is_number_integer());
+    assert(total.contains("compute") && total["compute"].is_number_integer());
+    assert(total.contains("total") && total["total"].is_number_integer());
+
+    const json row = body["instances"][0];
+    assert(row.is_object());
+    const std::vector<std::string> keys = {
+        "id", "aliases", "group", "n_ctx", "parallel", "pinned", "is_default",
+        "state", "model_bytes", "context_bytes", "compute_bytes", "total_bytes",
+        "vram_bytes", "last_used", "last_used_epoch",
+    };
+    assert(row.size() == keys.size());
+    for (const auto & key : keys) {
+        assert(row.contains(key));
+    }
+    assert(row["id"].is_string());
+    assert(row["aliases"].is_array());
+    assert(row["group"].is_string());
+    assert(row["n_ctx"].is_number());
+    assert(row["parallel"].is_number());
+    assert(row["pinned"].is_boolean());
+    assert(row["is_default"].is_boolean());
+    assert(row["state"].is_string());
+    assert(row["model_bytes"].is_number_integer());
+    assert(row["context_bytes"].is_number_integer());
+    assert(row["compute_bytes"].is_number_integer());
+    assert(row["total_bytes"].is_number_integer());
+    assert(row["vram_bytes"].is_number_integer());
+    assert(row["last_used"].is_number());
+    assert(row["last_used_epoch"].is_number());
+}
+
+// ordering over routing candidates: fewest busy wins, then least recently used,
+// then registration order. full or slot-less members are never picked.
+static void test_pick_best_candidate() {
+    using cand = server_instances::route_candidate;
+
+    // busy-first: the idle member wins over a busier one regardless of stamps
+    assert(server_instances::pick_best_candidate({
+        { 0, 1, 1, 100 },
+        { 1, 1, 0, 900 },
+    }) == std::optional<size_t>(1));
+
+    // then least-recently-used among equally busy members
+    assert(server_instances::pick_best_candidate({
+        { 0, 2, 1, 900 },
+        { 1, 2, 1, 100 },
+    }) == std::optional<size_t>(1));
+
+    // then registration order on a full tie: members are pushed in registration
+    // order, and a strict compare keeps the first one seen
+    assert(server_instances::pick_best_candidate({
+        { 0, 1, 0, 500 },
+        { 1, 1, 0, 500 },
+    }) == std::optional<size_t>(0));
+    assert(server_instances::pick_best_candidate({
+        { 1, 1, 0, 500 },
+        { 0, 1, 0, 500 },
+    }) == std::optional<size_t>(1));
+
+    // all-busy group excludes every member
+    assert(!server_instances::pick_best_candidate({
+        { 0, 1, 1, 100 },
+        { 1, 2, 2, 200 },
+    }).has_value());
+
+    // control: a fresh unbuilt member (no slots) never outranks a used one,
+    // even when the used member is the only one with a window
+    assert(server_instances::pick_best_candidate({
+        { 0, 0, 0, -1 },
+        { 1, 1, 0, 700 },
+    }) == std::optional<size_t>(1));
+
+    // control: a fresh built member (never used) is picked before a used one
+    // at equal busyness; the cold member spreads the first load
+    assert(server_instances::pick_best_candidate({
+        { 0, 1, 0, 700 },
+        { 1, 1, 0, -1 },
+    }) == std::optional<size_t>(1));
+}
+
+// the pure unbuilt cases of the n_ctx display rule: explicit sizes report as
+// requested; inheriting reports 0 until the weights are loaded (the model
+// default comes from a live pool, covered by the server golden).
+static void test_displayed_n_ctx_unbuilt() {
+    server_instances mgr; // weights never loaded
+    server_instance  inst;
+    inst.built = false;
+    inst.effective.n_parallel = 1;
+
+    inst.effective.n_ctx = 256;
+    assert(mgr.displayed_n_ctx(inst) == 256);
+
+    inst.effective.n_ctx = 0;
+    assert(mgr.displayed_n_ctx(inst) == 0);
+}
+
+// pool I/O worker lifecycle: no job can be posted to a stopped or
+// never-started worker. post returns nullopt there instead of a future
+// that would never complete (callers answer the existing retriable 503).
+static void test_snapshot_io_post_lifecycle() {
+    server_instances mgr;
+
+    // before start: no worker exists, the post refuses fast
+    assert(!mgr.snapshot_io_post([]() {}).has_value());
+
+    mgr.start_io_worker();
+    // double start is a no-op: still exactly one worker draining the queue
+    mgr.start_io_worker();
+    auto fut = mgr.snapshot_io_post([]() {});
+    assert(fut.has_value());
+    fut->wait();
+    fut->get();
+
+    mgr.stop_io_worker();
+    // after stop: the post refuses again, never a dangling future
+    assert(!mgr.snapshot_io_post([]() {}).has_value());
+
+    // double stop is a no-op (and so is the terminate() in the destructor)
+    mgr.stop_io_worker();
+}
+
+// hashed write keys: identities that sanitize alike never share a directory,
+// while the legacy mapping is unchanged so old files stay readable.
+static void test_snapshot_model_keys() {
+    // collision control group: sanitization twins get distinct write dirs
+    const std::string slash = server_snapshot_model_key_hashed("a/b");
+    const std::string colon = server_snapshot_model_key_hashed("a:b");
+    const std::string plain = server_snapshot_model_key_hashed("a_b");
+    assert(slash != colon && slash != plain && colon != plain);
+
+    // each write key extends the legacy mapping with a hash suffix
+    assert(slash.substr(0, 4) == "a_b-");
+    assert(colon.substr(0, 4) == "a_b-");
+
+    // deterministic across calls
+    assert(server_snapshot_model_key_hashed("org/model") == server_snapshot_model_key_hashed("org/model"));
+
+    // the legacy mapping is unchanged (the read fallback for old files)
+    assert(server_snapshot_model_key("a/b") == "a_b");
+    assert(server_snapshot_model_key("a:b") == "a_b");
+    assert(server_snapshot_model_key("tinyllama-2") == "tinyllama-2");
+}
+
+// resolve order: hashed-key scoped file wins, then the previous-key scoped
+// file, then the legacy flat file; "" when none exists.
+static void test_snapshot_resolve_key_fallback() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path root = fs::temp_directory_path(ec) / "llama-m8-resolve";
+    fs::remove_all(root, ec);
+
+    server_instances mgr;
+    mgr.base_name = "a/b";  // previous key "a_b", write key "a_b-<hash>"
+    mgr.params.slot_save_path = root.string();
+
+    const std::string p_new  = mgr.snapshot_instance_path("ledger", "work");
+    const std::string p_prev = mgr.snapshot_instance_path_prev("ledger", "work");
+    const std::string p_leg  = mgr.snapshot_legacy_path("work");
+    assert(p_new != p_prev);
+
+    const auto touch = [&](const std::string & p) {
+        fs::create_directories(fs::path(p).parent_path(), ec);
+        std::ofstream out(p, std::ios::binary);
+        out.put('x');
+    };
+
+    assert(mgr.resolve_snapshot_path("ledger", "work").empty());
+
+    touch(p_leg);
+    assert(mgr.resolve_snapshot_path("ledger", "work") == p_leg);
+
+    touch(p_prev);
+    assert(mgr.resolve_snapshot_path("ledger", "work") == p_prev);
+
+    touch(p_new);
+    assert(mgr.resolve_snapshot_path("ledger", "work") == p_new);
+
+    fs::remove_all(root, ec);
+}
+
+// firing rule for the huge-implicit-window guardrail: warns iff the window
+// inherits its size (n_ctx == 0) on a large-train model. the null-model case
+// never reaches the predicate (the caller returns first).
+static void test_huge_implicit_ctx_predicate() {
+    // must fire: inherit on a large-train model, including the threshold itself
+    assert(server_should_warn_huge_implicit_ctx(0, 32768));
+    assert(server_should_warn_huge_implicit_ctx(0, 262144));
+
+    // must not fire: explicit size, however small or large
+    assert(!server_should_warn_huge_implicit_ctx(1, 262144));
+    assert(!server_should_warn_huge_implicit_ctx(512, 262144));
+    assert(!server_should_warn_huge_implicit_ctx(2147483647, 262144));
+
+    // must not fire: inherit on a small-train model, including just below threshold
+    assert(!server_should_warn_huge_implicit_ctx(0, 0));
+    assert(!server_should_warn_huge_implicit_ctx(0, 4096));
+    assert(!server_should_warn_huge_implicit_ctx(0, 32767));
+}
+
+// snapshot switch budget: 2 concurrent switches are allowed, the 3rd is
+// rejected. the deadline-free rejections are exact (no clock or sleep).
+static void test_snapshot_switch_budget() {
+    server_instances mgr;
+
+    // within budget: both switches acquire, never a 503
+    server_instances::switch_guard first(mgr, INT64_MAX);
+    server_instances::switch_guard second(mgr, INT64_MAX);
+    assert(first.acquired && second.acquired);
+
+    // over budget with no time left to wait: rejected immediately
+    server_instances::switch_guard third(mgr, 0);
+    assert(!third.acquired);
+}
+
+// snapshot I/O queue budget: max_io_jobs (4) queued writes are accepted, the
+// 5th is rejected with the retriable nullopt. a pinned worker job makes the
+// drain deterministic (no clock or sleep on the test thread).
+static void test_snapshot_io_queue_budget() {
+    server_instances mgr;
+    mgr.start_io_worker();
+
+    // pin the worker inside one job so nothing drains while the queue fills
+    std::promise<void> entered;
+    std::atomic<bool>  release{false};
+    auto pin = mgr.snapshot_io_post([&]() {
+        entered.set_value();
+        while (!release.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    assert(pin.has_value());
+    entered.get_future().wait();
+
+    // four queued posts accepted...
+    std::vector<std::future<void>> queued;
+    for (int i = 0; i < 4; i++) {
+        auto fut = mgr.snapshot_io_post([]() {});
+        assert(fut.has_value());
+        queued.push_back(std::move(*fut));
+    }
+    // ...the 5th queued write is rejected
+    assert(!mgr.snapshot_io_post([]() {}).has_value());
+
+    release.store(true);
+    pin->wait();
+    pin->get();
+    for (auto & fut : queued) {
+        fut.wait();
+        fut.get();
+    }
+    mgr.stop_io_worker();
+}
+
+int main() {    test_layout_paths();
     test_merge();
     test_merge_tolerates_shape_drift();
     test_merge_saturates();
+    test_instances_envelope_shape();
+    test_pick_best_candidate();
+    test_displayed_n_ctx_unbuilt();
+    test_snapshot_io_post_lifecycle();
+    test_snapshot_model_keys();
+    test_snapshot_resolve_key_fallback();
+    test_huge_implicit_ctx_predicate();
+    test_snapshot_switch_budget();
+    test_snapshot_io_queue_budget();
     return 0;
 }

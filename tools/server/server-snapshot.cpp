@@ -1,6 +1,8 @@
 #include "server-snapshot.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -139,6 +141,27 @@ static std::string snapshot_join(const std::string & root, const std::string & r
         return root + rest;
     }
     return root + "/" + rest;
+}
+
+std::string server_snapshot_model_key(const std::string & base_name) {
+    std::string key = base_name;
+    std::replace(key.begin(), key.end(), '/', '_');
+    std::replace(key.begin(), key.end(), ':', '_');
+    return key;
+}
+
+std::string server_snapshot_model_key_hashed(const std::string & base_name) {
+    // FNV-1a 32-bit over the original name: deterministic across runs and
+    // platforms (unlike std::hash), 8 hex chars, filesystem-safe. a collision
+    // merely reproduces the old shared-directory behavior, never corruption.
+    uint32_t hash = 2166136261u;
+    for (const char c : base_name) {
+        hash ^= (uint8_t) c;
+        hash *= 16777619u;
+    }
+    char suffix[9];
+    snprintf(suffix, sizeof(suffix), "%08x", hash);
+    return server_snapshot_model_key(base_name) + "-" + suffix;
 }
 
 std::string server_snapshot_instance_dir(const std::string & slot_save_path,

@@ -2113,7 +2113,13 @@ else the file name):
 | `base:latest` | the `default` instance |
 | `base:work` | the instance named `work` (exact name match wins over group) |
 | `base:jobs` | the group `jobs` - dispatches to its least-busy free member |
+| `base:latest:work` | the instance named `work` via the reserved `latest` pin |
+| `base:latest:jobs` | the group `jobs` via the reserved `latest` pin - dispatches to its least-busy free member |
 | anything else | `404 model not found on this child` |
+
+`latest` is a reserved routing token: no instance name or group may be called
+`latest` (rejected with `400`), and ids with more than three `:`-separated
+components never resolve.
 
 The explicit `instance` field overrides the instance/group component of `model`. A request
 may also carry `snapshot` (apply a saved KV snapshot, see below) and `id_slot` (default `0`).
@@ -2138,14 +2144,21 @@ Endpoints without a `model` field (`/health`, `/props`, `/tokenize`, `/detokeniz
     "n_ctx": 8192, "parallel": 1, "pinned": false, "is_default": false,
     "state": "loaded",
     "model_bytes": 0, "context_bytes": 0, "compute_bytes": 0,
-    "total_bytes": 0, "vram_bytes": 0, "last_used": -1
+    "total_bytes": 0, "vram_bytes": 0, "last_used": -1, "last_used_epoch": -1
   } ],
-  "snapshots": [ { "name": "...", "size": 0, "mtime": 0, "n_ctx_seq": 0 } ],
+  "snapshots": [ { "name": "...", "size": 0, "mtime": 0, "n_ctx_seq": 0, "instance": "work" } ],
   "total": { "model": 0, "context": 0, "compute": 0, "total": 0 }
 }
 ```
 
-`state` is always `"loaded"` (no auto-sleep in this branch). The shared `model_bytes` are
+`state` is `"loaded"` once the window exists, `"unloaded"` while the instance is
+registered but never demanded (a mere listing never materializes a window).
+`n_ctx` is the actual window size: explicit `ctx=` is reported as configured,
+while an inheriting instance reports the model default once built (or while the
+weights are loaded), `0` only when the weights are unloaded. `last_used` is the
+monotonic microsecond stamp of the last completion (`-1` when unused or
+unbuilt); `last_used_epoch` is the same event in unix epoch seconds for
+cross-process idle math. The shared `model_bytes` are
 counted once in `total.model`. When the last instance is deleted the weights are freed, the
 pool reports `instances: []` and all-zero totals, and a later `POST /instances` reloads them.
 
@@ -2162,8 +2175,12 @@ Toggle the advisory `pinned` flag. Pinned is never enforced in this branch.
 
 #### POST `/instances/:name/resize`
 
-Body: `{ "ctx_size": 4096 }`. Rebuilds the instance's context at the new size (the KV cache
-is rebuilt; slot snapshot bindings are cleared). Returns `200` with the instance JSON.
+Body: `{ "ctx_size": 4096 }`. Tears down the old context and rebuilds the
+instance's window at the new size (the KV cache is rebuilt; slot snapshot
+bindings are cleared). Returns `200` with `{ "n_ctx": <actual size> }`. If the
+rebuild fails the instance is left unbuilt and the endpoint returns `507`; a
+later demand retries the build at the new size. Resizing an unbuilt instance
+only records the size for its first demand.
 
 #### DELETE `/instances/:name`
 
@@ -2173,18 +2190,26 @@ thread is stopped. Deleting the last instance unloads the shared weights. Return
 
 #### Snapshot save / restore
 
-`--slot-save-path DIR` must be set. Snapshots are stored as `DIR/<base>.bin` (the pool
-identity is sanitized: `/` and `:` become `_`).
+`--slot-save-path DIR` must be set (`501` without it). Snapshots are scoped
+per instance: new files are written as
+`DIR/<model_key>/<instance>/<snapshot>.bin`, where `model_key` is the pool
+identity sanitized (`/` and `:` become `_`) plus a short deterministic hash so
+identities that sanitize alike never share a directory. Files written before
+per-instance scoping live flat at `DIR/<model_key>/<snapshot>.bin` (legacy
+layout); reads fall back to them, per-instance lists include them tagged
+`"instance": null`, and a fresh save supersedes them.
 
 - `POST /instances/:name/snapshot` body `{ "name": "foo" }` saves slot `0`'s KV and binds it.
   Returns `201`.
-- `GET /instances/:name/snapshots` lists the pool's snapshots.
+- `GET /instances/:name/snapshots` returns `200` with `{ "snapshots": [...] }`
+  for that instance's namespace (own files plus legacy flat files).
 - `DELETE /instances/:name/snapshot/foo` removes the file and unbinds it. Returns
   `{ "success": true }`.
 - A request carrying `"snapshot": "foo"` loads that snapshot into the slot, replacing its KV
   and prompt; while the slot is bound to a snapshot, later requests extend it and the
   extended KV is saved back when the slot switches away. A snapshot saved under a different
-  context size is rejected with `400`.
+  context size is rejected with `400`; a missing snapshot is `404`; a corrupt file is
+  `400`; a busy worker or a timed-out switch is `503`.
 
 ## API errors
 

@@ -198,6 +198,26 @@ def test_instances_envelope():
     assert inst["compute_bytes"] == 0
 
 
+def test_instances_props_shape():
+    """Golden for the /props shape on an instance server: total_slots plus the
+    per-instance array key set."""
+    global server
+    server.instances = ["swarm0:group=swarm:ctx=512"]
+    server.n_ctx = 512
+    server.start()
+
+    res = server.make_request("GET", "/props")
+    assert res.status_code == 200
+    assert "total_slots" in res.body
+    assert res.body["total_slots"] == 1
+    assert "instances" in res.body
+    assert isinstance(res.body["instances"], list)
+    assert len(res.body["instances"]) == 1
+    assert set(res.body["instances"][0].keys()) == {"name", "group", "n_ctx"}
+    assert res.body["instances"][0]["name"] == "swarm0"
+    assert res.body["instances"][0]["group"] == "swarm"
+
+
 def test_instances_concurrency_overlap():
     """Two simultaneous long generations on two different instances overlap (1b).
 
@@ -311,11 +331,17 @@ def test_instances_post_invalid_name_400():
     server.n_ctx = 512
     server.start()
 
-    for bad_name in ["a:b", "a=b", "a/b", "a b"]:
+    for bad_name in ["a:b", "a=b", "a/b", "a b", "latest"]:
         res = server.make_request("POST", "/instances", data={
             "name": bad_name, "group": "swarm", "ctx_size": 512,
         })
         assert res.status_code == 400, f"name {bad_name!r} should be rejected with 400"
+
+    # 'latest' is a reserved routing token, also rejected as a group
+    res = server.make_request("POST", "/instances", data={
+        "name": "work", "group": "latest", "ctx_size": 512,
+    })
+    assert res.status_code == 400
 
     # a valid name still creates an instance
     res = server.make_request("POST", "/instances", data={
@@ -364,6 +390,100 @@ def test_instances_snapshot_management():
     assert res.status_code == 200
     res = server.make_request("GET", "/instances/a/snapshots")
     assert not any(s["name"] == "foo" for s in res.body["snapshots"])
+
+
+# --- M7: a snapshot-save burst at startup resolves fast and never hangs ---
+def test_instances_snapshot_startup_burst():
+    """Snapshot saves fired the moment the server accepts requests must each
+    resolve with a valid status, never hang, and never 500. Saves landing
+    before the pool I/O worker starts fail fast with the retriable 503;
+    saves landing on the still-unbuilt window 404 (a save must not build
+    a window); saves after first demand succeed."""
+    global server
+    snap_dir = tempfile.mkdtemp()
+    server.instances = ["a:group=swarm:ctx=512"]
+    server.n_ctx = 512
+    server.slot_save_path = snap_dir
+    server.start()
+
+    def save(name: str) -> int:
+        res = server.make_request("POST", "/instances/a/snapshot", data={"name": name})
+        return res.status_code
+
+    # burst immediately: no demand has built the window yet
+    t0 = time.time()
+    results = parallel_function_calls([(save, (f"burst-{i}",)) for i in range(8)])
+    burst_s = time.time() - t0
+
+    # every save resolved (no hang), each with a valid startup status
+    assert len(results) == 8
+    for status in results:
+        assert status in (201, 404, 503), f"unexpected startup save status: {status}"
+    # 8 deadline-bounded saves must not serialize into a long stall
+    assert burst_s < 60, f"startup snapshot burst stalled: {burst_s:.1f}s"
+
+    # after first demand the window is built and a save succeeds
+    res = server.make_request("POST", "/completion", data={
+        "model": "tinyllama-2:a",
+        "prompt": "The quick brown fox jumps over the lazy dog",
+        "n_predict": 4,
+    })
+    assert res.status_code == 200
+    res = server.make_request("POST", "/instances/a/snapshot", data={"name": "after"})
+    assert res.status_code == 201
+
+
+# --- M10: sequential snapshot switches stay within budget (never 503) ---
+def test_instances_snapshot_switch_within_budget():
+    """A save / switch-away / switch-back cycle runs one switch at a time with
+    an empty I/O queue, so every step must succeed: a switch within the
+    documented budgets (2 concurrent switches, 4 queued writes) never 503s."""
+    global server
+    snap_dir = tempfile.mkdtemp()
+    server.instances = ["a:group=swarm:ctx=512"]
+    server.n_ctx = 512
+    server.slot_save_path = snap_dir
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "model": "tinyllama-2:a",
+        "prompt": "The quick brown fox jumps over the lazy dog",
+        "n_predict": 4,
+    })
+    assert res.status_code == 200
+
+    # save the starting KV as foo (a save binds the slot)
+    res = server.make_request("POST", "/instances/a/snapshot", data={"name": "foo"})
+    assert res.status_code == 201
+
+    res = server.make_request("POST", "/completion", data={
+        "model": "tinyllama-2:a",
+        "prompt": " continues",
+        "n_predict": 4,
+    })
+    assert res.status_code == 200
+
+    # save the extended KV as bar (binds bar)
+    res = server.make_request("POST", "/instances/a/snapshot", data={"name": "bar"})
+    assert res.status_code == 201
+
+    # switch back to foo: saves bar back, restores foo
+    res = server.make_request("POST", "/completion", data={
+        "model": "tinyllama-2:a",
+        "snapshot": "foo",
+        "prompt": " resumes",
+        "n_predict": 4,
+    })
+    assert res.status_code == 200
+
+    # and back to bar: saves foo back, restores bar
+    res = server.make_request("POST", "/completion", data={
+        "model": "tinyllama-2:a",
+        "snapshot": "bar",
+        "prompt": " resumes",
+        "n_predict": 4,
+    })
+    assert res.status_code == 200
 
 
 # --- L5: a missing snapshot yields a clean 404 (not a 500) ---
@@ -513,3 +633,176 @@ def test_instances_delete_last_unloads():
     assert res.status_code == 201
     body = _get_instances()
     assert body["total"]["model"] > 0, "POST /instances did not reload the shared weights"
+
+
+def test_instances_kv_unified_per_slot_plain_server():
+    """Control: --kv-unified-per-slot on a server without instances sizes the KV
+    pool as upstream (n_parallel * per-slot) and still serves."""
+    global server
+    server.instances = None
+    server.n_ctx = None
+    server.n_slots = 2
+    server.kv_unified_per_slot = 256
+    server.start()
+
+    res = server.make_request("GET", "/props")
+    assert res.status_code == 200
+    assert res.body["total_slots"] == 2
+    # pool sized to 2 * 256 = 512, split across 2 slots
+    assert res.body["default_generation_settings"]["n_ctx"] == 256
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France?",
+        "n_predict": 4,
+    })
+    assert res.status_code == 200
+
+
+def test_instances_last_used_advances_on_completion():
+    """last_used/last_used_epoch are stamped on slot release: -1 while unused,
+    non-decreasing across completions, and untouched by mere listings."""
+    global server
+    server.instances = ["a:group=swarm:ctx=512"]
+    server.n_ctx = 512
+    server.start()
+
+    def _last_used():
+        inst = _get_instances()["instances"][0]
+        return inst["last_used"], inst["last_used_epoch"]
+
+    # unused and unbuilt: both clocks report -1
+    assert _last_used() == (-1, -1)
+
+    import time
+    res = server.make_request("POST", "/completion", data={
+        "model": "tinyllama-2:a",
+        "prompt": "What is the capital of France?",
+        "n_predict": 4,
+    })
+    assert res.status_code == 200
+
+    first_used, first_epoch = _last_used()
+    assert first_used >= 0
+    now = int(time.time())
+    assert now - 300 <= first_epoch <= now + 60
+
+    # listings never advance either clock
+    assert _last_used() == (first_used, first_epoch)
+
+    res = server.make_request("POST", "/completion", data={
+        "model": "tinyllama-2:a",
+        "prompt": "And the capital of Spain?",
+        "n_predict": 4,
+    })
+    assert res.status_code == 200
+
+    second_used, second_epoch = _last_used()
+    assert second_used >= first_used
+    assert second_epoch >= first_epoch
+
+
+def test_instances_routing_matrix():
+    """Full routing matrix: every advertised alias form resolves, illegal forms
+    are rejected, and the explicit `instance` field overrides the model id."""
+    global server
+    server.instances = [
+        "a:group=g:ctx=512",
+        "b:group=g:ctx=512",
+        "c:group=h:ctx=512:pinned:default",
+    ]
+    server.n_ctx = 512
+    server.start()
+
+    res = server.make_request("GET", "/models")
+    assert res.status_code == 200
+    ids = {d["id"] for d in res.body["data"]}
+    assert ids == {"tinyllama-2:a", "tinyllama-2:b", "tinyllama-2:c"}
+
+    def complete(model=None, instance=None):
+        data = {"prompt": "What is the capital of France?", "n_predict": 4}
+        if model is not None:
+            data["model"] = model
+        if instance is not None:
+            data["instance"] = instance
+        return server.make_request("POST", "/completion", data=data)
+
+    def states():
+        return {inst["id"]: inst["state"] for inst in _get_instances()["instances"]}
+
+    # base:name routes to that member only
+    assert complete("tinyllama-2:a").status_code == 200
+    assert states()["tinyllama-2:a"] == "loaded"
+    assert states()["tinyllama-2:b"] == "unloaded"
+
+    # the explicit instance field overrides the model id (b serves, a untouched)
+    assert complete("tinyllama-2:a", instance="b").status_code == 200
+    assert states()["tinyllama-2:b"] == "loaded"
+
+    # base:group, base:latest:name, base:latest:group, bare base, base:latest
+    assert complete("tinyllama-2:g").status_code == 200
+    assert complete("tinyllama-2:latest:b").status_code == 200
+    assert complete("tinyllama-2:latest:g").status_code == 200
+    assert complete("tinyllama-2").status_code == 200
+    assert states()["tinyllama-2:c"] == "loaded"
+    assert complete("tinyllama-2:latest").status_code == 200
+
+    # a foreign pool name is strictly rejected, never defaulted
+    assert complete("other-pool:a").status_code == 400
+    # more than three components is never a legal id
+    assert complete("tinyllama-2:a:b:c").status_code == 400
+    # 'latest' anywhere but the reserved middle slot is rejected
+    assert complete("tinyllama-2:a:latest").status_code == 400
+    assert complete("tinyllama-2:latest:latest").status_code == 400
+
+
+def test_instances_nctx_inherit_reports_default():
+    """An instance with no `ctx=` reports the model default (non-zero): the
+    train size while unbuilt, the real window once built. An explicit size is
+    reported unchanged both ways (control group)."""
+    global server
+    server.instances = ["plain:group=g", "sized:group=g:ctx=256"]
+    server.n_ctx = None  # inherit the model default (effective 0)
+    server.start()
+
+    rows = {inst["id"]: inst for inst in _get_instances()["instances"]}
+    assert rows["tinyllama-2:plain"]["state"] == "unloaded"
+    assert rows["tinyllama-2:plain"]["n_ctx"] == 2048
+    assert rows["tinyllama-2:sized"]["n_ctx"] == 256
+
+    res = server.make_request("POST", "/completion", data={
+        "model": "tinyllama-2:plain",
+        "prompt": "What is the capital of France?",
+        "n_predict": 4,
+    })
+    assert res.status_code == 200
+
+    rows = {inst["id"]: inst for inst in _get_instances()["instances"]}
+    assert rows["tinyllama-2:plain"]["state"] == "loaded"
+    assert rows["tinyllama-2:plain"]["n_ctx"] == 2048
+    assert rows["tinyllama-2:sized"]["n_ctx"] == 256
+
+
+def test_instances_resize_unbuilt_applies_on_demand():
+    """Resizing an unbuilt window only records the size; the first demand
+    builds at the new size (the retry half of the teardown contract; a failed
+    rebuild 507s and stays unbuilt, covered deterministically in C++)."""
+    global server
+    server.instances = ["a:group=g:ctx=512"]
+    server.n_ctx = 512
+    server.start()
+
+    res = server.make_request("POST", "/instances/a/resize", data={"ctx_size": 1024})
+    assert res.status_code == 200
+    rows = {inst["id"]: inst for inst in _get_instances()["instances"]}
+    assert rows["tinyllama-2:a"]["state"] == "unloaded"
+    assert rows["tinyllama-2:a"]["n_ctx"] == 1024
+
+    res = server.make_request("POST", "/completion", data={
+        "model": "tinyllama-2:a",
+        "prompt": "What is the capital of France?",
+        "n_predict": 4,
+    })
+    assert res.status_code == 200
+    rows = {inst["id"]: inst for inst in _get_instances()["instances"]}
+    assert rows["tinyllama-2:a"]["state"] == "loaded"
+    assert rows["tinyllama-2:a"]["n_ctx"] == 1024

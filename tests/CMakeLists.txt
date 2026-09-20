@@ -169,11 +169,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-server-instances-snapshots.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-server-instances-snapshots PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-instances-snapshots PRIVATE server-context llama-server-impl llama-common)
-    # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
-    if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
-        llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-        target_include_directories(test-json-schema-to-grammar PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
-    endif()
+    llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
@@ -331,6 +327,8 @@ llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-common-instances.cpp ARGS -m "${MODEL_DEST}")
+target_include_directories(test-common-instances PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_link_libraries(test-common-instances PRIVATE server-context llama-server-impl llama-common)
 set_tests_properties(test-common-instances PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 if (APPLE)

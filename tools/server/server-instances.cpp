@@ -4,24 +4,17 @@
 #include "log.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <thread>
 
 #define IST_INF(fmt, ...) LOG_INF("inst %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define IST_WRN(fmt, ...) LOG_WRN("inst %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define IST_ERR(fmt, ...) LOG_ERR("inst %12.*s: " fmt, 12, __func__, __VA_ARGS__)
-
-// sanitize the pool identity into a directory name for snapshots: both '/' and ':'
-// are replaced by '_' so the path is filesystem-safe
-static std::string server_instance_model_key(const std::string & base_name) {
-    std::string key = base_name;
-    std::replace(key.begin(), key.end(), '/', '_');
-    std::replace(key.begin(), key.end(), ':', '_');
-    return key;
-}
 
 // size the per-slot snapshot locks: one heap-allocated mutex per slot so the vector
 // survives resize() (std::mutex is not movable) and switching different slots of one
@@ -41,14 +34,18 @@ static void server_instance_size_slot_locks(std::vector<std::unique_ptr<std::mut
 // operator asked for those.
 static constexpr int32_t HUGE_CTX_WARN_TOKENS = 32768;
 
+bool server_should_warn_huge_implicit_ctx(int32_t effective_n_ctx, int32_t n_ctx_train) {
+    return effective_n_ctx == 0 && n_ctx_train >= HUGE_CTX_WARN_TOKENS;
+}
+
 static void warn_if_huge_implicit_ctx(const llama_model * model, const common_params & effective, const char * instance_name) {
-    if (model == nullptr || effective.n_ctx != 0) {
-        return; // explicit size (or nothing to compare against): not the footgun
+    if (model == nullptr) {
+        return; // nothing to compare against: not the footgun
+    }
+    if (!server_should_warn_huge_implicit_ctx(effective.n_ctx, llama_model_n_ctx_train(model))) {
+        return; // explicit size, or a train context too small to matter
     }
     const int32_t n_ctx_train = llama_model_n_ctx_train(model);
-    if (n_ctx_train < HUGE_CTX_WARN_TOKENS) {
-        return;
-    }
     // rough KV footprint for the message: layers * kv_heads * head_dim * K+V * cache
     // bytes. head_dim ~= n_embd / n_head holds for the GQA families this branch serves;
     // hybrid (SSM) state is extra, so this is a lower bound.
@@ -133,6 +130,7 @@ bool server_instances::load(const common_params & params) {
         return false;
     }
     IST_INF("loaded shared model weights '%s'\n", params.model.path.c_str());
+    train_ctx_cached.store(llama_model_n_ctx_train(model), std::memory_order_relaxed);
 
     std::vector<common_instance> inst_cfgs = params.instances;
     if (inst_cfgs.empty()) {
@@ -288,16 +286,74 @@ server_instances::resolve_target server_instances::resolve(const std::string & m
         return resolve_instance_or_group(target, error);
     }
 
+    // <base>:latest:<name|group> -> that member. 'latest' is reserved, so a
+    // middle component holding anything else cannot be a legal id; more than
+    // three components is never a legal id either.
+    if (comps.size() == 3) {
+        if (comps[1] != "latest") {
+            error = "model not found: '" + model_id + "'";
+            return res;
+        }
+        std::string target = comps[2];
+
+        // the explicit `instance` request field overrides the model's instance/group component
+        if (!explicit_instance.empty()) {
+            target = explicit_instance;
+        }
+        return resolve_instance_or_group(target, error);
+    }
+
     error = "model not found: '" + model_id + "'";
     return res;
 }
 
-std::optional<size_t> server_instances::pick_best_available(const std::string & group) const {
+// single reduction of an instance's slot activity, shared by group routing and
+// last-used reporting: unbuilt windows report never-used stamps; built windows
+// report the scheduler-published aggregates (max stamps, busy count). this is
+// the one place the fresh policy is defined: last_used_us == -1 sorts a cold
+// member before any used member among equally-busy candidates.
+static server_context_stats instance_stats(const server_instance & inst) {
+    if (!inst.built) {
+        return server_context_stats{};
+    }
+    return inst.ctx_server->get_stats();
+}
+
+std::optional<size_t> server_instances::pick_best_candidate(const std::vector<route_candidate> & members) {
     std::optional<size_t> best;
     int                   best_busy = INT32_MAX;
     int64_t               best_lru  = INT64_MAX;
 
+    for (const auto & cand : members) {
+        // unbuilt (no slots) and fully busy members are never candidates; when
+        // every member is busy the caller waits for a slot release instead
+        if (cand.n_slots <= 0 || cand.n_busy >= cand.n_slots) {
+            continue;
+        }
+
+        // prefer fewer busy slots, then least-recently-used; tie-break by
+        // instance order (strict compare keeps the first registration)
+        bool better = false;
+        if (!best) {
+            better = true;
+        } else if (cand.n_busy != best_busy) {
+            better = cand.n_busy < best_busy;
+        } else {
+            better = cand.last_used_us < best_lru;
+        }
+
+        if (better) {
+            best      = cand.index;
+            best_busy = cand.n_busy;
+            best_lru  = cand.last_used_us;
+        }
+    }
+    return best;
+}
+
+std::optional<size_t> server_instances::pick_best_available(const std::string & group) const {
     // caller must hold mutex_dispatch
+    std::vector<route_candidate> members;
     for (size_t i = 0; i < instances.size(); ++i) {
         const server_instance & inst = *instances[i];
         // removing = a management op owns the instance; running = false once a destroy or
@@ -308,46 +364,10 @@ std::optional<size_t> server_instances::pick_best_available(const std::string & 
             continue;
         }
 
-        const auto slots    = inst.ctx_server->get_slot_info();
-        int        busy     = 0;
-        bool       any_used = false;
-        int64_t    lru      = INT64_MAX;
-        for (const auto & slot : slots) {
-            if (!slot.idle) {
-                busy++;
-            }
-            if (slot.t_last_used >= 0) {
-                any_used = true;
-                lru      = std::min(lru, slot.t_last_used);
-            }
-        }
-        if (!any_used) {
-            lru = 0;  // a fresh, warm instance is the most recently used
-        }
-
-        // only members with at least one idle slot are candidates; when every member is
-        // busy the caller waits for a slot release instead of dispatching onto a queue
-        if (busy >= (int) slots.size()) {
-            continue;
-        }
-
-        // prefer fewer busy slots, then least-recently-used; tie-break by instance order
-        bool better = false;
-        if (!best) {
-            better = true;
-        } else if (busy != best_busy) {
-            better = busy < best_busy;
-        } else {
-            better = lru < best_lru;
-        }
-
-        if (better) {
-            best      = i;
-            best_busy = busy;
-            best_lru  = lru;
-        }
+        const server_context_stats stats = instance_stats(inst);
+        members.push_back({ i, inst.effective.n_parallel, stats.n_processing, stats.last_used_us });
     }
-    return best;
+    return pick_best_candidate(members);
 }
 
 //
@@ -823,35 +843,27 @@ void server_instances::apply_identity(server_instance & inst) {
     inst.ctx_server->set_model_aliases(instance_aliases(inst.cfg.name, inst.cfg.group));
 }
 
+int32_t server_instances::displayed_n_ctx(const server_instance & inst) const {
+    if (inst.built) {
+        return inst.ctx_server->get_n_ctx();
+    }
+    if (inst.effective.n_ctx > 0) {
+        return inst.effective.n_ctx;
+    }
+    return train_ctx_cached.load(std::memory_order_relaxed);
+}
+
 // most recent slot use across an instance (max t_last_used over its slots), -1 when unused
 // (or unbuilt: a registered window has no slots yet)
 static int64_t instance_last_used(const server_instance & inst) {
-    if (!inst.built) {
-        return -1;
-    }
-    int64_t t_last_used = -1;
-    for (const auto & slot : inst.ctx_server->get_slot_info()) {
-        if (slot.t_last_used >= 0) {
-            t_last_used = std::max(t_last_used, slot.t_last_used);
-        }
-    }
-    return t_last_used;
+    return instance_stats(inst).last_used_us;
 }
 
 // wall-clock twin of instance_last_used: unix epoch seconds of the most recent slot
 // release, -1 when unused or unbuilt. safe to compare against the caller's own clock
 // and across processes, unlike the monotonic last_used.
 static int64_t instance_last_used_epoch(const server_instance & inst) {
-    if (!inst.built) {
-        return -1;
-    }
-    int64_t t_last_used_epoch = -1;
-    for (const auto & slot : inst.ctx_server->get_slot_info()) {
-        if (slot.t_last_used_wall_s >= 0) {
-            t_last_used_epoch = std::max(t_last_used_epoch, slot.t_last_used_wall_s);
-        }
-    }
-    return t_last_used_epoch;
+    return instance_stats(inst).last_used_wall_s;
 }
 
 json server_instances::instance_to_json(const server_instance & inst) const {
@@ -877,7 +889,7 @@ json server_instances::instance_to_json(const server_instance & inst,
         { "id", instance_id(inst) },
         { "aliases", instance_aliases(inst.cfg.name, inst.cfg.group) },
         { "group", inst.cfg.group },
-        { "n_ctx", inst.effective.n_ctx },
+        { "n_ctx", displayed_n_ctx(inst) },
         { "parallel", inst.effective.n_parallel },
         { "pinned", inst.cfg.pinned },
         { "is_default", inst.cfg.is_default },
@@ -939,6 +951,58 @@ json server_instances::get_instances_json() const {
     };
 }
 
+// one snapshot row builder for both JSON producers: {name, size, mtime,
+// n_ctx_seq, instance}. the tag is the owning instance name, or null for
+// legacy flat files.
+static void push_snapshot_row(std::vector<json> & entries, const server_snapshot_meta & meta, const json & instance_tag) {
+    entries.push_back({
+        { "name",      meta.name      },
+        { "size",      meta.size      },
+        { "mtime",     meta.mtime     },
+        { "n_ctx_seq", meta.n_ctx_seq },
+        { "instance",  instance_tag   },
+    });
+}
+
+// list one model-key directory: legacy flat files (null instance tag) plus every
+// instance subdirectory (a snapshot outlives its instance, so every subdirectory
+// is listed for cold-pool discoverability, not just live instances). `seen`
+// dedupes scoped entries already listed from the newer (hashed) key so a
+// re-saved snapshot appears once; legacy rows predate hashing and are never
+// deduped.
+static void list_snapshot_key_dir(const std::string & dir,
+                                  bool include_legacy,
+                                  const std::function<void(const server_snapshot_meta &, const json &)> & push,
+                                  std::set<std::string> & seen) {
+    if (include_legacy) {
+        for (const auto & meta : server_snapshot_list(dir)) {
+            push(meta, nullptr);
+        }
+    }
+    std::error_code          ec;
+    std::vector<std::string> subdirs;
+    std::filesystem::directory_iterator it(dir, ec);
+    if (!ec) {
+        for (const auto & entry : it) {
+            if (ec) {
+                break;
+            }
+            if (entry.is_directory(ec)) {
+                subdirs.push_back(entry.path().filename().string());
+            }
+        }
+    }
+    std::sort(subdirs.begin(), subdirs.end());
+    for (const auto & sub : subdirs) {
+        for (const auto & meta : server_snapshot_list(dir + "/" + sub)) {
+            if (!seen.insert(sub + '\0' + meta.name).second) {
+                continue;
+            }
+            push(meta, sub);
+        }
+    }
+}
+
 json server_instances::pool_snapshots_json() const {
     // null-safe string field read for ordering (common_json::value() throws
     // on a null, and legacy entries are explicitly tagged null)
@@ -950,43 +1014,20 @@ json server_instances::pool_snapshots_json() const {
     };
     std::vector<json> entries;
     if (!params.slot_save_path.empty()) {
-        const std::string model_key = server_instance_model_key(base_name);
-        const std::string dir       = params.slot_save_path + model_key;
+        const std::string model_key     = server_snapshot_model_key(base_name);
+        const std::string model_key_new = server_snapshot_model_key_hashed(base_name);
+        const std::string dir           = params.slot_save_path + model_key;
+        const std::string dir_new       = params.slot_save_path + model_key_new;
         const auto push = [&entries](const server_snapshot_meta & meta, const json & instance_tag) {
-            entries.push_back({
-                { "name",      meta.name      },
-                { "size",      meta.size      },
-                { "mtime",     meta.mtime     },
-                { "n_ctx_seq", meta.n_ctx_seq },
-                { "instance",  instance_tag   },
-            });
+            push_snapshot_row(entries, meta, instance_tag);
         };
+        // a snapshot re-saved after the key change exists under both keys; the
+        // hashed key is listed first so its row wins and the older one is skipped.
+        // legacy flat files predate hashing and live only under the old key.
+        std::set<std::string> seen_scoped;
+        list_snapshot_key_dir(dir_new, false, push, seen_scoped);
         // legacy flat files (pre-per-instance layout), tagged with a null instance
-        for (const auto & meta : server_snapshot_list(dir)) {
-            push(meta, nullptr);
-        }
-        // per-instance subdirectories, tagged with the owning instance name. a
-        // snapshot outlives its instance (cold-pool discoverability), so every
-        // subdirectory is listed, not just live instances.
-        std::error_code          ec;
-        std::vector<std::string> subdirs;
-        std::filesystem::directory_iterator it(dir, ec);
-        if (!ec) {
-            for (const auto & entry : it) {
-                if (ec) {
-                    break;
-                }
-                if (entry.is_directory(ec)) {
-                    subdirs.push_back(entry.path().filename().string());
-                }
-            }
-        }
-        std::sort(subdirs.begin(), subdirs.end());
-        for (const auto & sub : subdirs) {
-            for (const auto & meta : server_snapshot_list(dir + "/" + sub)) {
-                push(meta, sub);
-            }
-        }
+        list_snapshot_key_dir(dir, true, push, seen_scoped);
     }
     // deterministic envelope: order by (instance, name), legacy (null) first
     std::sort(entries.begin(), entries.end(), [&str_field](const json & a, const json & b) {
@@ -1001,30 +1042,33 @@ json server_instances::pool_snapshots_json() const {
     return snapshots;
 }
 
-// snapshots visible to one instance: its own instance-scoped directory plus
-// the legacy flat files (migration read path, tagged with a null instance).
+// snapshots visible to one instance: its own instance-scoped directory (new key
+// first, then the previous key) plus the legacy flat files (migration read
+// path, tagged with a null instance).
 json server_instances::instance_snapshots_json(const std::string & instance) const {
     std::vector<json> entries;
     if (!params.slot_save_path.empty()) {
-        const std::string model_key = server_instance_model_key(base_name);
-        const std::string dir       = params.slot_save_path + model_key;
+        const std::string model_key     = server_snapshot_model_key(base_name);
+        const std::string model_key_new = server_snapshot_model_key_hashed(base_name);
+        const std::string dir           = params.slot_save_path + model_key;
+        const std::string dir_new       = params.slot_save_path + model_key_new;
+        const auto push_scoped = [&entries, &instance](const server_snapshot_meta & meta) {
+            push_snapshot_row(entries, meta, instance);
+        };
+        // the hashed key wins over the previous key for re-saved snapshots
+        std::set<std::string> seen;
+        for (const auto & meta : server_snapshot_list(dir_new + "/" + instance)) {
+            seen.insert(meta.name);
+            push_scoped(meta);
+        }
         for (const auto & meta : server_snapshot_list(dir + "/" + instance)) {
-            entries.push_back({
-                { "name",      meta.name      },
-                { "size",      meta.size      },
-                { "mtime",     meta.mtime     },
-                { "n_ctx_seq", meta.n_ctx_seq },
-                { "instance",  instance       },
-            });
+            if (!seen.insert(meta.name).second) {
+                continue;
+            }
+            push_scoped(meta);
         }
         for (const auto & meta : server_snapshot_list(dir)) {
-            entries.push_back({
-                { "name",      meta.name      },
-                { "size",      meta.size      },
-                { "mtime",     meta.mtime     },
-                { "n_ctx_seq", meta.n_ctx_seq },
-                { "instance",  nullptr        },
-            });
+            push_snapshot_row(entries, meta, nullptr);
         }
     }
     std::stable_sort(entries.begin(), entries.end(), [](const json & a, const json & b) {
@@ -1045,22 +1089,37 @@ json server_instances::instance_snapshots_json(const std::string & instance) con
 
 std::string server_instances::snapshot_instance_path(const std::string & instance,
                                                      const std::string & snapshot) const {
-    return server_snapshot_instance_path(params.slot_save_path, server_instance_model_key(base_name),
+    // the only write target: the hashed key, so identities that sanitize alike
+    // never share a directory
+    return server_snapshot_instance_path(params.slot_save_path, server_snapshot_model_key_hashed(base_name),
+                                         instance, snapshot);
+}
+
+std::string server_instances::snapshot_instance_path_prev(const std::string & instance,
+                                                          const std::string & snapshot) const {
+    // read fallback for files written before key hashing (same shape as the
+    // scoped -> legacy fallback below)
+    return server_snapshot_instance_path(params.slot_save_path, server_snapshot_model_key(base_name),
                                          instance, snapshot);
 }
 
 std::string server_instances::snapshot_legacy_path(const std::string & snapshot) const {
-    return server_snapshot_legacy_path(params.slot_save_path, server_instance_model_key(base_name), snapshot);
+    return server_snapshot_legacy_path(params.slot_save_path, server_snapshot_model_key(base_name), snapshot);
 }
 
-// resolve a snapshot for read (and save-back): the instance-scoped file wins;
-// the legacy flat file is the migration fallback. "" when neither exists.
+// resolve a snapshot for read (and save-back): the hashed-key scoped file wins,
+// then the previous-key scoped file, then the legacy flat file (migration
+// fallbacks). "" when none exists.
 std::string server_instances::resolve_snapshot_path(const std::string & instance,
                                                     const std::string & snapshot) const {
     std::error_code ec;
     const std::string inst_path = snapshot_instance_path(instance, snapshot);
     if (std::filesystem::exists(inst_path, ec)) {
         return inst_path;
+    }
+    const std::string prev_path = snapshot_instance_path_prev(instance, snapshot);
+    if (std::filesystem::exists(prev_path, ec)) {
+        return prev_path;
     }
     const std::string leg_path = snapshot_legacy_path(snapshot);
     if (std::filesystem::exists(leg_path, ec)) {
@@ -1069,46 +1128,104 @@ std::string server_instances::resolve_snapshot_path(const std::string & instance
     return "";
 }
 
-std::shared_ptr<server_instance> server_instances::build_instance(const common_instance & cfg) {
-    auto inst       = std::make_shared<server_instance>();
-    inst->cfg       = cfg;
-    inst->effective = common_instance_params(params, cfg);
+server_instances::server_instances(context_builder_fn builder) {
+    set_context_builder(std::move(builder));
+}
 
-    if (inst->effective.n_parallel < 1) {
-        IST_WRN("instance '%s' has no valid n_parallel, defaulting to 1\n", cfg.name.c_str());
-        inst->effective.n_parallel = 1;
+void server_instances::set_context_builder(context_builder_fn builder) {
+    if (builder) {
+        context_builder = std::move(builder);
+    } else {
+        context_builder = [this](server_instance & inst) { return build_context_default(inst); };
     }
-    if (inst->effective.n_ctx == 0) {
-        IST_INF("instance '%s' inherits the model's default context size\n", cfg.name.c_str());
+}
+
+void server_instances::start_instance_loop_locked(server_instance & inst) {
+    // non-recursive mutex: try_lock fails exactly when the caller holds it
+    assert(mutex_dispatch.try_lock() == false);
+    if (inst.loop_started) {
+        return;
     }
+    inst.loop_thread = std::thread([&inst]() { inst.ctx_server->start_loop(); });
+    inst.loop_started = true;
+}
 
-    // guardrail before the allocation: a huge implicit window is almost never intended
-    warn_if_huge_implicit_ctx(model, inst->effective, cfg.name.c_str());
-
+bool server_instances::build_context_default(server_instance & inst) {
     // shared ownership of the pool's weights: the context borrows `model`, so this copy
     // guarantees the model outlives the context (and any transient shared_ptr reference
     // to this instance held by an aggregate handler) even after the pool frees its copy
-    inst->model_owner = model_init;
+    inst.model_owner = model_init;
 
     // allocate only this instance's KV + compute buffers from the already-loaded weights
-    inst->ctx_server = std::make_unique<server_context>();
-    if (!inst->ctx_server->load_model(inst->effective, model)) {
-        return nullptr;
+    inst.ctx_server = std::make_unique<server_context>();
+    if (!inst.ctx_server->load_model(inst.effective, model)) {
+        inst.ctx_server.reset();
+        inst.model_owner.reset();
+        return false;
     }
 
-    apply_identity(*inst);
+    apply_identity(inst);
 
-    inst->slot_snapshots.resize((size_t) inst->effective.n_parallel);
-    server_instance_size_slot_locks(inst->mutex_snapshot, inst->effective.n_parallel);
+    inst.slot_snapshots.resize((size_t) inst.effective.n_parallel);
+    server_instance_size_slot_locks(inst.mutex_snapshot, inst.effective.n_parallel);
 
-    inst->routes = std::make_unique<server_routes>(inst->effective, *inst->ctx_server);
-    inst->routes->update_meta(*inst->ctx_server);
+    inst.routes = std::make_unique<server_routes>(inst.effective, *inst.ctx_server);
+    inst.routes->update_meta(*inst.ctx_server);
 
     // wake group waiters on the first 0->capacity transition
-    inst->ctx_server->set_slot_release_callback([this](int) {
+    inst.ctx_server->set_slot_release_callback([this](int) {
         std::lock_guard<std::mutex> lock(mutex_dispatch);
         cond_dispatch.notify_all();
     });
+
+    return true;
+}
+
+bool server_instances::build_context_into(server_instance & inst) {
+    inst.effective = common_instance_params(params, inst.cfg);
+
+    if (inst.effective.n_parallel < 1) {
+        IST_WRN("instance '%s' has no valid n_parallel, defaulting to 1\n", inst.cfg.name.c_str());
+        inst.effective.n_parallel = 1;
+    }
+    if (inst.effective.n_ctx == 0) {
+        IST_INF("instance '%s' inherits the model's default context size\n", inst.cfg.name.c_str());
+    }
+
+    // guardrail before the allocation: a huge implicit window is almost never intended
+    warn_if_huge_implicit_ctx(model, inst.effective, inst.cfg.name.c_str());
+
+    return context_builder(inst);
+}
+
+void server_instances::teardown_instance_context(server_instance & inst) {
+    // abort first so in-flight generations finish promptly; the drain guard the
+    // caller holds then waits only for stragglers, never a never-ending decode
+    if (inst.ctx_server) {
+        inst.ctx_server->abort_slots("instance '" + inst.cfg.name + "' resized");
+        inst.ctx_server->terminate();
+    }
+    // never join under mutex_dispatch: a manager thread holding the dispatch
+    // lock while the scheduler tears down would deadlock the teardown path
+    if (inst.loop_thread.joinable()) {
+        inst.loop_thread.join();
+    }
+    inst.ctx_server.reset();
+    inst.routes.reset();
+    inst.model_owner.reset();
+    inst.slot_snapshots.clear();
+    inst.mutex_snapshot.clear();
+    inst.built        = false;
+    inst.loop_started = false;
+}
+
+std::shared_ptr<server_instance> server_instances::build_instance(const common_instance & cfg) {
+    auto inst = std::make_shared<server_instance>();
+    inst->cfg = cfg;
+
+    if (!build_context_into(*inst)) {
+        return nullptr;
+    }
 
     return inst;
 }
@@ -1154,44 +1271,34 @@ server_http_res_ptr server_instances::ensure_built_instance(const std::shared_pt
             return make_error(507, "insufficient_memory_error", "failed to reload shared weights");
         }
         IST_INF("reloaded shared model weights '%s'\n", params.model.path.c_str());
+        train_ctx_cached.store(llama_model_n_ctx_train(model), std::memory_order_relaxed);
     }
 
-    // guardrail before the allocation: a huge implicit window is almost never intended
-    warn_if_huge_implicit_ctx(model, inst->effective, inst->cfg.name.c_str());
-
-    // allocate only this instance's KV + compute buffers from the already-loaded weights
-    auto ctx_server = std::make_unique<server_context>();
-    if (!ctx_server->load_model(inst->effective, model)) {
+    // materialize the window: effective params are recomputed from cfg, then the
+    // injected builder allocates. expensive work runs with no dispatch lock held;
+    // the install below is gated on a teardown race, mirroring create_instance's
+    // shutdown check.
+    if (!build_context_into(*inst)) {
         IST_ERR("failed to allocate instance '%s', shared model stays loaded\n", inst->cfg.name.c_str());
         return make_error(507, "insufficient_memory_error",
                           "failed to allocate instance '" + inst->cfg.name + "', not enough device memory");
     }
 
-    auto routes = std::make_unique<server_routes>(inst->effective, *ctx_server);
-    routes->update_meta(*ctx_server);
-    ctx_server->set_slot_release_callback([this](int) {
-        std::lock_guard<std::mutex> lock(mutex_dispatch);
-        cond_dispatch.notify_all();
-    });
-
     {
         std::lock_guard<std::mutex> lock(mutex_dispatch);
         if (inst->removing || !inst->running || terminated) {
-            // lost a race with teardown after the build: the locals free the fresh
-            // context on return, nothing is installed, no scheduler is started
-            ctx_server->terminate();
+            // lost a race with teardown after the build: drop the fresh context,
+            // nothing is installed, no scheduler is started
+            inst->routes.reset();
+            inst->ctx_server->terminate();
+            inst->ctx_server.reset();
+            inst->model_owner.reset();
             return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
         }
-        inst->model_owner = model_init;
-        inst->ctx_server  = std::move(ctx_server);
-        inst->routes      = std::move(routes);
-        apply_identity(*inst);
-        inst->slot_snapshots.resize((size_t) inst->effective.n_parallel);
-        server_instance_size_slot_locks(inst->mutex_snapshot, inst->effective.n_parallel);
-        // start the scheduler only now that the instance is fully installed; mirrors
-        // create_instance's shutdown check so a racing terminate() cannot leak the thread
-        inst->loop_thread = std::thread([inst]() { inst->ctx_server->start_loop(); });
-        inst->built       = true;
+        // start the scheduler only now that the instance is fully installed, so a
+        // racing terminate() cannot leak the thread
+        start_instance_loop_locked(*inst);
+        inst->built = true;
         cond_dispatch.notify_all();  // wake group waiters so the new window can be picked
     }
 
@@ -1230,6 +1337,7 @@ server_http_res_ptr server_instances::create_instance(const common_instance & cf
             return make_error(507, "insufficient_memory_error", "failed to reload shared weights");
         }
         IST_INF("reloaded shared model weights '%s'\n", params.model.path.c_str());
+        train_ctx_cached.store(llama_model_n_ctx_train(model), std::memory_order_relaxed);
     }
 
     auto inst = build_instance(cfg);
@@ -1242,25 +1350,23 @@ server_http_res_ptr server_instances::create_instance(const common_instance & cf
     IST_INF("creating instance '%s' (group '%s', ctx = %d, parallel = %d)\n", cfg.name.c_str(), cfg.group.c_str(),
             inst->effective.n_ctx, inst->effective.n_parallel);
 
-    // start the scheduler BEFORE registering the instance: a terminate() that runs
-    // after the push (but before the thread was created) would otherwise leak an
-    // un-joined thread. the terminated check under the same lock closes that race.
-    inst->loop_thread = std::thread([inst]() { inst->ctx_server->start_loop(); });
-
     {
         std::lock_guard<std::mutex> lock(mutex_dispatch);
         if (terminated) {
-            // the server is shutting down mid-create: stop the scheduler we just started
-            // and join it so nothing is left joinable when the pool is destroyed
+            // the server is shutting down mid-create: the scheduler was never
+            // started, so drop the fresh context with no thread to join
+            inst->routes.reset();
             inst->ctx_server->terminate();
-            if (inst->loop_thread.joinable()) {
-                inst->loop_thread.join();
-            }
+            inst->ctx_server.reset();
+            inst->model_owner.reset();
             return make_error(503, "unavailable_error", "server is shutting down");
         }
-        // explicitly created means explicitly demanded: the window exists from here on
+        // explicitly created means explicitly demanded: push first, then start the
+        // scheduler under the same lock, so terminate() cannot slip between them
+        // and leak a joinable thread
         inst->built = true;
         instances.push_back(inst);
+        start_instance_loop_locked(*inst);
         cond_dispatch.notify_all();  // wake group waiters so the new member can be picked
     }
 
@@ -1369,28 +1475,36 @@ server_http_res_ptr server_instances::resize_instance(const std::string & name, 
         }
     }
 
-    // exclusive access while the context is rebuilt and its bookkeeping refreshed. the
-    // guard rejects new dispatches and drains in-flight ones; its destructor restores
-    // `removing` even when resize fails or throws.
-    server_task_result_ptr result;
+    // exclusive access while the old context is torn down and the new one is
+    // built at the requested size. the guard rejects new dispatches and drains
+    // in-flight ones; its destructor restores `removing` even when the rebuild
+    // fails or throws.
+    // abort in-flight generations before draining: the drain below would otherwise
+    // wait forever on a never-ending decode (same order as destroy_instance)
+    inst->ctx_server->abort_slots("instance '" + name + "' resized");
     {
         instance_drain_guard guard(*this, inst);
-        result = inst->ctx_server->resize(new_ctx);
-        if (!result || result->is_error()) {
-            return make_error(result ? result->to_json() :
-                                       format_error_response("failed to resize instance", ERROR_TYPE_SERVER));
+        teardown_instance_context(*inst);
+
+        inst->cfg.ctx_size = new_ctx;
+        if (!build_context_into(*inst)) {
+            // the rebuild failed: a well-defined unbuilt window at the new size.
+            // a later demand retries the build instead of serving a dangling context.
+            IST_ERR("failed to resize instance '%s' to ctx = %d, leaving it unbuilt\n", name.c_str(), new_ctx);
+            return make_error(507, "insufficient_memory_error",
+                              "failed to resize instance '" + name + "', not enough device memory");
         }
 
-        // the context was rebuilt; refresh identity, routes meta and snapshot bookkeeping
-        inst->effective.n_ctx = new_ctx;
-        apply_identity(*inst);
-        inst->routes->update_meta(*inst->ctx_server);
-        inst->slot_snapshots.assign((size_t) inst->effective.n_parallel, std::string());
-        server_instance_size_slot_locks(inst->mutex_snapshot, inst->effective.n_parallel);
+        // the window was rebuilt (bindings were dropped with the old context);
+        // start the scheduler exactly once under the dispatch lock
+        std::lock_guard<std::mutex> lock(mutex_dispatch);
+        start_instance_loop_locked(*inst);
+        inst->built = true;
+        cond_dispatch.notify_all();
     }
 
     IST_INF("instance '%s' resized to ctx = %d\n", name.c_str(), new_ctx);
-    return make_ok(instance_to_json(*inst));
+    return make_ok({ { "n_ctx", displayed_n_ctx(*inst) } });
 }
 
 server_http_res_ptr server_instances::set_instance_pinned(const std::string & name, bool pinned) {
@@ -1554,7 +1668,7 @@ server_http_res_ptr server_instances::handle_get_props(const server_http_req & r
             instances_arr.push_back({
                 { "name",  it->cfg.name        },
                 { "group", it->cfg.group       },
-                { "n_ctx", it->effective.n_ctx },
+                { "n_ctx", displayed_n_ctx(*it) },
             });
         }
         props["total_slots"] = total_slots;
@@ -1567,18 +1681,7 @@ server_http_res_ptr server_instances::handle_get_props(const server_http_req & r
 }
 
 server_http_res_ptr server_instances::handle_post_props(const server_http_req & req) {
-    auto inst = default_instance();
-    if (!inst) {
-        return make_error("no instances loaded", ERROR_TYPE_SERVER);
-    }
-    if (auto err = ensure_built_instance(inst)) {
-        return err;
-    }
-    active_route_guard guard(*this, *inst);
-    if (!guard.acquired) {
-        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
-    }
-    return inst->routes->post_props(req);
+    return default_instance_forward(req, &server_routes::post_props);
 }
 
 server_http_res_ptr server_instances::handle_post_infill(const server_http_req & req) {
@@ -1606,18 +1709,7 @@ server_http_res_ptr server_instances::handle_post_chat_completions_tok(const ser
 }
 
 server_http_res_ptr server_instances::handle_post_control(const server_http_req & req) {
-    auto inst = default_instance();
-    if (!inst) {
-        return make_error("no instances loaded", ERROR_TYPE_SERVER);
-    }
-    if (auto err = ensure_built_instance(inst)) {
-        return err;
-    }
-    active_route_guard guard(*this, *inst);
-    if (!guard.acquired) {
-        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
-    }
-    return inst->routes->post_control(req);
+    return default_instance_forward(req, &server_routes::post_control);
 }
 
 server_http_res_ptr server_instances::handle_post_responses_oai(const server_http_req & req) {
@@ -1647,18 +1739,7 @@ server_http_res_ptr server_instances::handle_post_anthropic_count_tokens(const s
 }
 
 server_http_res_ptr server_instances::handle_post_apply_template(const server_http_req & req) {
-    auto inst = default_instance();
-    if (!inst) {
-        return make_error("no instances loaded", ERROR_TYPE_SERVER);
-    }
-    if (auto err = ensure_built_instance(inst)) {
-        return err;
-    }
-    active_route_guard guard(*this, *inst);
-    if (!guard.acquired) {
-        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
-    }
-    return inst->routes->post_apply_template(req);
+    return default_instance_forward(req, &server_routes::post_apply_template);
 }
 
 server_http_res_ptr server_instances::handle_get_models(const server_http_req & req) {
@@ -1672,7 +1753,7 @@ server_http_res_ptr server_instances::handle_get_models(const server_http_req & 
         if (!inst->built) {
             data.push_back({
                 { "id",       instance_id(*inst)        },
-                { "n_ctx",    inst->effective.n_ctx     },
+                { "n_ctx",    displayed_n_ctx(*inst)    },
                 { "parallel", inst->effective.n_parallel },
                 { "status",   "unloaded"                },
             });
@@ -1692,7 +1773,7 @@ server_http_res_ptr server_instances::handle_get_models(const server_http_req & 
                 models.push_back(std::move(m));
             }
             for (auto & d : entry["data"]) {
-                d["n_ctx"]    = inst->effective.n_ctx;
+                d["n_ctx"]    = displayed_n_ctx(*inst);
                 d["parallel"] = inst->effective.n_parallel;
                 d["status"]   = "loaded";
                 data.push_back(std::move(d));
@@ -1709,33 +1790,11 @@ server_http_res_ptr server_instances::handle_get_models(const server_http_req & 
 }
 
 server_http_res_ptr server_instances::handle_post_tokenize(const server_http_req & req) {
-    auto inst = default_instance();
-    if (!inst) {
-        return make_error("no instances loaded", ERROR_TYPE_SERVER);
-    }
-    if (auto err = ensure_built_instance(inst)) {
-        return err;
-    }
-    active_route_guard guard(*this, *inst);
-    if (!guard.acquired) {
-        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
-    }
-    return inst->routes->post_tokenize(req);
+    return default_instance_forward(req, &server_routes::post_tokenize);
 }
 
 server_http_res_ptr server_instances::handle_post_detokenize(const server_http_req & req) {
-    auto inst = default_instance();
-    if (!inst) {
-        return make_error("no instances loaded", ERROR_TYPE_SERVER);
-    }
-    if (auto err = ensure_built_instance(inst)) {
-        return err;
-    }
-    active_route_guard guard(*this, *inst);
-    if (!guard.acquired) {
-        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
-    }
-    return inst->routes->post_detokenize(req);
+    return default_instance_forward(req, &server_routes::post_detokenize);
 }
 
 server_http_res_ptr server_instances::handle_post_embeddings(const server_http_req & req) {
@@ -1753,33 +1812,11 @@ server_http_res_ptr server_instances::handle_post_rerank(const server_http_req &
 }
 
 server_http_res_ptr server_instances::handle_get_lora_adapters(const server_http_req & req) {
-    auto inst = default_instance();
-    if (!inst) {
-        return make_error("no instances loaded", ERROR_TYPE_SERVER);
-    }
-    if (auto err = ensure_built_instance(inst)) {
-        return err;
-    }
-    active_route_guard guard(*this, *inst);
-    if (!guard.acquired) {
-        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
-    }
-    return inst->routes->get_lora_adapters(req);
+    return default_instance_forward(req, &server_routes::get_lora_adapters);
 }
 
 server_http_res_ptr server_instances::handle_post_lora_adapters(const server_http_req & req) {
-    auto inst = default_instance();
-    if (!inst) {
-        return make_error("no instances loaded", ERROR_TYPE_SERVER);
-    }
-    if (auto err = ensure_built_instance(inst)) {
-        return err;
-    }
-    active_route_guard guard(*this, *inst);
-    if (!guard.acquired) {
-        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
-    }
-    return inst->routes->post_lora_adapters(req);
+    return default_instance_forward(req, &server_routes::post_lora_adapters);
 }
 
 //
@@ -1893,7 +1930,7 @@ server_http_res_ptr server_instances::handle_post_instance_snapshot(const server
     }
 
     const std::string dir = server_snapshot_instance_dir(params.slot_save_path,
-                                                         server_instance_model_key(base_name), name);
+                                                         server_snapshot_model_key_hashed(base_name), name);
     std::error_code   ec;
     std::filesystem::create_directories(dir, ec);
 
@@ -1986,19 +2023,23 @@ server_http_res_ptr server_instances::handle_delete_instance_snapshot(const serv
         return make_error(format_error_response("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND));
     }
 
-    // per-instance delete: the instance-scoped file first, then the legacy
-    // flat file (migration). each removed file unbinds slots: the named
-    // instance's slots for its own file, every instance's slots for a legacy
-    // file (which any instance may have restored before scoping existed).
+    // per-instance delete: the hashed-key scoped file, the previous-key scoped
+    // file (pre-hashing saves), then the legacy flat file (migration). each
+    // removed file unbinds slots: the named instance's slots for its own files,
+    // every instance's slots for a legacy file (which any instance may have
+    // restored before scoping existed).
     const std::string inst_path = snapshot_instance_path(name, snapshot);
+    const std::string prev_path = snapshot_instance_path_prev(name, snapshot);
     const std::string leg_path  = snapshot_legacy_path(snapshot);
 
     std::error_code ec;
     const bool removed_inst = std::filesystem::remove(inst_path, ec);
     ec.clear();
+    const bool removed_prev = std::filesystem::remove(prev_path, ec);
+    ec.clear();
     const bool removed_leg = std::filesystem::remove(leg_path, ec);
 
-    if (!removed_inst && !removed_leg) {
+    if (!removed_inst && !removed_prev && !removed_leg) {
         return make_error(format_error_response("snapshot not found: '" + snapshot + "'", ERROR_TYPE_NOT_FOUND));
     }
 
@@ -2032,12 +2073,20 @@ server_http_res_ptr server_instances::handle_delete_instance_snapshot(const serv
 //
 
 void server_instances::start_loops() {
+    // idempotent and safe to call after demand-driven builds: only instances that
+    // own a context and never started a loop get one. serialized on mutex_dispatch
+    // so a racing demand build cannot interleave a second start (assigning over a
+    // joinable thread would std::terminate).
+    std::lock_guard<std::mutex> lock(mutex_dispatch);
+    if (terminated) {
+        return;
+    }
     for (const auto & inst : instances) {
         // unbuilt windows have no scheduler yet; their loop starts on first demand
         if (!inst->ctx_server) {
             continue;
         }
-        inst->loop_thread = std::thread([inst]() { inst->ctx_server->start_loop(); });
+        start_instance_loop_locked(*inst);
     }
     start_io_worker();
 }
@@ -2109,6 +2158,11 @@ std::optional<std::future<void>> server_instances::snapshot_io_post(std::functio
     auto                       future = task.get_future();
     {
         std::lock_guard<std::mutex> lock(mutex_io);
+        // no worker, no queue: before the single start or after the single stop a
+        // posted job would never run, so refuse fast with a retriable error
+        if (!io_running) {
+            return std::nullopt;
+        }
         // hard bound on queued jobs: each queued write holds a full KV host buffer, so a
         // full queue rejects with a retriable error instead of accumulating host memory
         if (io_jobs.size() >= max_io_jobs) {
@@ -2122,6 +2176,11 @@ std::optional<std::future<void>> server_instances::snapshot_io_post(std::functio
 
 void server_instances::start_io_worker() {
     std::lock_guard<std::mutex> lock(mutex_io);
+    if (io_running) {
+        return;
+    }
+    io_stop    = false;
+    io_running = true;
     if (!io_thread.joinable()) {
         io_thread = std::thread([this]() { io_loop(); });
     }
@@ -2130,7 +2189,11 @@ void server_instances::start_io_worker() {
 void server_instances::stop_io_worker() {
     {
         std::lock_guard<std::mutex> lock(mutex_io);
-        io_stop = true;
+        if (!io_running) {
+            return;
+        }
+        io_running = false;
+        io_stop    = true;
         cond_io.notify_all();
     }
     // the loop drains any pending jobs before it returns, so an HTTP thread waiting
@@ -2141,13 +2204,8 @@ void server_instances::stop_io_worker() {
 }
 
 std::shared_ptr<server_instance> server_instances::default_instance() {
-    std::lock_guard<std::mutex> lock(mutex_dispatch);
-    for (const auto & inst : instances) {
-        if (inst->cfg.is_default) {
-            return inst;
-        }
-    }
-    return instances.empty() ? nullptr : instances.front();
+    // one implementation (see the const overload); the dispatch mutex is mutable
+    return static_cast<const server_instances *>(this)->default_instance();
 }
 
 std::shared_ptr<server_instance> server_instances::default_instance() const {
@@ -2158,6 +2216,26 @@ std::shared_ptr<server_instance> server_instances::default_instance() const {
         }
     }
     return instances.empty() ? nullptr : instances.front();
+}
+
+// the shared prologue of every default-instance endpoint: resolve the default,
+// build it on demand, guard against a racing destroy/resize, then run the
+// instance's own route handler. custom endpoints (health, props, slots,
+// models) keep their own bodies.
+server_http_res_ptr server_instances::default_instance_forward(const server_http_req & req,
+                                                               server_http_context::handler_t server_routes::* method) {
+    auto inst = default_instance();
+    if (!inst) {
+        return make_error("no instances loaded", ERROR_TYPE_SERVER);
+    }
+    if (auto err = ensure_built_instance(inst)) {
+        return err;
+    }
+    active_route_guard guard(*this, *inst);
+    if (!guard.acquired) {
+        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
+    }
+    return (inst->routes.get()->*method)(req);
 }
 
 server_http_res_ptr server_instances::make_error(const std::string & message, error_type type) const {

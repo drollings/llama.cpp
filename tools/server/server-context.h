@@ -118,10 +118,16 @@ struct server_context {
     void set_model_name(const std::string & name);
     void set_model_aliases(const std::set<std::string> & aliases);
 
-    // best-effort snapshot of slot states (used by the manager for group routing).
-    // the scheduler thread owns the slot states, so this may be stale; the instance's
-    // own queue is the authority and defers a request when the race is lost.
-    std::vector<server_slot_info> get_slot_info() const;
+    // race-free aggregate of this context's slot activity, published by the
+    // scheduler thread (see server_context_stats). best-effort and possibly
+    // stale; the instance's own queue is the authority and defers a request
+    // when the race is lost.
+    server_context_stats get_stats() const;
+
+    // whole-window context size, cached at load (equals llama_n_ctx then).
+    // race-free; prefer this over get_slot_n_ctx() * n_parallel, which can
+    // disagree with llama_n_ctx after rounding/recapping.
+    int32_t get_n_ctx() const;
 
     // manager-only: be notified on the scheduler thread whenever a slot becomes idle,
     // used to wake requests waiting for a free instance in a group
@@ -146,11 +152,6 @@ struct server_context {
     // manager-only: abort all in-flight slot tasks with an error result (used before
     // destroy/resize so no HTTP reader is left hanging)
     server_task_result_ptr abort_slots(const std::string & reason);
-
-    // manager-only: destroy and rebuild this instance's context at a new size. runs on the
-    // scheduler thread; the loop keeps running with the fresh context. re-applies the
-    // shared-model pointers and skips init() (queue callbacks are registered once).
-    server_task_result_ptr resize(int32_t new_ctx);
 
     // manager-only reporting (read-only, best-effort across scheduler thread)
     int get_slot_n_ctx() const;

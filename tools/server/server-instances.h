@@ -19,6 +19,12 @@
 #include <thread>
 #include <vector>
 
+// pure firing rule for the huge-implicit-window guardrail: warn iff the window
+// inherits its size (effective n_ctx == 0) and the model's train context
+// reaches the threshold. tested directly (truth table); warn_if_huge_implicit_ctx
+// applies it after the null-model check.
+bool server_should_warn_huge_implicit_ctx(int32_t effective_n_ctx, int32_t n_ctx_train);
+
 // one named context sharing a pool's loaded weights. owns the effective params
 // (referenced by server_routes), the server_context, and the server_routes.
 struct server_instance {
@@ -53,16 +59,37 @@ struct server_instance {
     // built    = the context window (KV + compute), routes and scheduler exist. a
     //            registered instance starts unbuilt; the first demand for it
     //            materializes exactly one window (see ensure_built_instance).
+    // loop_started = the scheduler thread was started exactly once, only by
+    //            start_instance_loop_locked. built implies a context exists;
+    //            loop_started implies its scheduler is (or was) running.
     bool removing          = false;
     bool running           = true;
     int  n_active_dispatch = 0;
     bool built             = false;
+    bool loop_started      = false;
 };
 
 // manages the pool: one shared model load, many named contexts (instances).
 // owns the shared weights, resolves requests by model id, routes them to the
 // owning instance, and exposes the instance management API.
 struct server_instances {
+    // context construction seam: fills ctx_server + routes for an instance from
+    // the shared model, true on success. the production default builds them for
+    // real; tests may inject a stub to drive build-failure paths. runs on the
+    // calling thread with no manager lock held.
+    using context_builder_fn = std::function<bool(server_instance &)>;
+
+    explicit server_instances(context_builder_fn builder = nullptr);
+
+    // production context construction (the default builder): model ownership,
+    // KV + compute alloc from the shared weights, identity, slot bookkeeping,
+    // routes, and the slot-release callback. leaves null context/routes on failure.
+    bool build_context_default(server_instance & inst);
+
+    // test-only: replace the builder (nullptr restores the default). call only
+    // when no build is in flight.
+    void set_context_builder(context_builder_fn builder);
+
     // shared weights, loaded exactly once (model_only mode). shared_ptr so every
     // instance holds a copy (server_instance::model_owner); the weights are freed only
     // when the pool and every instance have released their copy, so a context that still
@@ -89,6 +116,16 @@ struct server_instances {
     // and takes mutex_dispatch underneath. set once when the server shuts down.
     std::mutex mutex_mgmt;
 
+    // the shared model's training context, cached on every weight (re)load. lets
+    // reporting show the real size of an inherit-size window without touching the
+    // model pointer off the management lock (see displayed_n_ctx).
+    std::atomic<int32_t> train_ctx_cached{0};
+
+    // window size shown in /instances, /props and /models: built windows report
+    // their real size; unbuilt windows report the requested size, or the model
+    // default when inheriting (0 when the weights are not loaded). lock-free.
+    int32_t displayed_n_ctx(const server_instance & inst) const;
+
     // one-shot teardown flag, guarded by mutex_dispatch (see terminate())
     bool terminated = false;
 
@@ -108,6 +145,21 @@ struct server_instances {
         std::shared_ptr<server_instance> inst;   // INSTANCE target; kept alive for the caller
         std::string                      group;  // GROUP target
     };
+
+    // routing input for one group member, derived from a single stats snapshot.
+    // the fresh policy lives here: a member with no slots (unbuilt) is never
+    // picked; a fresh built member (last_used_us == -1) sorts before any used
+    // member among equally-busy candidates (cold-spread).
+    struct route_candidate {
+        size_t  index        = 0;  // position in the manager's instances vector (tie-break)
+        int     n_slots      = 0;
+        int     n_busy       = 0;
+        int64_t last_used_us = -1; // max stamp over the member's slots, -1 = never used
+    };
+
+    // pure ordering over candidates: fewest busy slots, then least recently
+    // used, then registration order. nullopt when no candidate has a free slot.
+    static std::optional<size_t> pick_best_candidate(const std::vector<route_candidate> & members);
 
     resolve_target resolve(const std::string & model_id,
                            const std::string & explicit_instance,
@@ -161,7 +213,61 @@ struct server_instances {
     void start_loops();
     void terminate();
 
+    // --- pool snapshot I/O worker lifecycle: file read/write never runs on a
+    //     scheduler thread. start_loops() owns the single start together with
+    //     the scheduler starts (M2 choke point); terminate() owns the single
+    //     stop. both are idempotent. a post before start or after stop returns
+    //     nullopt so callers fail fast with the existing retriable 503 instead
+    //     of waiting on a future that will never complete.
+    void start_io_worker();
+    void stop_io_worker();
+    // post a job to the single FIFO pool I/O worker. the queue is hard-bounded by
+    // max_io_jobs (a queued write holds a full KV host buffer); returns nullopt when
+    // the worker is not running or the queue is full so a caller can reject with a
+    // retriable error instead of accumulating unbounded host memory.
+    std::optional<std::future<void>> snapshot_io_post(std::function<void()> && fn);
+
+    // per-instance snapshot paths under <slot_save_path>/<model_key>/. the
+    // instance-scoped path (hashed key) is the only write target;
+    // resolve_snapshot_path prefers it, then the previous-key scoped file,
+    // then the legacy flat file for migration reads.
+    std::string snapshot_instance_path(const std::string & instance, const std::string & snapshot) const;
+    std::string snapshot_instance_path_prev(const std::string & instance, const std::string & snapshot) const;
+    std::string snapshot_legacy_path(const std::string & snapshot) const;
+    std::string resolve_snapshot_path(const std::string & instance, const std::string & snapshot) const;
+
+    // RAII switch-semaphore guard; acquisition bounded by the compose deadline.
+    // at most max_concurrent_switches (2) may be held pool-wide; further
+    // acquisitions fail so callers answer the retriable 503.
+    struct switch_guard {
+        server_instances & mgr;
+        bool               acquired = false;
+        switch_guard(server_instances & m, int64_t deadline_ms);
+        ~switch_guard();
+    };
+
   private:
+    // the only place a scheduler thread is constructed: starts the loop once per
+    // built context, no-op afterwards. caller must hold mutex_dispatch (debug
+    // assert); every teardown joins the thread before the instance is released,
+    // so the captured reference never outlives the instance.
+    void start_instance_loop_locked(server_instance & inst);
+
+    // active context builder (the injected stub or the production default).
+    context_builder_fn context_builder;
+
+    // shared construction used by create, demand-build and resize: (re)computes
+    // effective params from cfg, then materializes ctx_server + routes through
+    // the injected builder. false = build failed, nothing installed.
+    bool build_context_into(server_instance & inst);
+
+    // manager-owned teardown: aborts in-flight work, stops the scheduler and
+    // joins its thread, then releases the context, routes, weights ref and slot
+    // bookkeeping, leaving a well-defined unbuilt instance. caller must hold
+    // mutex_mgmt (and usually the drain guard) but NOT mutex_dispatch while
+    // joining.
+    void teardown_instance_context(server_instance & inst);
+
     resolve_target        resolve_instance_or_group(const std::string & target, std::string & error) const;
     std::optional<size_t> pick_best_available(const std::string & group) const;
     // materialize one registered instance on first demand: reloads the shared weights
@@ -170,6 +276,11 @@ struct server_instances {
     // mgmt -> dispatch), so concurrent first demands for one instance collapse onto a
     // single build. call with NO locks held. nullptr = ready to serve.
     server_http_res_ptr ensure_built_instance(const std::shared_ptr<server_instance> & inst);
+    // shared prologue of every default-instance endpoint: resolve the default,
+    // build it on demand, guard against a racing destroy/resize, then run the
+    // instance's own route handler. custom endpoints keep their own bodies.
+    server_http_res_ptr default_instance_forward(const server_http_req & req,
+                                                 server_http_context::handler_t server_routes::* method);
     server_http_res_ptr   dispatch_group(const server_http_req & req,
                                          const std::string &     group,
                                          const std::string &     snapshot,
@@ -208,18 +319,6 @@ struct server_instances {
         bool ok        = false;
     };
     server_snapshot_write_result snapshot_io_write(const std::string & path, server_snapshot_data data, int64_t deadline_ms);
-    // post a job to the single FIFO pool I/O worker. the queue is hard-bounded by
-    // max_io_jobs (a queued write holds a full KV host buffer); returns nullopt when the
-    // queue is full so a caller can reject with a retriable error instead of accumulating
-    // unbounded host memory.
-    std::optional<std::future<void>> snapshot_io_post(std::function<void()> && fn);
-    // RAII switch-semaphore guard; acquisition bounded by the compose deadline
-    struct switch_guard {
-        server_instances & mgr;
-        bool               acquired = false;
-        switch_guard(server_instances & m, int64_t deadline_ms);
-        ~switch_guard();
-    };
 
     // management API internals
     // the single place an instance is constructed from the already-loaded shared
@@ -255,12 +354,7 @@ struct server_instances {
     std::string                      instance_id(const server_instance & inst) const;
     std::set<std::string>            instance_aliases(const std::string & name, const std::string & group) const;
     void                             apply_identity(server_instance & inst);
-    // per-instance snapshot paths under <slot_save_path>/<model_key>/. the
-    // instance-scoped path is the only write target; resolve_snapshot_path
-    // prefers it and falls back to the legacy flat file for migration reads.
-    std::string snapshot_instance_path(const std::string & instance, const std::string & snapshot) const;
-    std::string snapshot_legacy_path(const std::string & snapshot) const;
-    std::string resolve_snapshot_path(const std::string & instance, const std::string & snapshot) const;    std::shared_ptr<server_instance> default_instance();
+    std::shared_ptr<server_instance> default_instance();
     std::shared_ptr<server_instance> default_instance() const;
 
     server_http_res_ptr make_error(const std::string & message, error_type type) const;
@@ -272,10 +366,12 @@ struct server_instances {
     //     a bounded job queue decoupled from the HTTP-thread lifecycle, so a client
     //     disconnect can never interrupt an in-flight write.
     void                                   io_loop();
-    void                                   start_io_worker();
-    void                                   stop_io_worker();
     std::mutex                             mutex_io;
     std::condition_variable                cond_io;
+    // worker running state, guarded by mutex_io: false before the single start in
+    // start_loops() and after the single stop in terminate(). posts while false
+    // refuse fast (nullopt) instead of queueing onto a thread that will never run.
+    bool                                   io_running = false;
     // hard-bounded job queue: each queued snapshot write holds a full KV host buffer, so
     // the queue is capped at max_io_jobs (rejects with a retriable 503 when full) instead
     // of accumulating unbounded host memory under slow-disk churn. 4 = two concurrent

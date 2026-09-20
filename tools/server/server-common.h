@@ -23,12 +23,17 @@
 
 using json = common_json;
 
-// lightweight snapshot of one slot's state, used by the manager for group routing
-struct server_slot_info {
-    int id = 0;
-    bool idle = false;
-    int64_t t_last_used = -1; // monotonic us, -1 = never used (ordering within one process only)
-    int64_t t_last_used_wall_s = -1; // unix epoch seconds, -1 = never used (comparable across processes)
+// race-free aggregate of one context's slot activity, published by the scheduler
+// thread and read by the manager for group routing and last-used reporting.
+// single writer (the scheduler), lock-free for readers; values are best-effort
+// and may be stale by design. the task-time queue re-check stays the correctness
+// gate and must not be skipped based on these numbers.
+struct server_context_stats {
+    int     n_processing     = 0;  // slots currently processing (busy)
+    int64_t last_used_us     = -1; // max t_last_used over slots, monotonic us, -1 = never
+    int64_t last_used_wall_s = -1; // max t_last_used_wall_s over slots, epoch s, -1 = never
+    int32_t n_ctx_slot       = 0;  // per-slot context, fixed at load
+    int32_t n_ctx_total      = 0;  // whole-window context, fixed at load
 };
 
 #define SLT_DBG(slot, fmt, ...) LOG_DBG("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)

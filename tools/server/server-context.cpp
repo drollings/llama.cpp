@@ -947,6 +947,34 @@ private:
     // the scheduler thread whenever a slot becomes idle
     std::function<void(int /* id_slot */)> callback_on_slot_release;
 
+    // single-writer aggregates for lock-free manager reads (group routing and
+    // last-used reporting). the scheduler thread is the only writer, via
+    // publish_slot_stats() once per update_slots() iteration; the cached n_ctx
+    // values are fixed in load_model(). a mutex is the wrong tool here: it would
+    // stall the scheduler on every HTTP read.
+    std::atomic<int>     stat_processing{0};
+    std::atomic<int64_t> stat_last_used_us{-1};
+    std::atomic<int64_t> stat_last_used_wall_s{-1};
+    std::atomic<int32_t> stat_n_ctx_slot{0};
+    std::atomic<int32_t> stat_n_ctx_total{0};
+
+    // rescan the slots into the published aggregates. scheduler thread only.
+    void publish_slot_stats() {
+        int     n_proc  = 0;
+        int64_t lu      = -1;
+        int64_t lu_wall = -1;
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                ++n_proc;
+            }
+            lu      = std::max(lu,      slot.t_last_used);
+            lu_wall = std::max(lu_wall, slot.t_last_used_wall_s);
+        }
+        stat_processing.store(n_proc, std::memory_order_relaxed);
+        stat_last_used_us.store(lu, std::memory_order_relaxed);
+        stat_last_used_wall_s.store(lu_wall, std::memory_order_relaxed);
+    }
+
     // cached memory breakdown, fixed at context creation. computed once in load_model
     // (after ctx_tgt is set), zeroed in destroy(). read/written under mutex_mem so the
     // HTTP reporting path never touches ctx_tgt (which the scheduler frees on destroy).
@@ -1042,7 +1070,7 @@ private:
 
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
-    bool load_model(common_params & params, llama_model * shared_model = nullptr, bool skip_init = false) {
+    bool load_model(common_params & params, llama_model * shared_model = nullptr) {
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
@@ -1209,7 +1237,7 @@ private:
                 callback_state(SERVER_STATE_LOADING, {{"stage", "mmproj_model"}});
             }
 
-            if (!skip_init && !is_resume) {
+            if (!is_resume) {
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
 
@@ -1370,6 +1398,13 @@ private:
             slot.reset();
         }
 
+        // fix the published window sizes for the life of this context; the busy
+        // and last-used aggregates start clean and are refreshed every scheduler
+        // iteration by publish_slot_stats()
+        stat_n_ctx_slot.store(n_ctx_slot(), std::memory_order_relaxed);
+        stat_n_ctx_total.store(llama_n_ctx(ctx_tgt), std::memory_order_relaxed);
+        publish_slot_stats();
+
         {
             const char * LLAMA_TRACE = getenv("LLAMA_TRACE");
             trace = LLAMA_TRACE ? atoi(LLAMA_TRACE) : 0;
@@ -1443,12 +1478,12 @@ private:
         // propagate new defaults back to caller
         params = params_base;
 
-        if (!skip_init && !is_resume) {
+        if (!is_resume) {
             return init();
         }
 
-        // resume from sleep / resize skip init() (queue callbacks are registered once);
-        // a resume still reports READY, a resize never does
+        // resume from sleep skips init() (queue callbacks are registered once);
+        // a resume still reports READY
         if (is_resume && callback_state) {
             callback_state(SERVER_STATE_READY, {});
         }
@@ -2980,6 +3015,7 @@ private:
 
                 metrics_flush_idle();
 
+                publish_slot_stats();
                 return; // skip further processing
 
             } else {
@@ -3000,6 +3036,7 @@ private:
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
 
             // the batch is half-built and not rendered, skip now to avoid UB
+            publish_slot_stats();
             return;
         }
 
@@ -3064,6 +3101,8 @@ private:
                 break; // stop any further processing
             }
         }
+
+        publish_slot_stats();
     }
 
     void pre_decode() {
@@ -4418,14 +4457,18 @@ void server_context::set_model_aliases(const std::set<std::string> & aliases) {
     impl->model_aliases = aliases;
 }
 
-std::vector<server_slot_info> server_context::get_slot_info() const {
-    std::vector<server_slot_info> out;
-    const auto & slots = impl->slots;
-    out.reserve(slots.size());
-    for (const auto & slot : slots) {
-        out.push_back({ slot.id, !slot.is_processing(), slot.t_last_used, slot.t_last_used_wall_s });
-    }
-    return out;
+server_context_stats server_context::get_stats() const {
+    server_context_stats stats;
+    stats.n_processing     = impl->stat_processing.load(std::memory_order_relaxed);
+    stats.last_used_us     = impl->stat_last_used_us.load(std::memory_order_relaxed);
+    stats.last_used_wall_s = impl->stat_last_used_wall_s.load(std::memory_order_relaxed);
+    stats.n_ctx_slot       = impl->stat_n_ctx_slot.load(std::memory_order_relaxed);
+    stats.n_ctx_total      = impl->stat_n_ctx_total.load(std::memory_order_relaxed);
+    return stats;
+}
+
+int32_t server_context::get_n_ctx() const {
+    return impl->stat_n_ctx_total.load(std::memory_order_relaxed);
 }
 
 void server_context::set_slot_release_callback(std::function<void(int)> callback) {
@@ -4475,23 +4518,6 @@ server_task_result_ptr server_context::abort_slots(const std::string & reason) {
     return instance_op([this, reason]() {
         impl->abort_all_slots(reason);
         return json{{ "success", true }};
-    });
-}
-
-server_task_result_ptr server_context::resize(int32_t new_ctx) {
-    return instance_op([this, new_ctx]() {
-        // abort anything still running, then rebuild the context at the new size.
-        // skip_init skips init() (so the queue callbacks registered on the first load are
-        // not registered twice) without touching `sleeping` and without emitting READY.
-        impl->abort_all_slots("instance resized");
-        impl->params_base.n_ctx = new_ctx;
-        // destroy() nulls model_tgt; model_shared survives and carries the borrowed
-        // weights across the rebuild (no reload from disk)
-        impl->destroy();
-        if (!impl->load_model(impl->params_base, impl->model_shared, true)) {
-            throw std::runtime_error("failed to rebuild the instance context");
-        }
-        return json{{ "success", true }, { "n_ctx", llama_n_ctx(impl->ctx_tgt) }};
     });
 }
 

@@ -1,6 +1,8 @@
 #include "common.h"
 #include "llama.h"
+#include "server-instances.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -97,6 +99,26 @@ static void test_instances_parse_errors() {
     expect_parse_error("a:b:ctx=8");             // ':' in name (also a grammar separator)
     expect_parse_error("foo:group=a/b");         // '/' in group
     expect_parse_error("foo:group=a=b");         // '=' in group
+    // 'latest' is a reserved routing token, never a legal name or group
+    expect_parse_error("latest");                // reserved name
+    expect_parse_error("latest:group=g");        // reserved name with a group
+    expect_parse_error("foo:group=latest");      // reserved group
+}
+
+static void test_instances_parse_valid_names() {
+    // control group: previously valid names stay valid, including near-misses
+    // of the reserved token (the reservation is the exact string "latest")
+    for (const char * spec : {
+            "a",
+            "swarm0:group=swarm:ctx=512",
+            "ledger:ctx=512:pinned:default",
+            "Latest",
+            "latest1",
+            "my-latest-thing",
+        }) {
+        const auto insts = common_instances_parse(spec);
+        assert(insts.size() == 1);
+    }
 }
 
 static void test_instance_params() {
@@ -186,9 +208,149 @@ static void test_borrowed_model(const common_params & base) {
     // model_init is destroyed last; the model is freed there
 }
 
+// a demand-driven build followed by repeated start_loops() must leave exactly one
+// scheduler thread: a second start would assign over a joinable thread and abort.
+static void test_demand_build_starts_one_loop(const common_params & base) {
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfg;
+    cfg.name     = "solo";
+    cfg.group    = "solo";
+    cfg.ctx_size = 256;
+    cfg.parallel = 1;
+    params.instances.push_back(cfg);
+
+    int builds = 0;
+    server_instances mgr;
+    mgr.set_context_builder([&builds, &mgr](server_instance & inst) {
+        ++builds;
+        return mgr.build_context_default(inst);
+    });
+
+    assert(mgr.load(params));
+    assert(builds == 0);
+    assert(!mgr.instances.front()->built);
+
+    // a no-model handler forces the demand-driven build of the default instance
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req req { {}, {}, "/props", "", "", {}, no_stop };
+    auto res = mgr.handle_get_props(req);
+    assert(res->status == 200);
+    assert(builds == 1);
+    assert(mgr.instances.front()->built);
+    assert(mgr.instances.front()->loop_started);
+
+    // repeated starts are no-ops: no second thread, no abort, no extra build
+    mgr.start_loops();
+    mgr.start_loops();
+    assert(builds == 1);
+    assert(mgr.instances.front()->loop_started);
+
+    mgr.terminate();
+}
+
+// control: start_loops() on a pool of only unbuilt windows starts nothing.
+static void test_start_loops_skips_unbuilt(const common_params & base) {
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfg;
+    cfg.name     = "cold";
+    cfg.group    = "cold";
+    cfg.ctx_size = 256;
+    cfg.parallel = 1;
+    params.instances.push_back(cfg);
+
+    server_instances mgr;
+    assert(mgr.load(params));
+    assert(!mgr.instances.front()->built);
+
+    mgr.start_loops();
+    assert(!mgr.instances.front()->built);
+    assert(!mgr.instances.front()->loop_started);
+    assert(!mgr.instances.front()->ctx_server);
+    assert(!mgr.instances.front()->loop_thread.joinable());
+
+    mgr.terminate();
+}
+
+// resize is a manager-owned teardown + rebuild: success leaves a fresh window
+// with exactly one scheduler, failure leaves a well-defined unbuilt window
+// that a later demand retries at the new size.
+static void test_resize_teardown_rebuild(const common_params & base) {
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfg;
+    cfg.name     = "r";
+    cfg.group    = "r";
+    cfg.ctx_size = 256;
+    cfg.parallel = 1;
+    params.instances.push_back(cfg);
+
+    int builds = 0;
+    server_instances mgr;
+    mgr.set_context_builder([&builds, &mgr](server_instance & inst) {
+        ++builds;
+        return mgr.build_context_default(inst);
+    });
+    assert(mgr.load(params));
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req props_req { {}, {}, "/props", "", "", {}, no_stop };
+    auto resize_req = [&](int32_t n_ctx) {
+        return server_http_req { { { "name", "r" } }, {}, "/instances/r/resize", "",
+                                 safe_json_to_str({ { "ctx_size", n_ctx } }), {}, no_stop };
+    };
+
+    // demand-build the 256 window first
+    assert(mgr.handle_get_props(props_req)->status == 200);
+    assert(builds == 1);
+
+    // successful resize: fresh 512 window, exactly one scheduler
+    auto res = mgr.handle_post_instance_resize(resize_req(512));
+    assert(res->status == 200);
+    assert(json::parse(res->data)["n_ctx"].get<int>() == 512);
+    assert(builds == 2);
+    const auto inst = mgr.instances.front();
+    assert(inst->built && inst->loop_started && inst->loop_thread.joinable());
+    assert(inst->effective.n_ctx == 512);
+    mgr.start_loops();
+    mgr.start_loops();
+    assert(builds == 2);
+    assert(mgr.handle_get_props(props_req)->status == 200);
+
+    // program the builder to fail: the resize 507s and leaves a clean unbuilt
+    // window (null context/routes, no joinable thread) at the new size
+    mgr.set_context_builder([](server_instance &) { return false; });
+    res = mgr.handle_post_instance_resize(resize_req(1024));
+    assert(res->status == 507);
+    assert(!inst->built && !inst->ctx_server && !inst->routes);
+    assert(!inst->loop_thread.joinable());
+    assert(inst->cfg.ctx_size == 1024);
+    assert(inst->effective.n_ctx == 1024);
+
+    // a later demand retries at the new size and serves again
+    mgr.set_context_builder(nullptr);
+    assert(mgr.handle_get_props(props_req)->status == 200);
+    assert(builds == 2);
+    assert(inst->built && inst->loop_started && inst->loop_thread.joinable());
+    assert(inst->effective.n_ctx == 1024);
+
+    mgr.terminate();
+}
+
 int main(int argc, char ** argv) {
     test_instances_parse_round_trip();
     test_instances_parse_errors();
+    test_instances_parse_valid_names();
     test_instance_params();
 
     common_params params;
@@ -203,8 +365,20 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    // params are built by hand here (no CLI parse), so resolve the thread
+    // counts the same way parsing would; leaving -1 crashes context init
+    if (params.cpuparams.n_threads < 0) {
+        params.cpuparams.n_threads = common_cpu_get_num_math();
+    }
+    if (params.cpuparams_batch.n_threads < 0) {
+        params.cpuparams_batch.n_threads = common_cpu_get_num_math();
+    }
+
     ggml_backend_load_all();
     test_borrowed_model(params);
+    test_demand_build_starts_one_loop(params);
+    test_start_loops_skips_unbuilt(params);
+    test_resize_teardown_rebuild(params);
 
     fprintf(stdout, "%s: all tests passed\n", __func__);
     return 0;

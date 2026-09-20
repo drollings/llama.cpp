@@ -472,6 +472,14 @@ void common_instance_validate(const common_instance & inst) {
     };
     check("instance name", inst.name);
     check("instance group", inst.group);
+    // 'latest' is a reserved routing token (base:latest:<name|group>), so no
+    // instance or group may claim it, otherwise the alias would be ambiguous
+    if (inst.name == "latest") {
+        throw std::invalid_argument("instance name 'latest' is reserved");
+    }
+    if (inst.group == "latest") {
+        throw std::invalid_argument("instance group 'latest' is reserved");
+    }
 }
 
 std::vector<common_instance> common_instances_parse(const std::string & spec) {

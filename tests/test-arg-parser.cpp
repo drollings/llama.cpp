@@ -274,6 +274,13 @@ static void test(void) {
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
     }
 
+    {
+        common_params kv_params;
+        argv = {"binary_name", "--kv-unified-per-slot", "2048"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_SERVER));
+        assert(kv_params.kv_unified_per_slot == 2048);
+    }
+
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
@@ -361,6 +368,15 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "overwritten.gguf");
     assert(params.cpuparams.n_threads == 1010);
+
+    {
+        common_params kv_params;
+        setenv("LLAMA_ARG_KV_UNIFIED_PER_SLOT", "2048", true);
+        argv = {"binary_name"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_SERVER));
+        assert(kv_params.kv_unified_per_slot == 2048);
+        unsetenv("LLAMA_ARG_KV_UNIFIED_PER_SLOT");
+    }
 #endif // _WIN32
 
     printf("test-arg-parser: test download functions\n\n");

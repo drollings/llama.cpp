@@ -60,6 +60,16 @@ struct server_snapshot_meta {
 // seconds. skips unreadable files (n_ctx_seq = 0 on an unreadable header).
 std::vector<server_snapshot_meta> server_snapshot_list(const std::string & dir);
 
+// pool identity to a filesystem-safe directory name: '/' and ':' become '_'.
+// the legacy mapping, kept for reading snapshots written before key hashing;
+// two distinct identities can sanitize alike ("a/b" vs "a:b"), so it must
+// never be the write target for new files.
+std::string server_snapshot_model_key(const std::string & base_name);
+// collision-resistant write key: the legacy mapping plus a short deterministic
+// hash of the original name, so identities that sanitize alike never share a
+// directory. new saves always write under this key; readers try it first and
+// fall back to the legacy key (same shape as the scoped -> flat fallback).
+std::string server_snapshot_model_key_hashed(const std::string & base_name);
 // per-instance on-disk layout. snapshots are scoped to their instance:
 //   <slot_save_path>/<model_key>/<instance>/<snapshot>.bin
 // where model_key is the sanitized pool identity and instance/snapshot are
