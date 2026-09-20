@@ -10,23 +10,33 @@
 namespace {
 
 constexpr uint32_t SNAPSHOT_MAGIC   = 0x534C5041;  // "SLPA"
-constexpr uint32_t SNAPSHOT_VERSION = 1;
-constexpr size_t   SNAPSHOT_HEADER  = 24;  // magic + version + n_ctx_seq + n_tokens + kv_size
+constexpr uint32_t SNAPSHOT_VERSION = 2;
+constexpr size_t   SNAPSHOT_HEADER_V1 = 24;  // magic + version + n_ctx_seq + n_tokens + kv_size
+constexpr size_t   SNAPSHOT_HEADER_V2 = 28;  // v1 header + adapter_fp_len (fp bytes follow)
+// max adapter fingerprint accepted from a file header. the writer emits a short
+// hex hash (16 chars); anything larger is corrupt. bounds the header-driven
+// allocation below so a crafted fp_len cannot force a huge resize.
+constexpr uint32_t SNAPSHOT_FP_MAX = 1024;
 
-// write the 24-byte header followed by the payload. returns the payload offset
-// (== SNAPSHOT_HEADER) on success, or 0 if the payload does not fit int32.
+// write the header followed by the payload. returns the payload offset on
+// success, or 0 if the payload does not fit int32.
 size_t write_snapshot(std::ostream & out, const server_snapshot_data & data) {
-    if (data.tokens.size() > (size_t) INT32_MAX) {
+    if (data.tokens.size() > (size_t) INT32_MAX || data.adapter_fp.size() > (size_t) UINT32_MAX) {
         return 0;
     }
     const uint64_t kv_size = (uint64_t) data.kv.size();
     const int32_t  n_tokens = (int32_t) data.tokens.size();
+    const uint32_t fp_len = (uint32_t) data.adapter_fp.size();
 
     out.write((const char *) &SNAPSHOT_MAGIC, 4);
     out.write((const char *) &SNAPSHOT_VERSION, 4);
     out.write((const char *) &data.n_ctx_seq, 4);
     out.write((const char *) &n_tokens, 4);
     out.write((const char *) &kv_size, 8);
+    out.write((const char *) &fp_len, 4);
+    if (fp_len > 0) {
+        out.write(data.adapter_fp.data(), (std::streamsize) fp_len);
+    }
 
     for (const llama_token t : data.tokens) {
         out.write((const char *) &t, sizeof(t));
@@ -34,7 +44,7 @@ size_t write_snapshot(std::ostream & out, const server_snapshot_data & data) {
     if (!data.kv.empty()) {
         out.write((const char *) data.kv.data(), (std::streamsize) data.kv.size());
     }
-    return SNAPSHOT_HEADER;
+    return SNAPSHOT_HEADER_V2 + fp_len;
 }
 
 int64_t file_mtime_unix(const std::filesystem::path & path) {
@@ -71,24 +81,47 @@ server_snapshot_read_out server_snapshot_read_status(const std::string & path) {
     in.read((char *) &n_ctx_seq, 4);
     in.read((char *) &n_tokens, 4);
     in.read((char *) &kv_size, 8);
-    if (!in || magic != SNAPSHOT_MAGIC || version != SNAPSHOT_VERSION || n_tokens < 0) {
+    if (!in || magic != SNAPSHOT_MAGIC || (version != 1 && version != 2) || n_tokens < 0) {
         out.status = server_snapshot_status::CORRUPT;
         return out;
     }
 
-    // exact size check: 24-byte header + tokens + kv. any leftover or shortfall
+    // v2 carries the adapter fingerprint between kv_size and the payload; v1 has
+    // no such field and reads as fp = "".
+    std::string adapter_fp;
+    size_t      header = SNAPSHOT_HEADER_V1;
+    if (version == 2) {
+        uint32_t fp_len = 0;
+        in.read((char *) &fp_len, 4);
+        if (!in || fp_len > SNAPSHOT_FP_MAX) {
+            out.status = server_snapshot_status::CORRUPT;
+            return out;
+        }
+        adapter_fp.resize(fp_len);
+        if (fp_len > 0) {
+            in.read(adapter_fp.data(), (std::streamsize) fp_len);
+            if (!in) {
+                out.status = server_snapshot_status::CORRUPT;
+                return out;
+            }
+        }
+        header = SNAPSHOT_HEADER_V2 + fp_len;
+    }
+
+    // exact size check: header + fp + tokens + kv. any leftover or shortfall
     // means the file is corrupt or truncated.
-    const uint64_t expect = SNAPSHOT_HEADER + (uint64_t) n_tokens * sizeof(llama_token) + kv_size;
+    const uint64_t expect = (uint64_t) header + (uint64_t) n_tokens * sizeof(llama_token) + kv_size;
     in.seekg(0, std::ios::end);
     if (in.tellg() != (std::streampos) expect) {
         out.status = server_snapshot_status::CORRUPT;
         return out;
     }
     // back to the payload for the reads below
-    in.seekg(SNAPSHOT_HEADER, std::ios::beg);
+    in.seekg((std::streamoff) header, std::ios::beg);
 
     server_snapshot_data data;
-    data.n_ctx_seq = n_ctx_seq;
+    data.n_ctx_seq  = n_ctx_seq;
+    data.adapter_fp = std::move(adapter_fp);
     data.tokens.resize((size_t) n_tokens);
     for (llama_token & t : data.tokens) {
         in.read((char *) &t, sizeof(t));
@@ -200,8 +233,10 @@ std::vector<server_snapshot_meta> server_snapshot_list(const std::string & dir) 
         const std::string fname = entry.path().filename().string();
         const std::string name  = fname.substr(0, fname.size() - 4);  // strip ".bin"
 
-        // header-only read for n_ctx_seq; an unreadable header reports n_ctx_seq = 0
-        int32_t n_ctx_seq = 0;
+        // header-only read for n_ctx_seq + adapter_fp; an unreadable header
+        // reports n_ctx_seq = 0 and an empty fp
+        int32_t     n_ctx_seq  = 0;
+        std::string adapter_fp;
         {
             std::ifstream in(entry.path(), std::ios::binary);
             uint32_t      magic = 0;
@@ -211,8 +246,23 @@ std::vector<server_snapshot_meta> server_snapshot_list(const std::string & dir) 
             in.read((char *) &version, 4);
             in.read((char *) &n_ctx_seq, 4);
             in.read((char *) &n, 4);
-            if (!(in && magic == SNAPSHOT_MAGIC && version == SNAPSHOT_VERSION)) {
-                n_ctx_seq = 0;
+            bool ok = (bool) in && magic == SNAPSHOT_MAGIC && (version == 1 || version == 2);
+            if (ok && version == 2) {
+                // skip kv_size, then read the fp (offsets 16-24 + fp at 28)
+                uint64_t kv_size = 0;
+                uint32_t fp_len  = 0;
+                in.read((char *) &kv_size, 8);
+                in.read((char *) &fp_len, 4);
+                ok = (bool) in && fp_len <= SNAPSHOT_FP_MAX;
+                if (ok && fp_len > 0) {
+                    adapter_fp.resize(fp_len);
+                    in.read(adapter_fp.data(), (std::streamsize) fp_len);
+                    ok = (bool) in;
+                }
+            }
+            if (!ok) {
+                n_ctx_seq  = 0;
+                adapter_fp.clear();
             }
         }
 
@@ -221,6 +271,7 @@ std::vector<server_snapshot_meta> server_snapshot_list(const std::string & dir) 
             entry.file_size(ec),
             file_mtime_unix(entry.path()),
             n_ctx_seq,
+            adapter_fp,
         });
     }
     return out;

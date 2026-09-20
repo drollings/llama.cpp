@@ -179,6 +179,111 @@ static void test_list() {
     std::filesystem::remove_all(dir);
 }
 
+static void test_fp_round_trip() {
+    const auto dir  = make_tmpdir();
+    const auto path = (dir / "snap.bin").string();
+
+    server_snapshot_data data = sample();
+    data.adapter_fp           = "deadbeef";
+    assert(server_snapshot_write(path, data));
+    const auto got = server_snapshot_read(path);
+    assert(got.has_value());
+    assert(got->adapter_fp == "deadbeef");
+    assert(got->tokens == data.tokens);
+    assert(got->kv == data.kv);
+
+    const auto list = server_snapshot_list(dir.string());
+    assert(list.size() == 1);
+    assert(list[0].adapter_fp == "deadbeef");
+
+    std::filesystem::remove_all(dir);
+}
+
+// hand-craft a version-1 file (no adapter_fp field): it must read with fp = ""
+static void test_v1_backcompat() {
+    const auto dir  = make_tmpdir();
+    const auto path = (dir / "v1.bin").string();
+    const auto data = sample();
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        const uint32_t magic = 0x534C5041;
+        const uint32_t version = 1;
+        const uint64_t kv_size = (uint64_t) data.kv.size();
+        const int32_t  n_tokens = (int32_t) data.tokens.size();
+        out.write((const char *) &magic, 4);
+        out.write((const char *) &version, 4);
+        out.write((const char *) &data.n_ctx_seq, 4);
+        out.write((const char *) &n_tokens, 4);
+        out.write((const char *) &kv_size, 8);
+        for (const llama_token t : data.tokens) {
+            out.write((const char *) &t, sizeof(t));
+        }
+        out.write((const char *) data.kv.data(), (std::streamsize) data.kv.size());
+    }
+    const auto got = server_snapshot_read(path);
+    assert(got.has_value());
+    assert(got->adapter_fp.empty());
+    assert(got->tokens == data.tokens);
+    assert(got->kv == data.kv);
+
+    const auto list = server_snapshot_list(dir.string());
+    assert(list.size() == 1);
+    assert(list[0].adapter_fp.empty());
+
+    std::filesystem::remove_all(dir);
+}
+
+// version 3 (or any unknown version) is CORRUPT, even with a consistent size
+static void test_version3_corrupt() {
+    const auto dir  = make_tmpdir();
+    const auto path = (dir / "v3.bin").string();
+    const auto data = sample();
+    assert(server_snapshot_write(path, data));
+    {
+        std::fstream io(path, std::ios::binary | std::ios::in | std::ios::out);
+        const uint32_t version = 3;
+        io.seekp(4);
+        io.write((const char *) &version, 4);
+    }
+    auto st = server_snapshot_read_status(path);
+    assert(st.status == server_snapshot_status::CORRUPT);
+    assert(!st.data.has_value());
+
+    std::filesystem::remove_all(dir);
+}
+
+// a huge fp_len in the header must be rejected without allocating: a 28-byte
+// crafted file claims gigabytes of fingerprint.
+static void test_huge_fp_len_corrupt() {
+    const auto dir  = make_tmpdir();
+    const auto path = (dir / "evil.bin").string();
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        const uint32_t magic   = 0x534C5041;
+        const uint32_t version = 2;
+        const int32_t  n_ctx_seq = 64;
+        const int32_t  n_tokens  = 0;
+        const uint64_t kv_size   = 0;
+        const uint32_t fp_len    = 0xFFFFFFF0u;
+        out.write((const char *) &magic, 4);
+        out.write((const char *) &version, 4);
+        out.write((const char *) &n_ctx_seq, 4);
+        out.write((const char *) &n_tokens, 4);
+        out.write((const char *) &kv_size, 8);
+        out.write((const char *) &fp_len, 4);
+    }
+    auto st = server_snapshot_read_status(path);
+    assert(st.status == server_snapshot_status::CORRUPT);
+    assert(!st.data.has_value());
+
+    // the header-only list path must also refuse without allocating
+    const auto list = server_snapshot_list(dir.string());
+    assert(list.size() == 1);
+    assert(list[0].adapter_fp.empty());
+
+    std::filesystem::remove_all(dir);
+}
+
 static void test_no_tmp_leftover() {
     const auto dir  = make_tmpdir();
     const auto path = (dir / "snap.bin").string();
@@ -204,6 +309,10 @@ int main() {
     test_bad_magic_nullopt();
     test_read_status();
     test_list();
+    test_fp_round_trip();
+    test_v1_backcompat();
+    test_version3_corrupt();
+    test_huge_fp_len_corrupt();
     test_no_tmp_leftover();
     printf("test-server-snapshot: all tests passed\n");
     return 0;

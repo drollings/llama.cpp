@@ -15,17 +15,24 @@
 // on-disk layout (plain, host-endian):
 //   offset  size  field
 //   0       4     magic   = 0x534C5041  ("SLPA")
-//   4       4     version = 1
+//   4       4     version = 2
 //   8       4     n_ctx_seq   (int32)
 //   12      4     n_tokens    (int32)
 //   16      8     kv_size     (uint64)
-//   24      ...   tokens:  n_tokens * int32
+//   24      4     adapter_fp_len (uint32, v2 only)
+//   28      ...   adapter_fp: adapter_fp_len bytes (v2 only)
+//   ...     ...   tokens:  n_tokens * int32
 //   ...     ...   kv:      kv_size bytes
+//
+// version 1 files have no adapter_fp field; readers treat them as fp = "".
 
 struct server_snapshot_data {
     llama_tokens         tokens;
     std::vector<uint8_t> kv;
     int32_t              n_ctx_seq = 0;
+    // fingerprint of the adapter set active when the snapshot was written
+    // ("" = none / pre-v2 file)
+    std::string adapter_fp;
 };
 
 // atomic: write <path>.tmp, then rename over <path>. returns false on I/O error
@@ -33,7 +40,7 @@ struct server_snapshot_data {
 bool server_snapshot_write(const std::string & path, const server_snapshot_data & data);
 
 // file-state classifier for the snapshot module. MISSING = the file does not open;
-// CORRUPT = bad magic/version/size or a truncated payload.
+// CORRUPT = bad magic/version/size or a truncated payload (version > 2 included).
 enum class server_snapshot_status { OK, MISSING, CORRUPT };
 
 struct server_snapshot_read_out {
@@ -42,7 +49,8 @@ struct server_snapshot_read_out {
 };
 
 // validate magic/version and exact file size; carries MISSING vs CORRUPT so the caller
-// can map to 404/400 without a separate existence check. never throws.
+// can map to 404/400 without a separate existence check. accepts version 1 (fp = "")
+// and 2. never throws.
 server_snapshot_read_out server_snapshot_read_status(const std::string & path);
 
 // thin wrapper over server_snapshot_read_status: data on OK, nullopt otherwise.
@@ -54,10 +62,11 @@ struct server_snapshot_meta {
     uint64_t    size;
     int64_t     mtime;    // unix seconds
     int32_t     n_ctx_seq;
+    std::string adapter_fp; // "" for v1 files / unreadable headers
 };
 
-// list *.bin in dir, header-parsed n_ctx_seq (read header only), mtime in unix
-// seconds. skips unreadable files (n_ctx_seq = 0 on an unreadable header).
+// list *.bin in dir, header-parsed n_ctx_seq + adapter_fp (read header only),
+// mtime in unix seconds. skips unreadable files (n_ctx_seq = 0 on an unreadable header).
 std::vector<server_snapshot_meta> server_snapshot_list(const std::string & dir);
 
 // pool identity to a filesystem-safe directory name: '/' and ':' become '_'.

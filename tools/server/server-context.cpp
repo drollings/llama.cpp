@@ -2827,6 +2827,30 @@ private:
                     res->id = task.id;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SET_ADAPTERS:
+                {
+                    // single-writer: the scheduler owns params_base.lora_adapters.
+                    // the caller holds the pool's instance_drain_guard, so no slot is
+                    // processing and no save/restore task can interleave. identity
+                    // compares path+scale+ptr: are_lora_equal ignores path, so a
+                    // freed adapter whose address is reused by another file would
+                    // wrongly skip the invalidation below.
+                    if (are_lora_sets_identical(params_base.lora_adapters, task.set_adapters)) {
+                        auto res = std::make_unique<server_task_result_apply_lora>();
+                        res->id = task.id;
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+                    // the adapter change invalidates every slot's live KV ...
+                    for (auto & slot : slots) {
+                        slot.prompt_clear();
+                        slot.prompt.clear();
+                    }
+                    params_base.lora_adapters = task.set_adapters;
+                    auto res = std::make_unique<server_task_result_apply_lora>();
+                    res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_SLOT_SAVE_COPY:
                 {
                     const int id_slot = task.slot_action.id_slot;
@@ -4501,6 +4525,15 @@ server_task_result_ptr server_context::slot_restore_apply(int id_slot, std::vect
     task.id_slot = id_slot;
     task.slot_buffer = std::move(buffer);
     task.slot_tokens = std::move(tokens);
+
+    return run_scheduler_task(std::move(task), [deadline_ms]() {
+        return deadline_ms >= 0 && ggml_time_ms() >= deadline_ms;
+    });
+}
+
+server_task_result_ptr server_context::set_lora_adapters(std::vector<common_adapter_lora_info> adapters, int64_t deadline_ms) {
+    server_task task(SERVER_TASK_TYPE_SET_ADAPTERS);
+    task.set_adapters = std::move(adapters);
 
     return run_scheduler_task(std::move(task), [deadline_ms]() {
         return deadline_ms >= 0 && ggml_time_ms() >= deadline_ms;

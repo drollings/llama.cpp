@@ -137,6 +137,15 @@ bool are_lora_equal(
         const std::vector<common_adapter_lora_info> & l1,
         const std::vector<common_adapter_lora_info> & l2);
 
+// strict identity for whole-set swaps (per-instance attach/detach): path, scale
+// AND pointer must match element-wise. are_lora_equal ignores path, so a freed
+// adapter whose heap address is reused by a different file would compare equal
+// and skip the KV invalidation. same path+scale+ptr implies the same object,
+// hence the same tensors.
+bool are_lora_sets_identical(
+        const std::vector<common_adapter_lora_info> & l1,
+        const std::vector<common_adapter_lora_info> & l2);
+
 // get the ids of all enabled loras
 std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_info> & loras);
 

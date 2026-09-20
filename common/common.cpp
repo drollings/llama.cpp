@@ -453,6 +453,14 @@ common_params common_instance_params(const common_params & base, const common_in
     // parallel defaults to 1, NEVER to the base (global --parallel) value
     params.n_parallel = inst.parallel > 0 ? inst.parallel : 1;
 
+    // non-empty lora list replaces the base --lora set; ptrs stay null for the pool to resolve
+    if (!inst.lora.empty()) {
+        params.lora_adapters.clear();
+        for (const auto & la : inst.lora) {
+            params.lora_adapters.push_back({ la.first, la.second, "", "", nullptr });
+        }
+    }
+
     return params;
 }
 
@@ -534,6 +542,33 @@ std::vector<common_instance> common_instances_parse(const std::string & spec) {
                     throw std::invalid_argument("default takes no value");
                 }
                 inst.is_default = true;
+            } else if (key == "lora") {
+                if (val.empty()) {
+                    throw std::invalid_argument("lora path cannot be empty");
+                }
+                if (val.find(':') != std::string::npos || val.find(',') != std::string::npos) {
+                    throw std::invalid_argument(string_format("lora path '%s' cannot contain ':' or ','", val.c_str()));
+                }
+                // optional scale is the next ':' component when it parses as a positive finite float
+                float scale = 1.0f;
+                if (i + 1 < comps.size()) {
+                    const std::string next = string_strip(comps[i + 1]);
+                    char * end = nullptr;
+                    const float parsed = strtof(next.c_str(), &end);
+                    if (end != nullptr && *end == '\0' && std::isfinite(parsed)) {
+                        if (parsed <= 0.0f) {
+                            throw std::invalid_argument(string_format("lora scale must be positive (in '%s')", part.c_str()));
+                        }
+                        scale = parsed;
+                        ++i; // consume the scale component
+                    }
+                }
+                for (const auto & prev : inst.lora) {
+                    if (prev.first == val) {
+                        throw std::invalid_argument(string_format("duplicate lora path '%s' in instance '%s'", val.c_str(), part.c_str()));
+                    }
+                }
+                inst.lora.emplace_back(val, scale);
             } else {
                 throw std::invalid_argument(string_format("unknown option '%s' in instance '%s'", comp.c_str(), part.c_str()));
             }
@@ -1521,6 +1556,18 @@ void common_init_result::init_from_model(common_params & params, struct llama_co
 
     // load and optionally apply lora adapters
     for (auto & la : params.lora_adapters) {
+        if (la.ptr != nullptr) {
+            // pool owns this adapter (registered in model->loras); reference it.
+            // do NOT llama_adapter_lora_init it again, and do NOT push to pimpl->lora.
+            // meta is still read from the valid pool-owned ptr so GET /lora-adapters
+            // keeps reporting task_name / prompt_prefix for registry adapters.
+            char buf[1024];
+            llama_adapter_meta_val_str(la.ptr, "adapter.lora.task_name", buf, sizeof(buf));
+            la.task_name = buf;
+            llama_adapter_meta_val_str(la.ptr, "adapter.lora.prompt_prefix", buf, sizeof(buf));
+            la.prompt_prefix = buf;
+            continue;
+        }
         llama_adapter_lora_ptr lora;
         lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
         if (lora == nullptr) {
@@ -1879,6 +1926,49 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
     }
 
     llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
+}
+
+std::string common_lora_fingerprint(const std::vector<common_adapter_lora_info> & loras) {
+    if (loras.empty()) {
+        return "";
+    }
+    // sort by path so order never affects the hash; ptr is never an input.
+    // the scale-bits tiebreak keeps equal paths in a defined order.
+    std::vector<const common_adapter_lora_info *> sorted;
+    sorted.reserve(loras.size());
+    for (const auto & la : loras) {
+        sorted.push_back(&la);
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const auto * a, const auto * b) {
+        if (a->path != b->path) {
+            return a->path < b->path;
+        }
+        uint32_t ab = 0, bb = 0;
+        memcpy(&ab, &a->scale, sizeof(ab));
+        memcpy(&bb, &b->scale, sizeof(bb));
+        return ab < bb;
+    });
+
+    // FNV-1a over path bytes, ':' separator, and the raw scale bits (exactly stable)
+    uint64_t hash = 14695981039346656037ull;
+    for (const auto * la : sorted) {
+        for (char c : la->path) {
+            hash ^= (uint64_t)(unsigned char) c;
+            hash *= 1099511628211ull;
+        }
+        hash ^= (uint64_t) ':';
+        hash *= 1099511628211ull;
+        uint32_t bits = 0;
+        static_assert(sizeof(bits) == sizeof(la->scale), "float must be 32-bit");
+        memcpy(&bits, &la->scale, sizeof(bits));
+        for (int i = 0; i < 4; ++i) {
+            hash ^= (uint64_t)((bits >> (8 * i)) & 0xff);
+            hash *= 1099511628211ull;
+        }
+    }
+    char out[17];
+    snprintf(out, sizeof(out), "%016llx", (unsigned long long) hash);
+    return out;
 }
 
 struct llama_model_params common_model_params_to_llama(common_params & params) {

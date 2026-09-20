@@ -202,6 +202,20 @@ bool are_lora_equal(
     return true;
 }
 
+bool are_lora_sets_identical(
+        const std::vector<common_adapter_lora_info> & l1,
+        const std::vector<common_adapter_lora_info> & l2) {
+    if (l1.size() != l2.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < l1.size(); ++i) {
+        if (l1[i].path != l2[i].path || l1[i].scale != l2[i].scale || l1[i].ptr != l2[i].ptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_info> & loras) {
     std::vector<size_t> enabled_ids;
     for (size_t i = 0; i < loras.size(); ++i) {

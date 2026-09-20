@@ -138,17 +138,18 @@ static void test_instances_envelope_shape() {
 
     const json total = body["total"];
     assert(total.is_object());
-    assert(total.size() == 4);
+    assert(total.size() == 5);
     assert(total.contains("model") && total["model"].is_number_integer());
     assert(total.contains("context") && total["context"].is_number_integer());
     assert(total.contains("compute") && total["compute"].is_number_integer());
+    assert(total.contains("adapter") && total["adapter"].is_number_integer());
     assert(total.contains("total") && total["total"].is_number_integer());
 
     const json row = body["instances"][0];
     assert(row.is_object());
     const std::vector<std::string> keys = {
         "id", "aliases", "group", "n_ctx", "parallel", "pinned", "is_default",
-        "state", "model_bytes", "context_bytes", "compute_bytes", "total_bytes",
+        "state", "model_bytes", "context_bytes", "compute_bytes", "adapter_bytes", "total_bytes",
         "vram_bytes", "last_used", "last_used_epoch",
     };
     assert(row.size() == keys.size());
@@ -166,6 +167,7 @@ static void test_instances_envelope_shape() {
     assert(row["model_bytes"].is_number_integer());
     assert(row["context_bytes"].is_number_integer());
     assert(row["compute_bytes"].is_number_integer());
+    assert(row["adapter_bytes"].is_number_integer());
     assert(row["total_bytes"].is_number_integer());
     assert(row["vram_bytes"].is_number_integer());
     assert(row["last_used"].is_number());

@@ -153,6 +153,84 @@ static void test_instance_params() {
     assert(p.n_parallel == 1); // divergence from _swarm_api: never inherits base.n_parallel
 }
 
+static void test_instances_lora_grammar() {
+    // repeatable lora= with explicit and default scales
+    auto v = common_instances_parse("a:lora=./x.gguf:0.5:lora=./y.gguf,b:lora=./z.gguf");
+    assert(v.size() == 2);
+    assert(v[0].lora.size() == 2);
+    assert(v[0].lora[0].first == "./x.gguf" && v[0].lora[0].second == 0.5f);
+    assert(v[0].lora[1].first == "./y.gguf" && v[0].lora[1].second == 1.0f);
+    assert(v[1].lora.size() == 1);
+    assert(v[1].lora[0].first == "./z.gguf" && v[1].lora[0].second == 1.0f);
+
+    // a non-float component after lora= is not a scale: default applies, comp parses on
+    auto w = common_instances_parse("a:lora=./x.gguf:pinned");
+    assert(w.size() == 1 && w[0].lora.size() == 1);
+    assert(w[0].lora[0].second == 1.0f && w[0].pinned);
+
+    // no lora= means an empty list (inherit the base --lora set)
+    auto p = common_instances_parse("plain:ctx=512");
+    assert(p.size() == 1 && p[0].lora.empty());
+
+    // invalid scales and paths are parse errors
+    expect_parse_error("a:lora=");            // empty path
+    expect_parse_error("a:lora=./x.gguf:0");  // zero scale
+    expect_parse_error("a:lora=./x.gguf:-2"); // negative scale
+    expect_parse_error("a:lora=./x.gguf:lora=./x.gguf"); // duplicate path
+}
+
+static void test_instance_params_lora() {
+    common_params base;
+    base.lora_adapters.push_back({ "base.gguf", 1.0f, "", "", nullptr });
+
+    // empty inst.lora inherits the base set untouched
+    common_instance inherit;
+    inherit.name = "inherit";
+    common_params p = common_instance_params(base, inherit);
+    assert(p.lora_adapters.size() == 1);
+    assert(p.lora_adapters[0].path == "base.gguf" && p.lora_adapters[0].scale == 1.0f);
+
+    // non-empty inst.lora REPLACES the base set; ptrs stay null for the pool
+    common_instance over;
+    over.name = "over";
+    over.lora = { { "./a.gguf", 0.5f }, { "./b.gguf", 2.0f } };
+    p = common_instance_params(base, over);
+    assert(p.lora_adapters.size() == 2);
+    assert(p.lora_adapters[0].path == "./a.gguf" && p.lora_adapters[0].scale == 0.5f);
+    assert(p.lora_adapters[1].path == "./b.gguf" && p.lora_adapters[1].scale == 2.0f);
+    assert(p.lora_adapters[0].ptr == nullptr && p.lora_adapters[1].ptr == nullptr);
+}
+
+static void test_lora_fingerprint() {
+    std::vector<common_adapter_lora_info> empty;
+    assert(common_lora_fingerprint(empty).empty());
+
+    // stable and order-independent; ptr is never an input
+    std::vector<common_adapter_lora_info> a = {
+        { "b.gguf", 1.0f, "", "", nullptr },
+        { "a.gguf", 0.5f, "", "", (llama_adapter_lora *) 0x1234 },
+    };
+    std::vector<common_adapter_lora_info> b = {
+        { "a.gguf", 0.5f, "", "", nullptr },
+        { "b.gguf", 1.0f, "", "", nullptr },
+    };
+    assert(!common_lora_fingerprint(a).empty());
+    assert(common_lora_fingerprint(a) == common_lora_fingerprint(b));
+
+    // scale is part of the identity
+    std::vector<common_adapter_lora_info> c = {
+        { "a.gguf", 1.0f, "", "", nullptr },
+    };
+    std::vector<common_adapter_lora_info> d = {
+        { "a.gguf", 0.5f, "", "", nullptr },
+    };
+    assert(common_lora_fingerprint(c) != common_lora_fingerprint(d));
+}
+
+static void test_adapter_buf_size_null() {
+    assert(llama_adapter_lora_buf_size(nullptr) == 0);
+}
+
 static void test_borrowed_model(const common_params & base) {
     common_params params = base;
     params.n_ctx = 256;
@@ -347,18 +425,63 @@ static void test_resize_teardown_rebuild(const common_params & base) {
     mgr.terminate();
 }
 
+// pool simulation: the pool loads the adapter once against the shared model, then
+// hands the ptr to init_from_model. the bogus path proves the skip guard: if init
+// tried to load-and-own again it would fail on the bogus file and return no context.
+static void test_borrowed_model_adapter_skip(const common_params & base, const std::string & adapter_path) {
+    common_params params = base;
+    params.n_ctx = 256;
+    params.n_parallel = 1;
+    params.warmup = false;
+
+    auto model_init = common_init_from_params(params, true);
+    llama_model * model = model_init->model();
+    assert(model != nullptr);
+
+    // the pool's single load (outside init_from_model)
+    llama_adapter_lora * pool_adapter = llama_adapter_lora_init(model, adapter_path.c_str());
+    if (pool_adapter == nullptr) {
+        fprintf(stderr, "WARNING: cannot load adapter '%s' on this model, skipping.\n", adapter_path.c_str());
+        return;
+    }
+    assert(llama_adapter_lora_buf_size(pool_adapter) > 0);
+
+    common_params p = params;
+    p.lora_adapters = { { "/nonexistent/bogus.gguf", 0.5f, "", "", pool_adapter } };
+    auto ctx = common_init_from_model_params(p, model);
+    assert(ctx->context() != nullptr); // the bogus path was never touched
+    assert(p.lora_adapters[0].ptr == pool_adapter);
+
+    // teardown: the context never owned the adapter (no double-free below), the
+    // pool frees its single load here
+    ctx.reset();
+    llama_adapter_lora_free(pool_adapter);
+}
+
 int main(int argc, char ** argv) {
     test_instances_parse_round_trip();
     test_instances_parse_errors();
     test_instances_parse_valid_names();
     test_instance_params();
+    test_instances_lora_grammar();
+    test_instance_params_lora();
+    test_lora_fingerprint();
+    test_adapter_buf_size_null();
 
     common_params params;
+    std::string   adapter_path;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::string(argv[i]) == "-m") {
             params.model.path = argv[i + 1];
         }
+        if (std::string(argv[i]) == "--lora") {
+            adapter_path = argv[i + 1];
+        }
     }
+    // hermetic thread count: the -1 default resolves through the host backend
+    // registry, which segfaults in some container toolchains
+    params.cpuparams.n_threads       = 4;
+    params.cpuparams_batch.n_threads = 4;
 
     if (params.model.path.empty()) {
         fprintf(stderr, "WARNING: no model file provided. Set LLAMACPP_TEST_MODELFILE=<gguf_model_path> to run the borrowed-model test.\n");
@@ -379,6 +502,11 @@ int main(int argc, char ** argv) {
     test_demand_build_starts_one_loop(params);
     test_start_loops_skips_unbuilt(params);
     test_resize_teardown_rebuild(params);
+    if (!adapter_path.empty()) {
+        test_borrowed_model_adapter_skip(params, adapter_path);
+    } else {
+        fprintf(stderr, "WARNING: no adapter file provided. Pass --lora <adapter_gguf> to run the adapter skip test.\n");
+    }
 
     fprintf(stdout, "%s: all tests passed\n", __func__);
     return 0;

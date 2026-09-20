@@ -454,6 +454,7 @@ struct common_instance {
     int32_t parallel = 0; // 0 = 1 (never inherits the global --parallel)
     bool pinned     = false; // advisory only; never enforced
     bool is_default = false; // target of <base> alone
+    std::vector<std::pair<std::string, float>> lora; // adapter path -> scale (empty = inherit base --lora)
 };
 
 struct common_params {
@@ -998,6 +999,10 @@ struct llama_context_params   common_context_params_to_llama(const common_params
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
+
+// short stable hash of the sorted (path, scale) adapter set; "" when empty.
+// used to fingerprint snapshots so a restore under a different adapter set is rejected.
+std::string common_lora_fingerprint(const std::vector<common_adapter_lora_info> & loras);
 
 // model endpoint from env
 std::string common_get_model_endpoint();
