@@ -137,6 +137,15 @@ struct server_context {
     server_task_result_ptr slot_save_copy(int id_slot, int64_t deadline_ms = -1);
     server_task_result_ptr slot_restore_apply(int id_slot, std::vector<uint8_t> buffer, llama_tokens tokens, int64_t deadline_ms = -1);
 
+    // replace the instance's adapter set. the caller must hold the pool's
+    // instance_drain_guard (no slot processing, no interleaving save/restore) and
+    // pool ownership of every adapter in the list (see M4). runs the swap on the
+    // scheduler thread and WAITS for it with a deadline; returns the task result
+    // (null on timeout). post directly to this context's queue, never through
+    // pool dispatch (the drain guard's removing flag would reject it).
+    server_task_result_ptr set_lora_adapters(std::vector<common_adapter_lora_info> adapters,
+                                             int64_t deadline_ms);
+
     // manager-only: run `op` on this instance's scheduler thread, serialized with all
     // other tasks (context lifetime is not thread-safe). `op` returns the JSON payload
     // and throws with a message to signal an error; the caller gets a

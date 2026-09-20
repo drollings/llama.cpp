@@ -30,6 +30,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_RESTORE_APPLY, // two-phase snapshot: apply a host KV buffer to a slot
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_SET_ADAPTERS, // replace the whole adapter list (path+scale+ptr), used by per-instance attach/detach
     SERVER_TASK_TYPE_INSTANCE_OP, // manager-invoked lifecycle op, runs on the scheduler thread
 };
 
@@ -178,6 +179,9 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_SET_ADAPTERS
+    std::vector<common_adapter_lora_info> set_adapters; // full target adapter list
 
     // used by SERVER_TASK_TYPE_SLOT_RESTORE_APPLY: the host KV buffer and the prompt tokens
     // it was copied from (read from disk by the manager's pool I/O worker, never the scheduler)

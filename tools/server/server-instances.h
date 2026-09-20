@@ -12,6 +12,7 @@
 #include <deque>
 #include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -70,6 +71,17 @@ struct server_instances {
     std::shared_ptr<common_init_result> model_init = nullptr;
     llama_model *                       model      = nullptr;
 
+    // pool-level adapter registry. every GGUF adapter file is loaded once against
+    // the shared model and referenced by any number of instances. entries are freed
+    // when their refcount hits 0 OR when the pool tears down - always BEFORE the
+    // model is freed (llama_adapter_lora_free erases from model->loras, and
+    // ~llama_model deletes whatever is still registered: wrong order double-frees).
+    struct adapter_registry_entry {
+        llama_adapter_lora_ptr adapter; // owns via llama_adapter_lora_free
+        size_t                 refcount = 0;
+    };
+    std::map<std::string, adapter_registry_entry> adapter_registry; // canonical path -> entry
+
     common_params params;  // base params (global defaults + instances config)
 
     // owned through shared_ptr so an in-flight dispatch keeps the instance alive while a
@@ -87,7 +99,8 @@ struct server_instances {
     // management calls can never race on the same instance (e.g. destroy + resize).
     // dispatches never take this mutex; a management op holds it for its whole body
     // and takes mutex_dispatch underneath. set once when the server shuts down.
-    std::mutex mutex_mgmt;
+    // mutable so read-only envelope handlers can take it for adapter accounting.
+    mutable std::mutex mutex_mgmt;
 
     // one-shot teardown flag, guarded by mutex_dispatch (see terminate())
     bool terminated = false;
@@ -128,6 +141,9 @@ struct server_instances {
     server_http_res_ptr handle_post_instance_snapshot(const server_http_req & req);
     server_http_res_ptr handle_get_instance_snapshots(const server_http_req & req);
     server_http_res_ptr handle_delete_instance_snapshot(const server_http_req & req);
+    server_http_res_ptr handle_post_instance_adapters(const server_http_req & req);
+    server_http_res_ptr handle_delete_instance_adapters(const server_http_req & req);
+    server_http_res_ptr handle_get_instance_adapters(const server_http_req & req);
 
     // --- HTTP handlers (wired by server.cpp, one per endpoint) ---
     server_http_res_ptr handle_get_health(const server_http_req & req);
@@ -222,12 +238,36 @@ struct server_instances {
     };
 
     // management API internals
+    // adapter registry (all callers hold mutex_mgmt). adapter_key is absolute +
+    // lexically-normalized, NOT canonicalized: no symlink/hardlink dedup is
+    // attempted. scale is per-instance (lives in the instance's effective list),
+    // never in the registry.
+    static std::string adapter_key(const std::string & path);
+    // load-or-bump: returns the pool-owned ptr, or nullptr when the file fails to
+    // load (the llama error is already logged). the caller owns one ref per
+    // instance entry and must pair it with release_adapter.
+    llama_adapter_lora * ensure_adapter(const std::string & path);
+    // drop one ref; frees the entry at 0 (the model is alive: pool model_init
+    // outlives every caller). key must be adapter_key() output.
+    void release_adapter(const std::string & key);
+    // release one ref per entry with a non-null ptr (rollback helper).
+    void release_adapter_set(const std::vector<common_adapter_lora_info> & loras);
+    // resolve the instance's adapter set into pool-owned entries (ptrs filled,
+    // canonical keys as paths); init_from_model skips any entry with a non-null
+    // ptr, so these are referenced, never re-loaded. caller holds mutex_mgmt. on
+    // failure releases what was taken and returns nullopt (distinct from a
+    // legitimate empty set). callers map nullopt to 400, never 507.
+    std::optional<std::vector<common_adapter_lora_info>> resolve_adapter_set(const common_instance & cfg);
+    // sum of llama_adapter_lora_buf_size over the instance's resolved set.
+    // caller holds mutex_mgmt (reads effective.lora_adapters).
+    uint64_t instance_adapter_bytes(const server_instance & inst) const;
     // the single place an instance is constructed from the already-loaded shared
     // model (effective params, n_parallel clamp, context allocation, identity, slot
     // bookkeeping, routes, slot-release callback). returns nullptr on context
     // allocation failure; the caller owns registration in the pool and starting the
-    // scheduler loop thread.
-    std::shared_ptr<server_instance> build_instance(const common_instance & cfg);
+    // scheduler loop thread. adapter_failed distinguishes an adapter load failure
+    // (caller maps to 400) from an allocation failure (caller maps to 507).
+    std::shared_ptr<server_instance> build_instance(const common_instance & cfg, bool & adapter_failed);
     server_http_res_ptr              create_instance(const common_instance & cfg);
     server_http_res_ptr              destroy_instance(const std::string & name, bool force);
     server_http_res_ptr              resize_instance(const std::string & name, int32_t new_ctx);
@@ -240,7 +280,8 @@ struct server_instances {
     json                             instance_to_json(const server_instance & inst,
                                                       uint64_t                model_bytes,
                                                       uint64_t                context_bytes,
-                                                      uint64_t                compute_bytes) const;
+                                                      uint64_t                compute_bytes,
+                                                      uint64_t                adapter_bytes) const;
     // the full {"instances": [...], "snapshots": [...], "total": {...}} envelope; the
     // shared weights are counted once per pool
     json get_instances_json() const;

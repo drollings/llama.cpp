@@ -223,7 +223,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
-| `--instance INSTANCE` | define a named context instance sharing this model's weights, format: `name[:group=G][:ctx=N][:parallel=M][:pinned][:default]` (repeatable, comma-separated values also accepted)<br/>(env: LLAMA_ARG_INSTANCES) |
+| `--instance INSTANCE` | define a named context instance sharing this model's weights, format: `name[:group=G][:ctx=N][:parallel=M][:pinned][:default][:lora=PATH[:SCALE]...]` (repeatable, comma-separated values also accepted)<br/>(env: LLAMA_ARG_INSTANCES) |
 | `--instance-wait SECONDS` | how long a group-targeted request waits for a free instance before returning 503 (default: 60; -1 = wait forever)<br/>(env: LLAMA_ARG_INSTANCE_WAIT) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
@@ -2067,7 +2067,7 @@ Start with `--instance`, one per named context. The base model configuration (`-
 `--parallel`, ...) is inherited by every instance, and each instance may override it:
 
 ```
-name[:group=G][:ctx=N][:parallel=M][:pinned][:default]
+name[:group=G][:ctx=N][:parallel=M][:pinned][:default][:lora=PATH[:SCALE]...]
 ```
 
 - `name` (required) and `group` are `[A-Za-z0-9._-]` strings; `group` defaults to `name`.
@@ -2076,6 +2076,10 @@ name[:group=G][:ctx=N][:parallel=M][:pinned][:default]
   `0` (or absent) means `1` - it **never** inherits the global `--parallel`.
 - `pinned` and `default` are advisory flags (see below). `default` marks the target of a bare
   `<base>` request.
+- `lora=PATH[:SCALE]` declares a LoRA adapter for the instance (repeatable). `SCALE`
+  defaults to `1.0` and must be positive and finite; `PATH` must not contain `:` or `,`.
+  An instance with no `lora=` inherits the base `--lora` set. The adapter file is loaded
+  once per pool and shared by every instance that references it (see below).
 
 ```sh
 # one process, three instances sharing the same weights
@@ -2137,11 +2141,11 @@ Endpoints without a `model` field (`/health`, `/props`, `/tokenize`, `/detokeniz
     "id": "base:work", "aliases": [...], "group": "jobs",
     "n_ctx": 8192, "parallel": 1, "pinned": false, "is_default": false,
     "state": "loaded",
-    "model_bytes": 0, "context_bytes": 0, "compute_bytes": 0,
+    "model_bytes": 0, "context_bytes": 0, "compute_bytes": 0, "adapter_bytes": 0,
     "total_bytes": 0, "vram_bytes": 0, "last_used": -1
   } ],
-  "snapshots": [ { "name": "...", "size": 0, "mtime": 0, "n_ctx_seq": 0 } ],
-  "total": { "model": 0, "context": 0, "compute": 0, "total": 0 }
+  "snapshots": [ { "name": "...", "size": 0, "mtime": 0, "n_ctx_seq": 0, "adapter_fp": "..." } ],
+  "total": { "model": 0, "context": 0, "compute": 0, "adapter": 0, "total": 0 }
 }
 ```
 
@@ -2184,7 +2188,39 @@ identity is sanitized: `/` and `:` become `_`).
 - A request carrying `"snapshot": "foo"` loads that snapshot into the slot, replacing its KV
   and prompt; while the slot is bound to a snapshot, later requests extend it and the
   extended KV is saved back when the slot switches away. A snapshot saved under a different
-  context size is rejected with `400`.
+  context size is rejected with `400`. A snapshot saved under a different adapter set is
+  rejected with `400` (see below).
+
+#### Per-instance LoRA adapters
+
+Each instance may carry its own LoRA adapter set: declared at startup with
+`--instance NAME:lora=PATH[:SCALE]...`, or attached at runtime. Every adapter file is
+loaded **once per pool** against the shared weights and referenced by any number of
+instances; deleting the last reference frees it, and deleting the last instance drains
+the whole registry before the weights are unloaded.
+
+- `POST /instances/:name/adapters` body `{ "path": "a.gguf", "scale": 1.0 }` attaches
+  (re-attach updates the scale). Returns `200` with the instance JSON; `400` on a bad
+  path/scale or an unloadable file; `404` on an unknown instance. Attaching to an
+  unbuilt window records the declaration; it resolves when the window materializes.
+- `GET /instances/:name/adapters` returns `[ { "path": "...", "scale": 1.0 } ]` in
+  instance order; `404` on an unknown instance.
+- `DELETE /instances/:name/adapters` body `{ "path": "a.gguf" }` detaches (`?path=`
+  accepted as an alias, since filesystem paths cannot fit a `:path` URL segment).
+  Returns `{ "success": true }`; `404` on an unknown instance or adapter.
+
+Attach/detach run under an exclusive drain (in-flight generations finish first) and
+apply synchronously: the next request always sees the new set. The swap invalidates
+every slot's live KV and revokes snapshot bindings (like resize). Each instance reports
+its own `adapter_bytes`; `total.adapter` counts each file once.
+
+Snapshots record the adapter fingerprint they were saved under (`adapter_fp` in the
+listing). Restoring under a different set returns `400 "snapshot adapter set does not
+match this instance"`. Files written before fingerprints (no `adapter_fp`) restore with
+a warning for backward compatibility.
+
+The legacy `GET/POST /lora-adapters` endpoints are unchanged: they address the default
+instance's scale-only adapter list.
 
 ## API errors
 

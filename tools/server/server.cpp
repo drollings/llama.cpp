@@ -340,6 +340,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.post ("/instances/:name/snapshot",     ex_wrapper([&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_instance_snapshot(req); }));
         ctx_http.get  ("/instances/:name/snapshots",    ex_wrapper([&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_instance_snapshots(req); }));
         ctx_http.del  ("/instances/:name/snapshot/:snapshot", ex_wrapper([&instances_mgr](const server_http_req & req) { return instances_mgr.handle_delete_instance_snapshot(req); }));
+        ctx_http.post ("/instances/:name/adapters",     ex_wrapper([&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_instance_adapters(req); }));
+        ctx_http.get  ("/instances/:name/adapters",     ex_wrapper([&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_instance_adapters(req); }));
+        ctx_http.del  ("/instances/:name/adapters",     ex_wrapper([&instances_mgr](const server_http_req & req) { return instances_mgr.handle_delete_instance_adapters(req); }));
     }
 
     // resumable streaming: a child binds the local session factories, the router binds

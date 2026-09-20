@@ -2,7 +2,10 @@ import threading
 import pytest
 from utils import *
 import os
+import requests
+import shutil
 import tempfile
+import urllib.parse
 
 server = ServerPreset.tinyllama2()
 
@@ -90,8 +93,8 @@ def test_instances_two_pool_list():
     # the envelope sums a 64-bit total; the shared model bytes are counted once
     assert "total" in body
     total = body["total"]
-    assert set(total.keys()) == {"model", "context", "compute", "total"}
-    assert total["total"] == total["model"] + total["context"] + total["compute"]
+    assert set(total.keys()) == {"model", "context", "compute", "adapter", "total"}
+    assert total["total"] == total["model"] + total["context"] + total["compute"] + total["adapter"]
 
     # the default instance is the pinned ledger
     defaults = [inst for inst in body["instances"] if inst["is_default"]]
@@ -187,8 +190,8 @@ def test_instances_envelope():
     assert len(body["instances"]) == 1
     assert "total" in body
     total = body["total"]
-    assert set(total.keys()) == {"model", "context", "compute", "total"}
-    assert total["total"] == total["model"] + total["context"] + total["compute"]
+    assert set(total.keys()) == {"model", "context", "compute", "adapter", "total"}
+    assert total["total"] == total["model"] + total["context"] + total["compute"] + total["adapter"]
 
     inst = body["instances"][0]
     assert inst["total_bytes"] == inst["model_bytes"] + inst["context_bytes"] + inst["compute_bytes"]
@@ -513,3 +516,309 @@ def test_instances_delete_last_unloads():
     assert res.status_code == 201
     body = _get_instances()
     assert body["total"]["model"] > 0, "POST /instances did not reload the shared weights"
+
+
+# --- adapters on demand (ROADMAP_20260809_ADAPTERS_ON_DEMAND) ---
+LORA_FILE_URL = "https://huggingface.co/ggml-org/stories15M_MOE/resolve/main/moe_shakespeare15M.gguf"
+
+
+def _adapter_path() -> str:
+    # cached in tests/tmp after the first download (no re-download across tests)
+    return os.path.abspath(download_file(LORA_FILE_URL))
+
+
+def _moe_server():
+    global server
+    server = ServerPreset.stories15m_moe()
+    server.n_ctx = 512
+    server.temperature = 0.0
+    return server
+
+
+def _adapters_of(name: str):
+    res = server.make_request("GET", f"/instances/{name}/adapters")
+    assert res.status_code == 200
+    return res.body
+
+
+def _complete(instance: str, **kw):
+    data = {"model": f"stories15m-moe:{instance}", "prompt": "Hello", "n_predict": 4}
+    data.update(kw)
+    return server.make_request("POST", "/completion", data=data)
+
+
+def test_instances_adapter_attach_detach():
+    """Attach is per-instance, GET lists [{path, scale}], re-attach updates the
+    scale (never 409, never a duplicate), detach removes."""
+    _moe_server()
+    server.instances = ["a:ctx=512", "b:ctx=512"]
+    server.start()
+    lora = _adapter_path()
+
+    res = server.make_request("POST", "/instances/a/adapters", data={"path": lora, "scale": 0.5})
+    assert res.status_code == 200
+    assert _adapters_of("a") == [{"path": lora, "scale": 0.5}]
+
+    # re-attach updates the scale in place
+    res = server.make_request("POST", "/instances/a/adapters", data={"path": lora, "scale": 1.0})
+    assert res.status_code == 200
+    assert _adapters_of("a") == [{"path": lora, "scale": 1.0}]
+
+    # make_request DELETE sends no body: use requests directly
+    url = f"http://{server.server_host}:{server.server_port}/instances/a/adapters"
+    res = requests.delete(url, json={"path": lora})
+    assert res.status_code == 200
+    assert _adapters_of("a") == []
+
+
+def test_instances_adapter_shared_single_load():
+    """One file attached to two instances loads once: both report adapter_bytes,
+    total.adapter counts it once."""
+    _moe_server()
+    server.instances = ["a:ctx=512", "b:ctx=512"]
+    server.start()
+    lora = _adapter_path()
+
+    assert _complete("a").status_code == 200
+    assert _complete("b").status_code == 200
+    res = server.make_request("POST", "/instances/a/adapters", data={"path": lora})
+    assert res.status_code == 200
+    res = server.make_request("POST", "/instances/b/adapters", data={"path": lora})
+    assert res.status_code == 200
+
+    body = _get_instances()
+    by_id = {inst["id"]: inst for inst in body["instances"]}
+    a_bytes = by_id["stories15m-moe:a"]["adapter_bytes"]
+    b_bytes = by_id["stories15m-moe:b"]["adapter_bytes"]
+    assert a_bytes > 0
+    assert a_bytes == b_bytes
+    assert body["total"]["adapter"] == a_bytes, "adapter file loaded more than once"
+    assert body["total"]["total"] == (
+        body["total"]["model"] + body["total"]["context"] + body["total"]["compute"] + body["total"]["adapter"]
+    )
+
+
+def test_instances_adapter_inherited_base():
+    """The base --lora set resolves into the same shared entries on every instance
+    (dedup with zero attach calls); attach is additive."""
+    _moe_server()
+    lora = _adapter_path()
+    server.lora_files = [lora]
+    server.instances = ["a:ctx=512", "b:ctx=512"]
+    server.start()
+
+    assert _complete("a").status_code == 200
+    assert _complete("b").status_code == 200
+    assert _adapters_of("a") == [{"path": lora, "scale": 1.0}]
+    assert _adapters_of("b") == [{"path": lora, "scale": 1.0}]
+
+    body = _get_instances()
+    by_id = {inst["id"]: inst for inst in body["instances"]}
+    assert by_id["stories15m-moe:a"]["adapter_bytes"] > 0
+    assert body["total"]["adapter"] == by_id["stories15m-moe:a"]["adapter_bytes"]
+
+    # a second file (same bytes, other path) attaches additively
+    lora2 = lora + ".copy.gguf"
+    shutil.copyfile(lora, lora2)
+    try:
+        res = server.make_request("POST", "/instances/a/adapters", data={"path": lora2})
+        assert res.status_code == 200
+        got = _adapters_of("a")
+        assert [e["path"] for e in got] == [lora, lora2]
+        assert _adapters_of("b") == [{"path": lora, "scale": 1.0}]
+    finally:
+        os.remove(lora2)
+
+
+def test_instances_adapter_isolated():
+    """Instance A's adapter never appears on B."""
+    _moe_server()
+    server.instances = ["a:ctx=512", "b:ctx=512"]
+    server.start()
+    lora = _adapter_path()
+
+    res = server.make_request("POST", "/instances/a/adapters", data={"path": lora})
+    assert res.status_code == 200
+    assert _complete("a").status_code == 200
+    assert _complete("b").status_code == 200
+    assert _adapters_of("a") == [{"path": lora, "scale": 1.0}]
+    assert _adapters_of("b") == []
+
+    body = _get_instances()
+    by_id = {inst["id"]: inst for inst in body["instances"]}
+    assert by_id["stories15m-moe:a"]["adapter_bytes"] > 0
+    assert by_id["stories15m-moe:b"]["adapter_bytes"] == 0
+
+
+def test_instances_adapter_detach_busy_503_or_waits():
+    """Attach during an in-flight generation on the same instance: no corruption,
+    no crash (the drain waits or 503s, never a torn swap)."""
+    _moe_server()
+    server.instances = ["a:ctx=512"]
+    server.start()
+    lora = _adapter_path()
+    assert _complete("a").status_code == 200
+
+    results = {}
+
+    def gen():
+        results["gen"] = server.make_request("POST", "/completion", data={
+            "model": "stories15m-moe:a",
+            "prompt": "The quick brown fox jumps over the lazy dog. ",
+            "n_predict": 128,
+        })
+
+    def attach():
+        results["attach"] = server.make_request("POST", "/instances/a/adapters", data={"path": lora})
+
+    t = threading.Thread(target=gen)
+    t.start()
+    time.sleep(0.5)  # let the long generation occupy the slot first
+    attach()
+    t.join()
+
+    assert results["gen"].status_code == 200
+    assert results["attach"].status_code in (200, 503)
+    # the server is still healthy and the adapter state is coherent
+    assert _complete("a", n_predict=2).status_code == 200
+    got = _adapters_of("a")
+    assert got in ([], [{"path": lora, "scale": 1.0}])
+
+def test_instances_adapter_clears_bindings():
+    """A slot bound to a snapshot is unbound by attach (like resize): after the
+    swap the request must reach the fingerprint check (400 here) instead of
+    short-circuiting on the stale binding (which would serve 200 from live KV)."""
+    _moe_server()
+    server.instances = ["a:ctx=512"]
+    server.slot_save_path = tempfile.mkdtemp()
+    server.start()
+    lora = _adapter_path()
+
+    res = server.make_request("POST", "/instances/a/adapters", data={"path": lora})
+    assert res.status_code == 200
+    assert _complete("a", n_predict=8).status_code == 200
+
+    res = server.make_request("POST", "/instances/a/snapshot", data={"name": "work"})
+    assert res.status_code == 201
+    # bind slot 0 to the snapshot
+    assert _complete("a", snapshot="work", n_predict=2).status_code == 200
+
+    # attach a second adapter: revokes the binding and changes the set, so asking
+    # for the snapshot must 400 on the fingerprint check rather than serve bound KV
+    lora2 = lora + ".copy.gguf"
+    shutil.copyfile(lora, lora2)
+    try:
+        res = server.make_request("POST", "/instances/a/adapters", data={"path": lora2})
+        assert res.status_code == 200
+        res = server.make_request("POST", "/completion", data={
+            "model": "stories15m-moe:a", "snapshot": "work", "prompt": "x", "n_predict": 2,
+        })
+        assert res.status_code == 400
+    finally:
+        os.remove(lora2)
+
+
+def test_instances_adapter_snapshot_mismatch_400():
+    """A snapshot saved under adapter A refuses restore after detach; re-attaching
+    the original set (fp excludes ptr, so re-resolution matches) restores fine."""
+    _moe_server()
+    server.instances = ["a:ctx=512"]
+    server.slot_save_path = tempfile.mkdtemp()
+    server.start()
+    lora = _adapter_path()
+
+    res = server.make_request("POST", "/instances/a/adapters", data={"path": lora})
+    assert res.status_code == 200
+    assert _complete("a", n_predict=8).status_code == 200
+    res = server.make_request("POST", "/instances/a/snapshot", data={"name": "work"})
+    assert res.status_code == 201
+
+    url = f"http://{server.server_host}:{server.server_port}/instances/a/adapters"
+    res = requests.delete(url, json={"path": lora})
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/completion", data={
+        "model": "stories15m-moe:a", "snapshot": "work", "prompt": "x", "n_predict": 2,
+    })
+    assert res.status_code == 400
+
+    res = server.make_request("POST", "/instances/a/adapters", data={"path": lora})
+    assert res.status_code == 200
+    res = server.make_request("POST", "/completion", data={
+        "model": "stories15m-moe:a", "snapshot": "work", "prompt": "x", "n_predict": 2,
+    })
+    assert res.status_code == 200
+
+
+def test_instances_adapter_cold_reload():
+    """Delete-last frees adapter bytes (registry drained); recreate + attach works
+    and generation still runs."""
+    _moe_server()
+    server.instances = ["a:ctx=512"]
+    server.start()
+    lora = _adapter_path()
+
+    res = server.make_request("POST", "/instances/a/adapters", data={"path": lora})
+    assert res.status_code == 200
+    assert _complete("a").status_code == 200
+    assert _get_instances()["total"]["adapter"] > 0
+
+    res = server.make_request("DELETE", "/instances/a")
+    assert res.status_code == 200
+    body = _get_instances()
+    assert body["instances"] == []
+    assert body["total"]["adapter"] == 0
+    assert body["total"]["model"] == 0
+
+    res = server.make_request("POST", "/instances", data={"name": "b", "ctx_size": 512})
+    assert res.status_code == 201
+    res = server.make_request("POST", "/instances/b/adapters", data={"path": lora})
+    assert res.status_code == 200
+    assert _complete("b").status_code == 200
+    assert _get_instances()["total"]["adapter"] > 0
+
+
+def test_instances_adapter_bad_path_400():
+    _moe_server()
+    server.instances = ["a:ctx=512"]
+    server.start()
+
+    # pure body validation rejects regardless of build state
+    res = server.make_request("POST", "/instances/a/adapters", data={"path": ""})
+    assert res.status_code == 400
+    res = server.make_request("POST", "/instances/a/adapters",
+                              data={"path": _adapter_path(), "scale": 0})
+    assert res.status_code == 400
+
+    # a missing file fails the load: only attempted on a built window (an
+    # unbuilt window records the declaration and resolves on first demand)
+    assert _complete("a").status_code == 200
+    res = server.make_request("POST", "/instances/a/adapters", data={"path": "/nonexistent/x.gguf"})
+    assert res.status_code == 400
+    assert _adapters_of("a") == []
+    assert _get_instances()["total"]["adapter"] == 0
+
+
+def test_instances_adapter_unknown_404():
+    _moe_server()
+    server.instances = ["a:ctx=512"]
+    server.start()
+    lora = _adapter_path()
+
+    res = server.make_request("GET", "/instances/nope/adapters")
+    assert res.status_code == 404
+    res = server.make_request("POST", "/instances/nope/adapters", data={"path": lora})
+    assert res.status_code == 404
+
+    base = f"http://{server.server_host}:{server.server_port}"
+    res = requests.delete(base + "/instances/nope/adapters", json={"path": lora})
+    assert res.status_code == 404
+    # unknown adapter on a known instance is also 404
+    res = requests.delete(base + "/instances/a/adapters", json={"path": lora})
+    assert res.status_code == 404
+    # the ?path= alias works for detach
+    res = server.make_request("POST", "/instances/a/adapters", data={"path": lora})
+    assert res.status_code == 200
+    res = requests.delete(base + "/instances/a/adapters?path=" + urllib.parse.quote(lora, safe=""))
+    assert res.status_code == 200
+    assert _adapters_of("a") == []
