@@ -77,15 +77,6 @@ static bool verify_attached(server_instance & inst, int64_t deadline_ms) {
     return installed && are_lora_sets_identical(*installed, inst.effective.lora_adapters);
 }
 
-// adapter-debt guards: destroy records the debt, later milestones reconcile it.
-[[maybe_unused]] static bool has_adapter_debt(const server_instance & inst) {
-    return !inst.adapter_debts.empty();
-}
-
-[[maybe_unused]] static void clear_adapter_debts(server_instance & inst) {
-    inst.adapter_debts.clear();
-}
-
 // RAII exclusive access for destroy/resize: set removing = true, wait for in-flight
 // dispatches to drain, then restore the flag on scope exit.
 struct instance_drain_guard {
@@ -137,6 +128,15 @@ struct active_route_guard {
 
 bool server_instances::load(const common_params & params) {
     this->params = params;
+
+    // each instance inherits the base sleep value into its own scheduler loop
+    // with no manager visibility (no sleeping state, no countdown), so refuse
+    // the combination instead of sleeping silently. idle reclamation is
+    // imperative DELETE /instances/:name.
+    if (!params.instances.empty() && params.sleep_idle_seconds >= 0) {
+        IST_ERR("%s", "instances do not support --sleep-idle-seconds (would sleep per-instance with no manager visibility); run with sleep disabled\n");
+        return false;
+    }
 
     // the pool identity is the first alias (or the model name or the file basename)
     if (!params.model_alias.empty()) {
@@ -1069,15 +1069,16 @@ static void list_snapshot_key_dir(const std::string & dir,
     }
 }
 
+// null-safe string field read for ordering (common_json::value() throws
+// on a null, and legacy snapshot entries are explicitly tagged null).
+static std::string snapshot_str_field(const json & e, const std::string & key) {
+    if (!e.is_object() || !e.contains(key) || !e.at(key).is_string()) {
+        return "";
+    }
+    return e.at(key).get<std::string>();
+}
+
 json server_instances::pool_snapshots_json() const {
-    // null-safe string field read for ordering (common_json::value() throws
-    // on a null, and legacy entries are explicitly tagged null)
-    const auto str_field = [](const json & e, const std::string & key) -> std::string {
-        if (!e.is_object() || !e.contains(key) || !e.at(key).is_string()) {
-            return "";
-        }
-        return e.at(key).get<std::string>();
-    };
     std::vector<json> entries;
     if (!params.slot_save_path.empty()) {
         const std::string model_key     = server_snapshot_model_key(base_name);
@@ -1096,10 +1097,10 @@ json server_instances::pool_snapshots_json() const {
         list_snapshot_key_dir(dir, true, push, seen_scoped);
     }
     // deterministic envelope: order by (instance, name), legacy (null) first
-    std::sort(entries.begin(), entries.end(), [&str_field](const json & a, const json & b) {
-        const std::string ai = str_field(a, "instance");
-        const std::string bi = str_field(b, "instance");
-        return ai != bi ? ai < bi : str_field(a, "name") < str_field(b, "name");
+    std::sort(entries.begin(), entries.end(), [](const json & a, const json & b) {
+        const std::string ai = snapshot_str_field(a, "instance");
+        const std::string bi = snapshot_str_field(b, "instance");
+        return ai != bi ? ai < bi : snapshot_str_field(a, "name") < snapshot_str_field(b, "name");
     });
     json snapshots = json::array();
     for (auto & e : entries) {
@@ -1138,13 +1139,7 @@ json server_instances::instance_snapshots_json(const std::string & instance) con
         }
     }
     std::stable_sort(entries.begin(), entries.end(), [](const json & a, const json & b) {
-        const auto str_field = [](const json & e) -> std::string {
-            if (!e.is_object() || !e.contains("name") || !e.at("name").is_string()) {
-                return "";
-            }
-            return e.at("name").get<std::string>();
-        };
-        return str_field(a) < str_field(b);
+        return snapshot_str_field(a, "name") < snapshot_str_field(b, "name");
     });
     json snapshots = json::array();
     for (auto & e : entries) {
@@ -1328,6 +1323,12 @@ bool server_instances::build_context_default(server_instance & inst) {
 bool server_instances::build_context_into(server_instance & inst) {
     inst.effective = common_instance_params(params, inst.cfg);
     inst.adapter_failed = false;
+
+    // instances never sleep: the pool has no residency state machine and
+    // reports no sleeping state, so an inherited idle timeout would park a
+    // scheduler with zero manager visibility. load() already refuses the
+    // combination at startup; strip it here too for runtime-created windows.
+    inst.effective.sleep_idle_seconds = -1;
 
     if (inst.effective.n_parallel < 1) {
         IST_WRN("instance '%s' has no valid n_parallel, defaulting to 1\n", inst.cfg.name.c_str());
@@ -1571,19 +1572,6 @@ server_http_res_ptr server_instances::destroy_instance(const std::string & name,
 
     if (!inst) {
         return make_error(format_error_response("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND));
-    }
-
-    // the debt outlives the window: a later reuse of this name must never
-    // resurrect it. recorded after the running=false flip above, while the
-    // window's refs are still observable.
-    {
-        size_t refs = 0;
-        for (const auto & la : inst->effective.lora_adapters) {
-            refs += (la.ptr != nullptr);
-        }
-        inst->adapter_debts.push_back(instance_id(*inst) + " destroy t=" + std::to_string(ggml_time_ms()) +
-                                      " use=" + std::to_string(inst.use_count()) +
-                                      " refs=" + std::to_string(refs));
     }
 
     // an unbuilt window never started a scheduler and owns no context: nothing to
@@ -2125,16 +2113,7 @@ server_http_res_ptr server_instances::handle_post_instance_adapters(const server
     // the drain below cannot deadlock (resize precedent, same lock order)
     std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
 
-    std::shared_ptr<server_instance> inst;
-    {
-        std::lock_guard<std::mutex> lock(mutex_dispatch);
-        for (const auto & it : instances) {
-            if (it->cfg.name == req.get_param("name")) {
-                inst = it;
-                break;
-            }
-        }
-    }
+    auto inst = get_instance(req.get_param("name"));
     if (!inst) {
         return make_error("instance not found: '" + req.get_param("name") + "'", ERROR_TYPE_NOT_FOUND);
     }
@@ -2257,16 +2236,7 @@ server_http_res_ptr server_instances::handle_delete_instance_adapters(const serv
 
     std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
 
-    std::shared_ptr<server_instance> inst;
-    {
-        std::lock_guard<std::mutex> lock(mutex_dispatch);
-        for (const auto & it : instances) {
-            if (it->cfg.name == req.get_param("name")) {
-                inst = it;
-                break;
-            }
-        }
-    }
+    auto inst = get_instance(req.get_param("name"));
     if (!inst) {
         return make_error("instance not found: '" + req.get_param("name") + "'", ERROR_TYPE_NOT_FOUND);
     }
@@ -2372,16 +2342,7 @@ server_http_res_ptr server_instances::handle_get_instance_adapters(const server_
     // reader side of the locking invariant: the effective list mutates under mutex_mgmt
     std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
 
-    std::shared_ptr<server_instance> inst;
-    {
-        std::lock_guard<std::mutex> lock(mutex_dispatch);
-        for (const auto & it : instances) {
-            if (it->cfg.name == req.get_param("name")) {
-                inst = it;
-                break;
-            }
-        }
-    }
+    auto inst = get_instance(req.get_param("name"));
     if (!inst) {
         return make_error("instance not found: '" + req.get_param("name") + "'", ERROR_TYPE_NOT_FOUND);
     }

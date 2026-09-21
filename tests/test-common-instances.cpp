@@ -1145,91 +1145,6 @@ static void test_pool_adapter_resize_borrowed(const common_params & base) {
     fs::remove_all(dir, ec);
 }
 
-// debt_ledger is a plain container: add/size round-trip, fields readable.
-static void test_debt_ledger_visible() {
-    debt_ledger ledger;
-    assert(ledger.size() == 0);
-    ledger.add("pool:a", "destroy", 123);
-    ledger.add("pool:b", "resize", 456);
-    assert(ledger.size() == 2);
-    assert(ledger.entries[0].instance == "pool:a");
-    assert(ledger.entries[0].task == "destroy");
-    assert(ledger.entries[0].t_ms == 123);
-    assert(ledger.entries[1].instance == "pool:b");
-    assert(ledger.entries[1].task == "resize");
-    assert(ledger.entries[1].t_ms == 456);
-}
-
-// destroy carries its debt: an unbuilt registered instance destroyed under a
-// deny factory (any build would fail) still records who held what.
-static void test_destroy_carries_debt(const common_params & base) {
-    common_params params = base;
-    params.n_ctx      = 256;
-    params.n_parallel = 1;
-    params.warmup     = false;
-
-    common_instance cfga;
-    cfga.name     = "a";
-    cfga.group    = "a";
-    cfga.ctx_size = 256;
-    cfga.parallel = 1;
-    params.instances.push_back(cfga);
-
-    server_instances mgr;
-    mgr.set_context_builder([](server_instance &) { return false; });
-    assert(mgr.load(params));
-
-    auto inst = test_find(mgr, "a");
-    assert(inst && !inst->built);
-
-    auto res = mgr.handle_delete_instance(test_req({ { "name", "a" } }, "/instances/a", ""));
-    assert(res->status == 200);
-    assert(inst->adapter_debts.size() == 1);
-    const std::string & debt = inst->adapter_debts[0];
-    assert(debt.find("a") != std::string::npos);
-    assert(debt.find("destroy") != std::string::npos);
-    assert(debt.find("use=") != std::string::npos);
-    assert(debt.find("refs=") != std::string::npos);
-
-    mgr.terminate();
-}
-
-// successful resizes record no debt.
-static void test_resize_no_debt(const common_params & base) {
-    common_params params = base;
-    params.n_ctx      = 256;
-    params.n_parallel = 1;
-    params.warmup     = false;
-
-    common_instance cfga;
-    cfga.name        = "a";
-    cfga.group       = "a";
-    cfga.ctx_size    = 256;
-    cfga.parallel    = 1;
-    cfga.is_default  = true;
-    params.instances.push_back(cfga);
-
-    server_instances mgr;
-    assert(mgr.load(params));
-
-    static const std::function<bool()> no_stop = []() { return false; };
-    server_http_req props_req { {}, {}, "/props", "", "", {}, no_stop };
-    assert(mgr.handle_get_props(props_req)->status == 200);
-
-    auto resize = [&](int32_t n_ctx) {
-        return mgr.handle_post_instance_resize(test_req({ { "name", "a" } },
-            "/instances/a/resize", safe_json_to_str({ { "ctx_size", n_ctx } })));
-    };
-    assert(resize(512)->status == 200);
-    assert(resize(256)->status == 200);
-
-    auto inst = test_find(mgr, "a");
-    assert(inst && inst->built);
-    assert(inst->adapter_debts.empty());
-
-    mgr.terminate();
-}
-
 // byte identities with an attached adapter: total adds every leg including
 // adapters, vram stays context+compute, and the envelope totals agree.
 static void test_adapter_bytes_identities(const common_params & base) {
@@ -1717,7 +1632,6 @@ int main(int argc, char ** argv) {
     test_instances_lora_compat();
     test_instances_lora_round_trip();
     test_instances_lora_validate();
-    test_debt_ledger_visible();
     test_instances_parse_errors();
     test_instances_parse_valid_names();
     test_instance_params();
@@ -1763,8 +1677,6 @@ int main(int argc, char ** argv) {
     test_pool_adapter_detach_reattach(params);
     test_pool_adapter_concurrent_detach_snapshot(params);
     test_pool_adapter_resize_borrowed(params);
-    test_destroy_carries_debt(params);
-    test_resize_no_debt(params);
     test_adapter_bytes_identities(params);
     test_adapter_bytes_unbuilt_zero(params);
     test_adapter_bytes_pool_shared(params);
