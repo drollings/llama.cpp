@@ -11,10 +11,12 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
 #include <chrono>
+#include <cstdlib>
 #include <cstdarg>
 #include <cstring>
 #include <ctime>
@@ -498,6 +500,50 @@ void common_instance_validate(const common_instance & inst) {
     }
 }
 
+// full-consume integer parse for instance options: std::stoi accepts trailing
+// garbage ("8192xyz" parses as 8192), so numerics use this instead. every
+// failure (empty, non-numeric, trailing characters, overflow) maps to
+// std::invalid_argument naming the option. sign handling stays downstream:
+// "-5" parses here, then the non-negative check rejects it, as before.
+static int32_t parse_strict_i32(const std::string & val, const std::string & what, const std::string & part) {
+    const std::string v = string_strip(val);
+    if (v.empty()) {
+        throw std::invalid_argument(string_format("invalid %s value '' (in '%s')", what.c_str(), part.c_str()));
+    }
+    char * end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(v.c_str(), &end, 10);
+    if (end == nullptr || *end != '\0' || errno == ERANGE || parsed > INT32_MAX || parsed < INT32_MIN) {
+        throw std::invalid_argument(string_format("invalid %s value '%s' (in '%s')", what.c_str(), val.c_str(), part.c_str()));
+    }
+    return (int32_t) parsed;
+}
+
+void common_instances_validate_all(const std::vector<common_instance> & instances) {
+    // duplicate names and group/name collisions over the full list; each
+    // direction names its own colliding pair
+    for (size_t i = 0; i < instances.size(); ++i) {
+        for (size_t j = i + 1; j < instances.size(); ++j) {
+            if (instances[i].name == instances[j].name) {
+                throw std::invalid_argument(string_format("duplicate instance name '%s'", instances[i].name.c_str()));
+            }
+            if (instances[i].group == instances[j].name) {
+                throw std::invalid_argument(string_format("instance group '%s' collides with instance name '%s'",
+                    instances[i].group.c_str(), instances[j].name.c_str()));
+            }
+            if (instances[j].group == instances[i].name) {
+                throw std::invalid_argument(string_format("instance group '%s' collides with instance name '%s'",
+                    instances[j].group.c_str(), instances[i].name.c_str()));
+            }
+        }
+    }
+
+    // the name/group character class (shared with the runtime API)
+    for (const auto & inst : instances) {
+        common_instance_validate(inst);
+    }
+}
+
 std::vector<common_instance> common_instances_parse(const std::string & spec) {
     std::vector<common_instance> instances;
 
@@ -522,21 +568,24 @@ std::vector<common_instance> common_instances_parse(const std::string & spec) {
             }
 
             const auto eq = comp.find('=');
-            const std::string key = eq == std::string::npos ? comp : comp.substr(0, eq);
+            // whitespace around '=' is leniency: the key matches stripped, so
+            // 'group =G' addresses the group instead of dying as unknown
+            const std::string key = eq == std::string::npos ? comp : string_strip(comp.substr(0, eq));
             const std::string val = eq == std::string::npos ? "" : comp.substr(eq + 1);
 
             if (key == "group") {
-                if (val.empty()) {
+                const std::string group = string_strip(val);
+                if (group.empty()) {
                     throw std::invalid_argument("group value cannot be empty");
                 }
-                inst.group = val;
+                inst.group = group;
             } else if (key == "ctx") {
-                inst.ctx_size = std::stoi(val);
+                inst.ctx_size = parse_strict_i32(val, "ctx", part);
                 if (inst.ctx_size < 0) {
                     throw std::invalid_argument("ctx must be non-negative");
                 }
             } else if (key == "parallel") {
-                inst.parallel = std::stoi(val);
+                inst.parallel = parse_strict_i32(val, "parallel", part);
                 if (inst.parallel < 0) {
                     throw std::invalid_argument("parallel must be non-negative");
                 }
@@ -569,6 +618,11 @@ std::vector<common_instance> common_instances_parse(const std::string & spec) {
                         }
                         scale = parsed;
                         ++i; // consume the scale component
+                    } else if (end != nullptr && *end == '\0') {
+                        // fully parsed but non-finite (nan/inf): a scale was
+                        // attempted, so name the scale instead of falling
+                        // through to 'unknown option'
+                        throw std::invalid_argument(string_format("invalid lora scale '%s' (in '%s')", next.c_str(), part.c_str()));
                     }
                 }
                 for (const auto & prev : inst.lora) {
@@ -589,23 +643,7 @@ std::vector<common_instance> common_instances_parse(const std::string & spec) {
         instances.push_back(std::move(inst));
     }
 
-    // validate: duplicate names and group/name collisions
-    for (size_t i = 0; i < instances.size(); ++i) {
-        for (size_t j = i + 1; j < instances.size(); ++j) {
-            if (instances[i].name == instances[j].name) {
-                throw std::invalid_argument(string_format("duplicate instance name '%s'", instances[i].name.c_str()));
-            }
-            if (instances[i].group == instances[j].name || instances[j].group == instances[i].name) {
-                throw std::invalid_argument(string_format("instance group '%s' collides with instance name '%s'",
-                    instances[i].group.c_str(), instances[j].name.c_str()));
-            }
-        }
-    }
-
-    // validate the name/group character class (shared with the runtime API)
-    for (const auto & inst : instances) {
-        common_instance_validate(inst);
-    }
+    common_instances_validate_all(instances);
 
     return instances;
 }
@@ -631,11 +669,16 @@ std::string common_instances_to_string(const std::vector<common_instance> & inst
             s += ":default";
         }
         // the adapter list in grammar form: paths print verbatim (they never
-        // contain ':' or ','), the scale only when it differs from the default
+        // contain ':' or ','), the scale only when it differs from the default.
+        // scales print with %.9g (exact float round trip), matching the
+        // raw-bits fingerprint input.
         for (const auto & la : inst.lora) {
             s += ":lora=" + la.first;
             if (la.second != 1.0f) {
-                s += ":" + std::to_string(la.second);
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%.9g", (double) la.second);
+                s += ":";
+                s += buf;
             }
         }
 

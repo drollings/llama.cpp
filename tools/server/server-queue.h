@@ -15,6 +15,7 @@
 #include <unordered_set>
 
 #define RES_DBG(fmt, ...) LOG_DBG("res  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+#define RES_WRN(fmt, ...) LOG_WRN("res  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 
 // struct for managing server tasks
 // in most cases, use server_response_reader to post new tasks and retrieve results
@@ -222,6 +223,20 @@ public:
     }
 
     // This function blocks the thread until there is a response for one of the id_tasks
+    // locked scan-and-take shared by recv() and recv_with_timeout(): removes
+    // and returns the first queued result for one of the tasks, or nullptr
+    // when none is queued. caller holds mutex_results.
+    T take_locked(const std::unordered_set<int> & id_tasks) {
+        for (size_t i = 0; i < queue_results.size(); i++) {
+            if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
+                T res = std::move(queue_results[i]);
+                queue_results.erase(queue_results.begin() + i);
+                return res;
+            }
+        }
+        return nullptr;
+    }
+
     T recv(const std::unordered_set<int> & id_tasks) {
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_results);
@@ -233,12 +248,8 @@ public:
                 return !queue_results.empty();
             });
 
-            for (size_t i = 0; i < queue_results.size(); i++) {
-                if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
-                    T res = std::move(queue_results[i]);
-                    queue_results.erase(queue_results.begin() + i);
-                    return res;
-                }
+            if (T res = take_locked(id_tasks)) {
+                return res;
             }
         }
 
@@ -251,12 +262,8 @@ public:
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_results);
 
-            for (int i = 0; i < (int) queue_results.size(); i++) {
-                if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
-                    T res = std::move(queue_results[i]);
-                    queue_results.erase(queue_results.begin() + i);
-                    return res;
-                }
+            if (T res = take_locked(id_tasks)) {
+                return res;
             }
 
             std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
@@ -278,7 +285,9 @@ public:
         return recv(id_tasks);
     }
 
-    // Send a new result to a waiting id_task
+    // Send a new result to a waiting id_task. a result with no waiter means
+    // the waiter went away (a lost add_waiting_task_id or a timed-out reader):
+    // loud on purpose, so a dropped response can never vanish silently.
     void send(T && result) {
         RES_DBG("sending result for task id = %d\n", result->id);
 
@@ -292,6 +301,7 @@ public:
                 return;
             }
         }
+        RES_WRN("no waiter for task id = %d, result dropped\n", result->id);
     }
 
     // broadcast a new result to all waiting tasks

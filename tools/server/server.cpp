@@ -617,7 +617,16 @@ int llama_server(common_params & params, int argc, char ** argv) {
         std::thread monitor_thread;
         if (child.is_child()) {
             monitor_thread = child.setup(shutdown_handler);
-            child.notify_to_router(server_state_to_str(SERVER_STATE_READY), routes.get_model_info());
+            if (use_instances) {
+                // the pool has no legacy context to describe (per-instance
+                // detail lives behind this child's own /instances, which the
+                // aggregate reads live). READY therefore carries no model
+                // snapshot; the router accepts an empty payload and still
+                // marks the child loaded.
+                child.notify_to_router(server_state_to_str(SERVER_STATE_READY), json());
+            } else {
+                child.notify_to_router(server_state_to_str(SERVER_STATE_READY), routes.get_model_info());
+            }
         }
 
         if (use_instances) {

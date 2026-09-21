@@ -289,6 +289,56 @@ struct server_instances {
     // joining.
     void teardown_instance_context(server_instance & inst);
 
+    // reload the shared weights when the pool went cold (last instance
+    // destroyed); no-op when already loaded. shared by demand-build and
+    // create so the two can never drift. caller holds mutex_mgmt, never
+    // mutex_dispatch. nullptr = weights ready, error result otherwise.
+    server_http_res_ptr cold_reload_locked();
+
+    // drop a freshly built but un-installable context (teardown race lost, or
+    // shutdown mid-create): stops nothing (no scheduler was started), frees
+    // what the build allocated and restores the declared adapter set for a
+    // later retry. caller holds mutex_dispatch.
+    void drop_built_context_locked(server_instance & inst);
+
+    // ref effects of one adapter-set mutation: entries the swap newly ensured
+    // (dropped if the scheduler apply fails) vs entries the swap removed
+    // (freed after the apply succeeds). attach fills acquired, detach fills
+    // released; the swap core owns the pairing.
+    struct adapter_set_delta {
+        std::vector<common_adapter_lora_info> acquired;
+        std::vector<common_adapter_lora_info> released;
+    };
+    // one mutation of both adapter lists together (grammar form + scheduler
+    // form, kept in sync). returns nullptr to proceed, error result to decline.
+    using adapter_set_mutator = std::function<server_http_res_ptr(
+        std::vector<std::pair<std::string, float>> & cfg_lora,
+        std::vector<common_adapter_lora_info> &     effective,
+        adapter_set_delta &                         delta)>;
+    // drain, apply one adapter-set mutation to both lists, push it to the
+    // scheduler with the compose deadline, verify and unbind bindings.
+    // shared by attach and detach so the two can never drift; the mutators
+    // stay thin validators over their own list edits. caller holds
+    // mutex_mgmt. nullptr = swapped, applied, verified and unbound (the
+    // caller shapes its own success response), error result otherwise.
+    server_http_res_ptr swap_adapter_set(const std::shared_ptr<server_instance> & inst,
+                                         const adapter_set_mutator &               mutate);
+
+    // deadline-bounded copy of one slot's live KV, stamped with the adapter set
+    // the KV was computed under. shared by switch-away save-back and explicit
+    // save so the copy mechanics can never drift. ok = data holds the copy;
+    // otherwise error holds the result for direct return (worded for the
+    // caller's operation via timeout_msg).
+    struct kv_copy_out {
+        bool                    ok = false;
+        server_http_res_ptr     error;
+        server_snapshot_data    data;
+    };
+    kv_copy_out kv_copy_to_data(server_instance &   inst,
+                                int                 id_slot,
+                                int64_t             deadline_ms,
+                                const std::string & timeout_msg);
+
     resolve_target        resolve_instance_or_group(const std::string & target, std::string & error) const;
     std::optional<size_t> pick_best_available(const std::string & group) const;
     // materialize one registered instance on first demand: reloads the shared weights
@@ -347,6 +397,12 @@ struct server_instances {
     // attempted. scale is per-instance (lives in the instance's effective list),
     // never in the registry.
     static std::string adapter_key(const std::string & path);
+    // fallible key computation for request-controlled paths: nullopt when the
+    // path is not a loadable key (embedded NUL, which no platform accepts in
+    // a filename, or a filesystem error from absolute()). callers map nullopt
+    // to 400 without touching the registry. stored entries always passed this
+    // check once, so internal re-derivations keep using adapter_key.
+    static std::optional<std::string> try_adapter_key(const std::string & path);
     // load-or-bump: returns the pool-owned ptr, or nullptr when the file fails to
     // load (the llama error is already logged). the caller owns one ref per
     // instance entry and must pair it with release_adapter.

@@ -788,10 +788,22 @@ common_params common_instance_params(const common_params & base, const common_in
 // (restricted to [A-Za-z0-9._-]). Throws std::invalid_argument.
 void common_instance_validate(const common_instance & inst);
 
-// parse the instance grammar: "name[:group=G][:ctx=N][:parallel=M][:pinned][:default]"
-// comma-separated list accepted; rejects duplicate names and name/group collisions.
+// canonical instance grammar, single source for help texts and comments:
+// name[:group=G][:ctx=N][:parallel=M][:pinned][:default][:lora=PATH[:SCALE]...]
+// comma-separated lists accepted; duplicate names and name/group collisions rejected.
+constexpr const char * COMMON_INSTANCES_GRAMMAR =
+    "name[:group=G][:ctx=N][:parallel=M][:pinned][:default][:lora=PATH[:SCALE]...]";
+
+// parse the instance grammar (see COMMON_INSTANCES_GRAMMAR above).
 // Throws std::invalid_argument on bad input.
 std::vector<common_instance> common_instances_parse(const std::string & spec);
+
+// validate a whole instance list (e.g. accumulated across repeated flags):
+// duplicate names and name/group collisions over the full list, plus the
+// name/group character class per entry. common_instances_parse applies it to
+// each spec; callers that accumulate lists by other means apply it to the
+// final list. Throws std::invalid_argument.
+void common_instances_validate_all(const std::vector<common_instance> & instances);
 
 // canonical serialization of instances (used for logging and the round-trip test)
 std::string common_instances_to_string(const std::vector<common_instance> & instances);

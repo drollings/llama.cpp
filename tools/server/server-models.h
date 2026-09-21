@@ -114,6 +114,18 @@ struct server_model_meta {
     void update_caps();
 };
 
+// bounded fan-out collector for GET /instances aggregation (implemented in
+// server-models.cpp). runs fetch over targets with a capped number of
+// concurrent workers and collects results up to deadline_ms; a late task
+// skips exactly like an unreachable child (never fatal to the aggregate).
+// results sort by model name so parallel completion order never leaks into
+// the output. a fetch returning nullopt (or throwing) skips that child.
+using instances_fetch_fn = std::function<std::optional<std::pair<std::string, json>>(const server_model_meta &)>;
+std::vector<std::pair<std::string, json>> instances_fanout_collect(
+    const std::vector<server_model_meta> & targets,
+    const instances_fetch_fn &             fetch,
+    int64_t                                deadline_ms);
+
 struct server_models_routes;
 struct server_lru_sched; // defined in server-models.cpp
 struct server_monitor;   // defined in server-models.cpp

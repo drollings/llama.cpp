@@ -123,3 +123,83 @@ def test_aggregate_two_live_plus_mock(mock_child):
             srv_b.stop()
     finally:
         srv_a.stop()
+
+
+AGG_PRESET = """\
+[agg-a]
+hf-repo = ggml-org/test-model-stories260K:F32
+instance = w:ctx=512
+
+[agg-b]
+hf-repo = ggml-org/test-model-stories260K-infill:F32
+instance = w:ctx=512
+"""
+
+
+def _router_with_two_children():
+    import os
+    import tempfile
+    preset_path = os.path.join(tempfile.mkdtemp(), "agg.ini")
+    with open(preset_path, "w") as f:
+        f.write(AGG_PRESET)
+    srv = ServerPreset.router()
+    srv.server_port = _free_port()
+    srv.models_preset = preset_path
+    srv.models_max = 3
+    srv.start()
+    for model in ("agg-a", "agg-b"):
+        res = srv.make_request("POST", "/models/load", data={"model": model}, timeout=180)
+        assert res.status_code == 200, res.body
+    return srv
+
+
+def _wait_for_model(srv, model, timeout=180):
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        res = srv.make_request("GET", "/models")
+        for item in res.body.get("data", []):
+            status = item.get("status", {})
+            value = status.get("value") if isinstance(status, dict) else status
+            if item.get("id") == model and value == "loaded":
+                return
+        time.sleep(2)
+    raise AssertionError(f"model {model} never loaded")
+
+
+def test_router_aggregate_two_children():
+    srv = _router_with_two_children()
+    try:
+        _wait_for_model(srv, "agg-a")
+        _wait_for_model(srv, "agg-b")
+
+        first = srv.make_request("GET", "/instances").body
+        # stable across runs: parallel completion order must not leak out
+        for _ in range(2):
+            assert srv.make_request("GET", "/instances").body == first
+
+        ids = {inst["id"] for inst in first["instances"]}
+        assert any(i.startswith("agg-a:") for i in ids)
+        assert any(i.startswith("agg-b:") for i in ids)
+
+        total = first["total"]
+        assert total["total"] == total["model"] + total["context"] + total["compute"] + total["adapter"]
+    finally:
+        srv.stop()
+
+
+def test_router_aggregate_unloaded_child_skipped():
+    srv = _router_with_two_children()
+    try:
+        _wait_for_model(srv, "agg-a")
+        _wait_for_model(srv, "agg-b")
+
+        res = srv.make_request("POST", "/models/unload", data={"model": "agg-b"})
+        assert res.status_code == 200
+
+        env = srv.make_request("GET", "/instances").body
+        ids = {inst["id"] for inst in env["instances"]}
+        assert any(i.startswith("agg-a:") for i in ids)
+        assert not any(i.startswith("agg-b:") for i in ids)
+    finally:
+        srv.stop()

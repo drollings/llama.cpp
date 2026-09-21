@@ -2113,6 +2113,17 @@ private:
         send_error(task.id, error, type);
     }
 
+    // single construction site for apply-lora results: every SET_LORA and
+    // SET_ADAPTERS outcome answers the same success shape, only the task id
+    // varies. the two writers keep their distinct install semantics (legacy
+    // SET_LORA installs as-is for the historical endpoint; SET_ADAPTERS skips
+    // identical sets and invalidates slot KV), so only the result is shared.
+    void send_apply_lora_result(int id_task) {
+        auto res = std::make_unique<server_task_result_apply_lora>();
+        res->id = id_task;
+        queue_results.send(std::move(res));
+    }
+
     void send_error(const server_slot & slot, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
         send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx);
     }
@@ -2821,9 +2832,7 @@ private:
                     }
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
                     params_base.lora_adapters = new_loras;
-                    auto res = std::make_unique<server_task_result_apply_lora>();
-                    res->id = task.id;
-                    queue_results.send(std::move(res));
+                    send_apply_lora_result(task.id);
                 } break;
             case SERVER_TASK_TYPE_SET_ADAPTERS:
                 {
@@ -2834,9 +2843,7 @@ private:
                     // freed adapter whose address is reused by another file would
                     // wrongly skip the invalidation below.
                     if (are_lora_sets_identical(params_base.lora_adapters, task.set_adapters)) {
-                        auto res = std::make_unique<server_task_result_apply_lora>();
-                        res->id = task.id;
-                        queue_results.send(std::move(res));
+                        send_apply_lora_result(task.id);
                         break;
                     }
                     // the adapter change invalidates every slot's live KV ...
@@ -2845,9 +2852,7 @@ private:
                         slot.prompt.clear();
                     }
                     params_base.lora_adapters = task.set_adapters;
-                    auto res = std::make_unique<server_task_result_apply_lora>();
-                    res->id = task.id;
-                    queue_results.send(std::move(res));
+                    send_apply_lora_result(task.id);
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE_COPY:
                 {
@@ -4562,18 +4567,20 @@ std::optional<std::vector<common_adapter_lora_info>> server_context::get_lora_ad
     return out;
 }
 
-server_task_result_ptr server_context::instance_op(const std::function<json()> & op) {
+server_task_result_ptr server_context::instance_op(const std::function<json()> & op, int64_t deadline_ms) {
     server_task task(SERVER_TASK_TYPE_INSTANCE_OP);
     task.instance_op = op;
 
-    return run_scheduler_task(std::move(task), [] { return false; });
+    return run_scheduler_task(std::move(task), [deadline_ms]() {
+        return deadline_ms >= 0 && ggml_time_ms() >= deadline_ms;
+    });
 }
 
-server_task_result_ptr server_context::abort_slots(const std::string & reason) {
+server_task_result_ptr server_context::abort_slots(const std::string & reason, int64_t deadline_ms) {
     return instance_op([this, reason]() {
         impl->abort_all_slots(reason);
         return json{{ "success", true }};
-    });
+    }, deadline_ms);
 }
 
 int server_context::get_slot_n_ctx() const {

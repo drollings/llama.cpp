@@ -15,6 +15,7 @@
 
 #include <functional>
 #include <optional>
+#include <future>
 #include <algorithm>
 #include <thread>
 #include <mutex>
@@ -426,6 +427,11 @@ static constexpr int STREAM_LOOKUP_TIMEOUT_MS = 250;
 
 // per-child GET /instances fan-out budget for the router aggregate below
 static constexpr int INSTANCES_AGG_TIMEOUT_MS = 5000;
+// global wall-clock budget for the whole aggregate (fetch all children and
+// merge): bounds how long slow children may tax the aggregate caller. this
+// measures caller latency, not child health: a skipped child is reported by
+// absence (as today), never scored, persisted, or cached.
+static constexpr int64_t INSTANCES_AGG_TOTAL_MS = 15000;
 
 static std::filesystem::path get_server_exec_path() {
 #if defined(_WIN32)
@@ -1616,6 +1622,87 @@ json server_models_merge_instances(const std::vector<std::pair<std::string, json
     };
 }
 
+// one child's envelope: nullopt when the child is unreachable, non-200, or
+// garbled (a child without instance grammar 404s, a dead child refuses).
+// never throws, never fatal to the aggregate.
+static std::optional<std::pair<std::string, json>> fetch_child_instances(const server_model_meta & meta) {
+    try {
+        httplib::Client cli(CHILD_ADDR, meta.port);
+        cli.set_connection_timeout(0, INSTANCES_AGG_TIMEOUT_MS * 1000);
+        cli.set_read_timeout(0, INSTANCES_AGG_TIMEOUT_MS * 1000);
+        cli.set_write_timeout(0, INSTANCES_AGG_TIMEOUT_MS * 1000);
+        auto resp = cli.Get("/instances");
+        if (!resp || resp->status != 200) {
+            return std::nullopt;
+        }
+        json envelope = json::parse(resp->body);
+        return std::make_pair(meta.name, std::move(envelope));
+    } catch (const std::exception &) {
+        return std::nullopt;
+    }
+}
+
+std::vector<std::pair<std::string, json>> instances_fanout_collect(
+        const std::vector<server_model_meta> & targets,
+        const instances_fetch_fn &             fetch,
+        int64_t                                deadline_ms) {
+    // bounded fan-out: at most FANOUT_MAX concurrent fetches (one async task
+    // per child would be a thundering herd under many children). each batch's
+    // futures are collected up to the shared deadline; a late child skips
+    // exactly like a dead one. the cap bounds caller latency, not child
+    // health: nothing about a skipped child is recorded.
+    static constexpr size_t FANOUT_MAX = 8;
+    std::vector<std::pair<std::string, json>> per_model;
+    for (size_t begin = 0; begin < targets.size(); begin += FANOUT_MAX) {
+        const size_t end = std::min(begin + FANOUT_MAX, targets.size());
+        std::vector<std::future<std::optional<std::pair<std::string, json>>>> futs;
+        for (size_t i = begin; i < end; ++i) {
+            futs.push_back(std::async(std::launch::async, fetch, targets[i]));
+        }
+        // collect up to the shared deadline. ready futures are taken without
+        // spending budget (collecting costs nothing); the deadline only bounds
+        // waiting, so a slow child can never starve ready siblings behind it
+        // in the batch order.
+        std::vector<bool> done(futs.size(), false);
+        size_t left = futs.size();
+        while (left > 0) {
+            if (deadline_ms - ggml_time_ms() <= 0) {
+                break;
+            }
+            bool progress = false;
+            for (size_t k = 0; k < futs.size(); ++k) {
+                if (done[k]) {
+                    continue;
+                }
+                if (futs[k].wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+                    continue;
+                }
+                done[k] = true;
+                --left;
+                progress = true;
+                try {
+                    if (auto got = futs[k].get()) {
+                        per_model.push_back(std::move(*got));
+                    }
+                } catch (const std::exception &) {
+                    continue;
+                }
+            }
+            if (left > 0 && !progress) {
+                const int64_t remain = deadline_ms - ggml_time_ms();
+                if (remain <= 0) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(std::min<int64_t>(remain, 10)));
+            }
+        }
+    }
+    // deterministic output regardless of completion order
+    std::sort(per_model.begin(), per_model.end(),
+              [](const auto & a, const auto & b) { return a.first < b.first; });
+    return per_model;
+}
+
 json server_models::get_instances_aggregate(const std::string & only) {
     // running children to query: just `only` when it names a live model, else
     // every running child. resolve under the models lock via copies only.
@@ -1634,25 +1721,8 @@ json server_models::get_instances_aggregate(const std::string & only) {
         }
     }
 
-    std::vector<std::pair<std::string, json>> per_model;
-    for (const auto & meta : targets) {
-        httplib::Client cli(CHILD_ADDR, meta.port);
-        cli.set_connection_timeout(0, INSTANCES_AGG_TIMEOUT_MS * 1000);
-        cli.set_read_timeout(0, INSTANCES_AGG_TIMEOUT_MS * 1000);
-        cli.set_write_timeout(0, INSTANCES_AGG_TIMEOUT_MS * 1000);
-        auto resp = cli.Get("/instances");
-        // a child without instance grammar 404s, a dead child refuses: both
-        // are skipped, never fatal to the aggregate
-        if (!resp || resp->status != 200) {
-            continue;
-        }
-        try {
-            json envelope = json::parse(resp->body);
-            per_model.emplace_back(meta.name, std::move(envelope));
-        } catch (const std::exception &) {
-            continue;
-        }
-    }
+    const int64_t deadline_ms = ggml_time_ms() + INSTANCES_AGG_TOTAL_MS;
+    auto per_model = instances_fanout_collect(targets, fetch_child_instances, deadline_ms);
     return server_models_merge_instances(per_model);
 }
 

@@ -1645,12 +1645,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CTX_SIZE"));
     add_opt(common_arg(
         {"--instance"}, "INSTANCE",
-        "define a named context instance sharing this model's weights, format: "
-        "name[:group=G][:ctx=N][:parallel=M][:pinned][:default] (repeatable, comma-separated values also accepted)",
+        std::string("define a named context instance sharing this model's weights, format: ") +
+            COMMON_INSTANCES_GRAMMAR + " (repeatable, comma-separated values also accepted)",
         [](common_params & params, const std::string & value) {
             for (auto & inst : common_instances_parse(value)) {
                 params.instances.push_back(std::move(inst));
             }
+            // repeated flags accumulate into one list: validate the whole
+            // list so cross-flag duplicates fail here, not later
+            common_instances_validate_all(params.instances);
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_INSTANCES"));
     add_opt(common_arg(

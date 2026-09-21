@@ -33,6 +33,10 @@ struct server_snapshot_data {
     // fingerprint of the adapter set active when the snapshot was written
     // ("" = none / pre-v2 file)
     std::string adapter_fp;
+    // on-disk version the data was read as (1 or 2). fresh data defaults to
+    // the current write version; the restore gate needs the distinction: a
+    // v1 empty fp is legacy, a v2 empty fp means "saved with zero adapters".
+    uint32_t version = 2;
 };
 
 // atomic: write <path>.tmp, then rename over <path>. returns false on I/O error
@@ -63,10 +67,14 @@ struct server_snapshot_meta {
     int64_t     mtime;    // unix seconds
     int32_t     n_ctx_seq;
     std::string adapter_fp; // "" for v1 files / unreadable headers
+    uint32_t    version = 0; // 1 or 2 from a readable header, 0 when unreadable
 };
 
-// list *.bin in dir, header-parsed n_ctx_seq + adapter_fp (read header only),
-// mtime in unix seconds. skips unreadable files (n_ctx_seq = 0 on an unreadable header).
+// list *.bin in dir: one row per file, header-parsed n_ctx_seq + adapter_fp +
+// version (read header only), mtime in unix seconds. a file whose header does
+// not parse still gets a row, with version 0 and zeroed fields, so one bad
+// file can never hide or end the good rows; only a file that vanishes
+// mid-listing (unstattable) is skipped.
 std::vector<server_snapshot_meta> server_snapshot_list(const std::string & dir);
 
 // pool identity to a filesystem-safe directory name: '/' and ':' become '_'.

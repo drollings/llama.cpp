@@ -111,3 +111,52 @@ def test_server_model_aliases_and_tags():
     assert set(model["tags"]) == {"chat", "fim", "small"}
     # id is derived from first alias (alphabetical order from std::set)
     assert model["id"] == "code"
+
+
+def test_server_slots_aggregate_skips_failed_member():
+    """A member whose slots endpoint fails must not fail the whole aggregate:
+    its rows are replaced by a per-instance error marker."""
+    global server
+    server.server_slots = False  # every built member's get_slots answers 501
+    server.instances = ["a:ctx=512", "b:ctx=512"]
+    server.n_ctx = 512
+    server.start()
+
+    for inst in ("a", "b"):
+        res = server.make_request("POST", "/completion", data={
+            "model": f"tinyllama-2:{inst}",
+            "prompt": "Hello",
+            "n_predict": 2,
+        })
+        assert res.status_code == 200
+
+    res = server.make_request("GET", "/slots")
+    assert res.status_code == 200
+    markers = res.body
+    assert len(markers) == 2
+    assert {m["instance"] for m in markers} == {"a", "b"}
+    assert all("error" in m for m in markers)
+    assert not any("id" in m for m in markers)
+
+
+def test_server_slots_aggregate_mixed_built_unbuilt():
+    """Control group: built members contribute tagged rows, unbuilt members
+    are silently skipped, no markers. Unchanged by skip-and-continue."""
+    global server
+    server.server_slots = True
+    server.n_slots = 1
+    server.instances = ["a:ctx=512", "b:ctx=512"]
+    server.n_ctx = 512
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "model": "tinyllama-2:a",
+        "prompt": "Hello",
+        "n_predict": 2,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("GET", "/slots")
+    assert res.status_code == 200
+    assert len(res.body) == 1
+    assert res.body[0]["instance"] == "a"

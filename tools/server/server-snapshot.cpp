@@ -120,6 +120,7 @@ server_snapshot_read_out server_snapshot_read_status(const std::string & path) {
     in.seekg((std::streamoff) header, std::ios::beg);
 
     server_snapshot_data data;
+    data.version    = version;
     data.n_ctx_seq  = n_ctx_seq;
     data.adapter_fp = std::move(adapter_fp);
     data.tokens.resize((size_t) n_tokens);
@@ -149,6 +150,14 @@ bool server_snapshot_write(const std::string & path, const server_snapshot_data 
         if (write_snapshot(out, data) == 0) {
             out.close();
             std::filesystem::remove(tmp_path);
+            return false;
+        }
+        // buffered flush failures surface at close: a short disk write must
+        // never rename a truncated .tmp over the target
+        out.close();
+        if (!out) {
+            std::error_code ec;
+            std::filesystem::remove(tmp_path, ec);
             return false;
         }
     }
@@ -225,28 +234,34 @@ std::vector<server_snapshot_meta> server_snapshot_list(const std::string & dir) 
 
     for (const auto & entry : std::filesystem::directory_iterator(dir, ec)) {
         if (ec) {
-            break;
+            break; // the iteration itself failed; entries collected so far stand
         }
-        if (!entry.is_regular_file(ec) || entry.path().extension() != ".bin") {
+        std::error_code fec;
+        if (!entry.is_regular_file(fec) || fec || entry.path().extension() != ".bin") {
             continue;
         }
         const std::string fname = entry.path().filename().string();
         const std::string name  = fname.substr(0, fname.size() - 4);  // strip ".bin"
 
-        // header-only read for n_ctx_seq + adapter_fp; an unreadable header
-        // reports n_ctx_seq = 0 and an empty fp
+        // header-only read for n_ctx_seq + adapter_fp + version; an unreadable
+        // header reports version 0 with zeroed fields (same bucket as the read
+        // path's CORRUPT, including negative n_tokens)
         int32_t     n_ctx_seq  = 0;
         std::string adapter_fp;
+        uint32_t    version    = 0;
         {
             std::ifstream in(entry.path(), std::ios::binary);
             uint32_t      magic = 0;
-            uint32_t      version = 0;
-            int32_t       n = 0;
+            uint32_t      v     = 0;
+            int32_t       n_tokens = 0;
             in.read((char *) &magic, 4);
-            in.read((char *) &version, 4);
+            in.read((char *) &v, 4);
             in.read((char *) &n_ctx_seq, 4);
-            in.read((char *) &n, 4);
-            bool ok = (bool) in && magic == SNAPSHOT_MAGIC && (version == 1 || version == 2);
+            in.read((char *) &n_tokens, 4);
+            bool ok = (bool) in && magic == SNAPSHOT_MAGIC && (v == 1 || v == 2) && n_tokens >= 0;
+            if (ok) {
+                version = v;
+            }
             if (ok && version == 2) {
                 // skip kv_size, then read the fp (offsets 16-24 + fp at 28)
                 uint64_t kv_size = 0;
@@ -261,17 +276,25 @@ std::vector<server_snapshot_meta> server_snapshot_list(const std::string & dir) 
                 }
             }
             if (!ok) {
+                version    = 0;
                 n_ctx_seq  = 0;
                 adapter_fp.clear();
             }
         }
 
+        // a file that vanished between iteration and stat carries no size: skip
+        // it rather than listing a row with a bogus size
+        const uint64_t fsize = entry.file_size(ec);
+        if (ec) {
+            continue;
+        }
         out.push_back({
             name,
-            entry.file_size(ec),
+            fsize,
             file_mtime_unix(entry.path()),
             n_ctx_seq,
             adapter_fp,
+            version,
         });
     }
     return out;

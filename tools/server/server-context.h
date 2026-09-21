@@ -161,12 +161,16 @@ struct server_context {
     // manager-only: run `op` on this instance's scheduler thread, serialized with all
     // other tasks (context lifetime is not thread-safe). `op` returns the JSON payload
     // and throws with a message to signal an error; the caller gets a
-    // server_task_result_instance (or an error result).
-    server_task_result_ptr instance_op(const std::function<json()> & op);
+    // server_task_result_instance (or an error result). deadline_ms bounds the
+    // wait (-1 waits forever, preserving the legacy callers); null on timeout.
+    server_task_result_ptr instance_op(const std::function<json()> & op, int64_t deadline_ms = -1);
 
     // manager-only: abort all in-flight slot tasks with an error result (used before
-    // destroy/resize so no HTTP reader is left hanging)
-    server_task_result_ptr abort_slots(const std::string & reason);
+    // destroy/resize so no HTTP reader is left hanging). same deadline contract
+    // as instance_op: teardown paths pass a compose budget so a stalled
+    // scheduler answers 503 with the instance intact instead of wedging the
+    // management plane (which is held across the call).
+    server_task_result_ptr abort_slots(const std::string & reason, int64_t deadline_ms = -1);
 
     // manager-only reporting (read-only, best-effort across scheduler thread)
     int get_slot_n_ctx() const;

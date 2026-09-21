@@ -113,8 +113,212 @@ static void test_instances_parse_errors() {
     expect_parse_error("foo:group=latest");      // reserved group
 }
 
-static void test_instances_parse_valid_names() {
-    // control group: previously valid names stay valid, including near-misses
+static void expect_parse_error_like(const std::string & spec, const std::string & needle) {
+    try {
+        common_instances_parse(spec);
+    } catch (const std::invalid_argument & e) {
+        if (std::string(e.what()).find(needle) == std::string::npos) {
+            fprintf(stderr, "error for '%s' did not mention '%s': %s\n", spec.c_str(), needle.c_str(), e.what());
+            assert(false);
+        }
+        return;
+    }
+    fprintf(stderr, "expected parse error for '%s'\n", spec.c_str());
+    assert(false);
+}
+
+// numeric options reject trailing garbage with a full-consume parse;
+// non-finite scales name the scale; whitespace around '=' stays leniency.
+static void test_instance_numerics_strict() {
+    // trailing garbage is rejected, not silently accepted
+    expect_parse_error("a:ctx=8192xyz");
+    expect_parse_error("a:parallel=2abc");
+    expect_parse_error("a:ctx=0x10");
+    expect_parse_error("a:ctx=12.5");
+    expect_parse_error("a:ctx=");
+    expect_parse_error("a:ctx=9999999999999999999999");
+    // control group: well-formed numerics keep parsing
+    const auto insts = common_instances_parse("a:ctx=8192:parallel=4");
+    assert(insts.size() == 1);
+    assert(insts[0].ctx_size == 8192);
+    assert(insts[0].parallel == 4);
+    // scale lookahead keeps working: 'pinned' is not a scale
+    const auto lora = common_instances_parse("a:lora=./x.gguf:pinned");
+    assert(lora.size() == 1);
+    assert(lora[0].lora.size() == 1);
+    assert(lora[0].lora[0].second == 1.0f);
+    assert(lora[0].pinned);
+    // non-finite scales name the scale, not the option
+    expect_parse_error_like("a:lora=./x.gguf:nan", "lora scale");
+    expect_parse_error_like("a:lora=./x.gguf:inf", "lora scale");
+    expect_parse_error_like("a:lora=./x.gguf:-inf", "lora scale");
+    // whitespace around '=' is leniency, never an unknown option
+    const auto spaced = common_instances_parse("name:group =G");
+    assert(spaced.size() == 1);
+    assert(spaced[0].group == "G");
+}
+
+// duplicate names and name/group collisions are validated over the whole
+// accumulated list, not just within one spec: repeated flags concatenate
+// parses, so the check must run on the merged result.
+static void test_instances_validate_all_cross_spec() {
+    // duplicate names spread across two specs throw
+    {
+        std::vector<common_instance> merged;
+        for (const auto & inst : common_instances_parse("a")) {
+            merged.push_back(inst);
+        }
+        for (const auto & inst : common_instances_parse("a")) {
+            merged.push_back(inst);
+        }
+        bool threw = false;
+        try {
+            common_instances_validate_all(merged);
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        assert(threw);
+    }
+    // a group in one spec colliding with a name in another throws
+    {
+        std::vector<common_instance> merged;
+        for (const auto & inst : common_instances_parse("x:group=y")) {
+            merged.push_back(inst);
+        }
+        for (const auto & inst : common_instances_parse("y")) {
+            merged.push_back(inst);
+        }
+        bool threw = false;
+        try {
+            common_instances_validate_all(merged);
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        assert(threw);
+    }
+    // control group: distinct names and groups validate clean
+    {
+        std::vector<common_instance> merged;
+        for (const auto & inst : common_instances_parse("a")) {
+            merged.push_back(inst);
+        }
+        for (const auto & inst : common_instances_parse("b:group=g")) {
+            merged.push_back(inst);
+        }
+        common_instances_validate_all(merged);
+        common_instances_validate_all({});
+    }
+}
+
+// the collision report names the actually-colliding pair in both orders:
+// {group=x} vs {name=y} and {name=x} vs {group=x} each name x twice.
+static void test_instances_collision_message_names_pair() {
+    {
+        std::vector<common_instance> merged;
+        for (const auto & inst : common_instances_parse("a:group=y")) {
+            merged.push_back(inst);
+        }
+        for (const auto & inst : common_instances_parse("y")) {
+            merged.push_back(inst);
+        }
+        try {
+            common_instances_validate_all(merged);
+            assert(false);
+        } catch (const std::invalid_argument & e) {
+            const std::string msg = e.what();
+            assert(msg.find("'y'") != std::string::npos);
+        }
+    }
+    {
+        std::vector<common_instance> merged;
+        for (const auto & inst : common_instances_parse("a:group=x")) {
+            merged.push_back(inst);
+        }
+        for (const auto & inst : common_instances_parse("b:group=a")) {
+            merged.push_back(inst);
+        }
+        try {
+            common_instances_validate_all(merged);
+            assert(false);
+        } catch (const std::invalid_argument & e) {
+            // the colliding pair is group 'a' vs name 'a'; 'x' and 'b' are
+            // bystanders that must not appear
+            const std::string msg = e.what();
+            assert(msg.find("'a'") != std::string::npos);
+            assert(msg.find("'x'") == std::string::npos);
+            assert(msg.find("'b'") == std::string::npos);
+        }
+    }
+}
+
+// adapter scales survive a grammar round trip bit-exactly: the text form
+// must carry full float precision, matching the raw-bits fingerprint input.
+static void test_instance_lora_scale_round_trip() {
+    for (const char * text : { "0.1", "0.5", "0.12345679", "0.001", "2" }) {
+        const auto insts = common_instances_parse(std::string("a:lora=./x.gguf:") + text);
+        assert(insts.size() == 1);
+        assert(insts[0].lora.size() == 1);
+        const float scale = insts[0].lora[0].second;
+        const auto back = common_instances_parse(common_instances_to_string(insts));
+        assert(back.size() == 1);
+        assert(back[0].lora.size() == 1);
+        assert(back[0].lora[0].second == scale);
+    }
+    // the default scale prints bare (no ':1' suffix) and re-parses to 1.0
+    const auto bare = common_instances_parse("a:lora=./x.gguf");
+    assert(common_instances_to_string(bare) == "a:lora=./x.gguf");
+}
+
+// the explicit instance field overrides any instance/group component of the
+// model id, including the absent component of a bare base id and the
+// reserved latest pin. the pool is hand-built (no weights) because name
+// resolution only reads identity config.
+static void test_resolve_honors_explicit_instance() {
+    server_instances mgr;
+    mgr.base_name = "tinyllama-2";
+    for (const char * name : { "a", "b", "c" }) {
+        auto inst = std::make_shared<server_instance>();
+        inst->cfg.name  = name;
+        inst->cfg.group = (std::string(name) == "c") ? "c" : "g";
+        if (std::string(name) == "b") {
+            inst->cfg.is_default = true;
+        }
+        mgr.instances.push_back(inst);
+    }
+    std::string error;
+    const auto inst_name = [&](const server_instances::resolve_target & t) {
+        assert(t.kind == server_instances::target_kind::INSTANCE);
+        assert(t.inst);
+        return t.inst->cfg.name;
+    };
+
+    // bare base plus an explicit instance resolves to that instance, not default
+    assert(inst_name(mgr.resolve("tinyllama-2", "a", error)) == "a");
+    // an explicit group routes by group policy
+    {
+        const auto t = mgr.resolve("tinyllama-2", "g", error);
+        assert(t.kind == server_instances::target_kind::GROUP);
+        assert(t.group == "g");
+    }
+    // latest plus an explicit instance resolves to that instance, not default
+    assert(inst_name(mgr.resolve("tinyllama-2:latest", "a", error)) == "a");
+    // control group: no override keeps the long-standing behavior
+    assert(inst_name(mgr.resolve("tinyllama-2", "", error)) == "b");
+    assert(inst_name(mgr.resolve("tinyllama-2:latest", "", error)) == "b");
+    assert(inst_name(mgr.resolve("tinyllama-2:a", "b", error)) == "b");
+    assert(inst_name(mgr.resolve("tinyllama-2:latest:b", "a", error)) == "a");
+    assert(inst_name(mgr.resolve("", "a", error)) == "a");
+    // unknown override still misses, on the generation-routing tier
+    assert(mgr.resolve("tinyllama-2", "nope", error).kind == server_instances::target_kind::NONE);
+    assert(!error.empty());
+    // a foreign pool name is rejected even when an override is present: the
+    // base guard runs before any override is considered
+    assert(mgr.resolve("other-pool", "a", error).kind == server_instances::target_kind::NONE);
+
+    mgr.terminate();
+}
+
+static void test_instances_parse_valid_names() {    // control group: previously valid names stay valid, including near-misses
     // of the reserved token (the reservation is the exact string "latest")
     for (const char * spec : {
             "a",
@@ -844,6 +1048,150 @@ static std::shared_ptr<server_instance> test_find(server_instances & mgr, const 
     return nullptr;
 }
 
+// teardown liveness: destroying an instance whose scheduler is wedged answers
+// 503 within the compose deadline instead of hanging, leaves the instance
+// intact, and releases the management plane so an unrelated op completes.
+static void test_destroy_bounded_on_wedged_scheduler(const common_params & base) {
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance victim;
+    victim.name        = "victim";
+    victim.group       = "victim";
+    victim.ctx_size    = 256;
+    victim.parallel    = 1;
+    victim.is_default  = true;
+    common_instance witness;
+    witness.name     = "w";
+    witness.group    = "w";
+    witness.ctx_size = 256;
+    witness.parallel = 1;
+    params.instances.push_back(victim);
+    params.instances.push_back(witness);
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req props_req { {}, {}, "/props", "", "", {}, no_stop };
+    assert(mgr.handle_get_props(props_req)->status == 200); // builds the default (victim)
+    server_context * ctx = test_find(mgr, "victim")->ctx_server.get();
+    assert(ctx != nullptr);
+
+    // wedge the victim scheduler with a blocking op
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+    std::thread blocker([&]() {
+        ctx->instance_op([&]() -> json {
+            entered.store(true);
+            while (!release.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return json{ { "success", true } };
+        });
+    });
+    while (!entered.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // the destroy must 503 within the compose deadline (1s floor at ctx 256),
+    // not hang; the witness pin queued behind it completes once the
+    // management plane is released
+    std::atomic<int>     destroy_status{0};
+    std::atomic<int64_t> destroy_ms{0};
+    std::thread destroyer([&]() {
+        const int64_t t0 = ggml_time_ms();
+        auto res = mgr.handle_delete_instance(test_req({ { "name", "victim" } }, "/instances/victim", ""));
+        destroy_ms.store(ggml_time_ms() - t0);
+        destroy_status.store(res->status);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200)); // let the destroy block in abort
+    const int64_t t1 = ggml_time_ms();
+    auto pin_res = mgr.handle_post_instance_pin(test_req({ { "name", "w" } }, "/instances/w/pin", ""));
+    const int64_t pin_ms = ggml_time_ms() - t1;
+    assert(pin_res->status == 200);
+    destroyer.join();
+
+    assert(destroy_status.load() == 503);
+    // bounded: about one deadline, far from forever
+    assert(destroy_ms.load() >= 500 && destroy_ms.load() < 8000);
+    // the pin waited out the bounded stall, then completed
+    assert(pin_ms < 8000);
+    fprintf(stdout, "wedged teardown: destroy status = %d in %lld ms, queued pin in %lld ms\n",
+        destroy_status.load(), (long long) destroy_ms.load(), (long long) pin_ms);
+    // the instance is intact: still registered, still built
+    assert(test_find(mgr, "victim") != nullptr);
+    assert(test_find(mgr, "victim")->built);
+
+    // unwedge: the same destroy now succeeds, proving nothing was torn down
+    release.store(true);
+    blocker.join();
+    assert(mgr.handle_delete_instance(test_req({ { "name", "victim" } }, "/instances/victim", ""))->status == 200);
+    assert(test_find(mgr, "victim") == nullptr);
+
+    mgr.terminate();
+}
+
+// calibration control group: on a healthy scheduler every management op
+// succeeds fast, so the bounded wait never fires. runs identically before
+// and after the deadline is introduced.
+static void test_management_healthy_control_fast(const common_params & base) {
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance solo;
+    solo.name       = "solo";
+    solo.group      = "solo";
+    solo.ctx_size   = 256;
+    solo.parallel   = 1;
+    solo.is_default = true;
+    params.instances.push_back(solo);
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req props_req { {}, {}, "/props", "", "", {}, no_stop };
+    assert(mgr.handle_get_props(props_req)->status == 200);
+
+    // create / pin / resize / destroy: all 200, each far below the compose
+    // deadline (1s floor), so a bounded wait can never mistake them for stuck
+    int64_t worst_ms = 0;
+    for (int i = 0; i < 3; ++i) {
+        const std::string name = "x" + std::to_string(i);
+        int64_t t0 = ggml_time_ms();
+        auto created = mgr.handle_post_instances(test_req({}, "/instances",
+            safe_json_to_str({ { "name", name }, { "ctx_size", 256 } })));
+        assert(created->status == 201);
+        worst_ms = std::max(worst_ms, ggml_time_ms() - t0);
+        assert(ggml_time_ms() - t0 < 8000);
+
+        t0 = ggml_time_ms();
+        assert(mgr.handle_post_instance_pin(test_req({ { "name", name } }, "/instances/" + name + "/pin", ""))->status == 200);
+        worst_ms = std::max(worst_ms, ggml_time_ms() - t0);
+        assert(ggml_time_ms() - t0 < 8000);
+
+        t0 = ggml_time_ms();
+        assert(mgr.handle_delete_instance(test_req({ { "name", name } }, "/instances/" + name, ""))->status == 200);
+        worst_ms = std::max(worst_ms, ggml_time_ms() - t0);
+        assert(ggml_time_ms() - t0 < 8000);
+    }
+
+    int64_t t0 = ggml_time_ms();
+    auto resized = mgr.handle_post_instance_resize(test_req({ { "name", "solo" } }, "/instances/solo/resize",
+        safe_json_to_str({ { "ctx_size", 512 } })));
+    assert(resized->status == 200);
+    worst_ms = std::max(worst_ms, ggml_time_ms() - t0);
+    assert(ggml_time_ms() - t0 < 8000);
+    fprintf(stdout, "healthy control: 10 ops, 0 retriable, worst op %lld ms\n", (long long) worst_ms);
+
+    mgr.terminate();
+}
+
 // pool sharing: a declared adapter resolves to the pool's entry on
 // demand-build (ptr non-null, installed identical), and attaching the same
 // file to a second instance observes the same ptr. a distinct file, even with
@@ -1019,6 +1367,55 @@ static void test_pool_adapter_detach_reattach(const common_params & base) {
     auto installed = inst_a->ctx_server->get_lora_adapters(deadline);
     assert(installed.has_value() && installed->size() == 1);
     assert((*installed)[0].ptr == before);
+
+    mgr.terminate();
+    fs::remove_all(dir, ec);
+}
+
+// a scale-only re-attach updates the scale in place: no refcount bump, no
+// duplicate entry, and the scheduler serves the new scale. pins the swap
+// core's acquired/release pairing for the update path.
+static void test_pool_adapter_scale_update_no_bump(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m8-scale").string();
+    fs::remove_all(dir, ec);
+    std::string file1;
+    std::string file2;
+    test_write_lora_pair(base, dir, file1, file2);
+
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    assert(mgr.handle_post_instances(test_req({}, "/instances",
+        safe_json_to_str({ { "name", "a" }, { "ctx_size", 256 } })))->status == 201);
+    assert(mgr.handle_post_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", file1 }, { "scale", 0.5 } })))->status == 200);
+
+    auto inst_a = test_find(mgr, "a");
+    assert(inst_a && inst_a->built);
+    assert(inst_a->effective.lora_adapters.size() == 1);
+    assert(mgr.adapter_registry.size() == 1);
+    assert(mgr.adapter_registry.begin()->second.refcount == 1);
+
+    // same file, new scale: still one entry, still one ref
+    assert(mgr.handle_post_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", file1 }, { "scale", 1.0 } })))->status == 200);
+    assert(inst_a->effective.lora_adapters.size() == 1);
+    assert(inst_a->effective.lora_adapters[0].scale == 1.0f);
+    assert(mgr.adapter_registry.size() == 1);
+    assert(mgr.adapter_registry.begin()->second.refcount == 1);
+
+    // detach drops to zero and frees the entry while the model stays alive
+    assert(mgr.handle_delete_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", file1 } })))->status == 200);
+    assert(inst_a->effective.lora_adapters.empty());
+    assert(mgr.adapter_registry.empty());
 
     mgr.terminate();
     fs::remove_all(dir, ec);
@@ -1529,6 +1926,80 @@ static void test_snapshot_prev2_allows(const common_params & base) {
     fs::remove_all(dir, ec);
 }
 
+// adapter-free variant of the m6 pool: the same window with no adapters, so
+// the live fingerprint is empty ("") - the exact-match target of a v2-empty file.
+static void test_snapshot_no_adapter_setup(server_instances & mgr, const common_params & base, const std::string & dir) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+
+    common_params params = base;
+    params.n_ctx          = 256;
+    params.n_parallel     = 1;
+    params.warmup         = false;
+    params.slot_save_path = (fs::path(dir) / "slots").string() + "/";
+    assert(mgr.load(params));
+
+    assert(mgr.handle_post_instances(test_req({}, "/instances",
+        safe_json_to_str({ { "name", "a" }, { "ctx_size", 256 } })))->status == 201);
+    mgr.start_loops();
+}
+
+// a v2 file saved with no adapters restores onto an adapter-free window:
+// empty matches empty. golden before and after the strict gate.
+static void test_snapshot_v2_empty_on_empty_allows(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m9-empty-ok").string();
+
+    server_instances mgr;
+    test_snapshot_no_adapter_setup(mgr, base, dir);
+
+    assert(mgr.handle_post_instance_snapshot(test_req({ { "name", "a" } },
+        "/instances/a/snapshot", safe_json_to_str({ { "name", "w1" } })))->status == 201);
+    assert(mgr.handle_post_instance_snapshot(test_req({ { "name", "a" } },
+        "/instances/a/snapshot", safe_json_to_str({ { "name", "w2" } })))->status == 201);
+
+    auto st = server_snapshot_read_status(mgr.snapshot_instance_path("a", "w1"));
+    assert(st.status == server_snapshot_status::OK && st.data.has_value());
+    assert(st.data->adapter_fp.empty());
+
+    assert(test_m6_switch(mgr, "w1")->status == 200);
+    assert(test_m6_switch(mgr, "w2")->status == 200);
+
+    mgr.terminate();
+    fs::remove_all(dir, ec);
+}
+
+// a v2 file saved with no adapters must NOT restore onto an adapter-equipped
+// window: the empty fingerprint means "zero adapters", which mismatches.
+static void test_snapshot_v2_empty_on_nonempty_400s(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m9-empty-strict").string();
+
+    server_instances mgr;
+    test_m6_setup(mgr, base, dir);
+
+    assert(mgr.handle_post_instance_snapshot(test_req({ { "name", "a" } },
+        "/instances/a/snapshot", safe_json_to_str({ { "name", "w1" } })))->status == 201);
+
+    // w4: w1's valid KV re-stamped empty (a v2 file with fp_len 0)
+    auto st = server_snapshot_read_status(mgr.snapshot_instance_path("a", "w1"));
+    assert(st.status == server_snapshot_status::OK && st.data.has_value());
+    assert(!st.data->adapter_fp.empty());
+    server_snapshot_data no_fp = std::move(*st.data);
+    no_fp.adapter_fp.clear();
+    assert(server_snapshot_write(mgr.snapshot_instance_path("a", "w4"), no_fp));
+
+    auto res = test_m6_switch(mgr, "w4");
+    assert(res->status == 400);
+    assert(res->data.find("adapter") != std::string::npos);
+
+    mgr.terminate();
+    fs::remove_all(dir, ec);
+}
+
 // adapter drift between save and restore is rejected: save attached, detach,
 // then restoring the attached-fp snapshot fails.
 static void test_snapshot_drift_400(const common_params & base) {
@@ -1633,12 +2104,17 @@ int main(int argc, char ** argv) {
     test_instances_lora_round_trip();
     test_instances_lora_validate();
     test_instances_parse_errors();
+    test_instance_numerics_strict();
+    test_instances_validate_all_cross_spec();
+    test_instances_collision_message_names_pair();
+    test_instance_lora_scale_round_trip();
     test_instances_parse_valid_names();
     test_instance_params();
     test_instances_lora_grammar();
     test_instance_params_lora();
     test_lora_fingerprint();
     test_adapter_buf_size_null();
+    test_resolve_honors_explicit_instance();
 
     common_params params;
     std::string   adapter_path;
@@ -1675,6 +2151,7 @@ int main(int argc, char ** argv) {
     test_pool_adapter_shared_ptr(params);
     test_pool_adapter_fingerprint(params);
     test_pool_adapter_detach_reattach(params);
+    test_pool_adapter_scale_update_no_bump(params);
     test_pool_adapter_concurrent_detach_snapshot(params);
     test_pool_adapter_resize_borrowed(params);
     test_adapter_bytes_identities(params);
@@ -1685,10 +2162,14 @@ int main(int argc, char ** argv) {
     test_snapshot_mismatch_400(params);
     test_snapshot_prev2_allows(params);
     test_snapshot_drift_400(params);
+    test_snapshot_v2_empty_on_empty_allows(params);
+    test_snapshot_v2_empty_on_nonempty_400s(params);
     test_instances_lora_normalize(params);
     test_live_merge_adapter_parity(params);
     test_borrowed_model(params);
     test_scheduler_timeout_cancels_pending(params);
+    test_destroy_bounded_on_wedged_scheduler(params);
+    test_management_healthy_control_fast(params);
     test_instances_envelope_built_unbuilt(params);
     test_demand_build_starts_one_loop(params);
     test_start_loops_skips_unbuilt(params);

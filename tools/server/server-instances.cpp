@@ -129,6 +129,16 @@ struct active_route_guard {
 bool server_instances::load(const common_params & params) {
     this->params = params;
 
+    // fail fast on duplicate names or name/group collisions accumulated
+    // across repeated flags or built programmatically: registration below
+    // assumes every name and group reference is unambiguous
+    try {
+        common_instances_validate_all(params.instances);
+    } catch (const std::invalid_argument & e) {
+        IST_ERR("invalid instance configuration: %s\n", e.what());
+        return false;
+    }
+
     // each instance inherits the base sleep value into its own scheduler loop
     // with no manager visibility (no sleeping state, no countdown), so refuse
     // the combination instead of sleeping silently. idle reclamation is
@@ -285,8 +295,12 @@ server_instances::resolve_target server_instances::resolve(const std::string & m
         return res;
     }
 
-    // <base> alone: the default instance (or the sole instance, or ambiguous)
+    // <base> alone: the default instance (or the sole instance, or ambiguous).
+    // the explicit `instance` request field overrides the absent component.
     if (comps.size() == 1) {
+        if (!explicit_instance.empty()) {
+            return resolve_instance_or_group(explicit_instance, error);
+        }
         if (pick_default()) {
             return res;
         }
@@ -298,6 +312,10 @@ server_instances::resolve_target server_instances::resolve(const std::string & m
     if (comps.size() == 2) {
         std::string target;
         if (comps[1] == "latest") {
+            // the explicit `instance` request field overrides the reserved pin
+            if (!explicit_instance.empty()) {
+                return resolve_instance_or_group(explicit_instance, error);
+            }
             if (pick_default()) {
                 return res;
             }
@@ -641,11 +659,13 @@ server_instances::switch_guard::switch_guard(server_instances & m, int64_t deadl
 }
 
 server_instances::switch_guard::~switch_guard() {
+    // notify only when the count changed: a failed acquisition waited out its
+    // deadline without taking a slot, so there is nothing to hand over
     if (acquired) {
         std::lock_guard<std::mutex> lock(mgr.mutex_switch);
         mgr.n_active_switches--;
+        mgr.cond_switch.notify_all();
     }
-    mgr.cond_switch.notify_all();
 }
 
 server_instances::server_snapshot_read_result server_instances::snapshot_io_read(const std::string & path,
@@ -704,6 +724,34 @@ server_instances::server_snapshot_write_result server_instances::snapshot_io_wri
     return done;
 }
 
+server_instances::kv_copy_out server_instances::kv_copy_to_data(server_instance &   inst,
+                                                                  int                 id_slot,
+                                                                  int64_t             deadline_ms,
+                                                                  const std::string & timeout_msg) {
+    kv_copy_out out;
+    auto result = inst.ctx_server->slot_save_copy(id_slot, deadline_ms);
+    if (!result) {
+        out.error = make_error(timeout_msg, ERROR_TYPE_UNAVAILABLE);
+        return out;
+    }
+    if (result->is_error()) {
+        // a busy slot fails with a retriable 503 instead of deferring
+        out.error = make_error(result->to_json());
+        return out;
+    }
+    auto * copy = dynamic_cast<server_task_result_slot_copy *>(result.get());
+    GGML_ASSERT(copy != nullptr);
+    out.data.n_ctx_seq = inst.ctx_server->get_slot_n_ctx();
+    out.data.tokens    = copy->tokens;
+    out.data.kv        = std::move(copy->buffer);
+    // record the adapter set this KV was computed under; a restore under a
+    // different set is rejected. the fingerprint read is serialized against
+    // attach/detach: the drain waits out this dispatch's n_active_dispatch.
+    out.data.adapter_fp = common_lora_fingerprint(inst.effective.lora_adapters);
+    out.ok = true;
+    return out;
+}
+
 server_http_res_ptr server_instances::apply_snapshot(server_instance &   inst,
                                                      const std::string & snapshot,
                                                      int                 id_slot) {
@@ -711,7 +759,7 @@ server_http_res_ptr server_instances::apply_snapshot(server_instance &   inst,
         return make_error("invalid snapshot name", ERROR_TYPE_INVALID_REQUEST);
     }
     if (params.slot_save_path.empty()) {
-        return make_error("snapshot switching requires --slot-save-path", ERROR_TYPE_INVALID_REQUEST);
+        return make_error("snapshot switching requires --slot-save-path", ERROR_TYPE_NOT_SUPPORTED);
     }
     if (id_slot < 0) {
         id_slot = 0;
@@ -749,27 +797,15 @@ server_http_res_ptr server_instances::apply_snapshot(server_instance &   inst,
         }
     }
 
-    // 4. persist the slot's current KV (if any) before switching away from it. the write is
-    //    fire-and-forget on the single FIFO pool I/O worker, which serializes all file ops.
+    // 4. persist the slot's current KV (if any) before switching away from it.
+    //    the write runs awaited on the single FIFO pool I/O worker, which
+    //    serializes all file ops; the deadline bounds the wait (see below).
     if (!current.empty()) {
-        auto result = inst.ctx_server->slot_save_copy(id_slot, deadline_ms);
-        if (!result) {
-            return make_error("snapshot switch timed out while saving", ERROR_TYPE_UNAVAILABLE);
+        auto copied = kv_copy_to_data(inst, id_slot, deadline_ms, "snapshot switch timed out while saving");
+        if (!copied.ok) {
+            return std::move(copied.error);
         }
-        if (result->is_error()) {
-            // a busy slot fails with a retriable 503 instead of deferring
-            return make_error(result->to_json());
-        }
-        auto * copy = dynamic_cast<server_task_result_slot_copy *>(result.get());
-        GGML_ASSERT(copy != nullptr);
-        server_snapshot_data data;
-        data.n_ctx_seq = inst.ctx_server->get_slot_n_ctx();
-        data.tokens    = copy->tokens;
-        data.kv        = std::move(copy->buffer);
-        // record the adapter set this KV was computed under; a restore under a
-        // different set is rejected. the fingerprint read is serialized against
-        // attach/detach: the drain waits out this dispatch's n_active_dispatch.
-        data.adapter_fp = common_lora_fingerprint(inst.effective.lora_adapters);
+        server_snapshot_data data = std::move(copied.data);
         // save the old snapshot back where it was read from: the
         // instance-scoped file when present, else the legacy flat file it was
         // restored from (migration), else the instance-scoped path. the old
@@ -817,10 +853,12 @@ server_http_res_ptr server_instances::apply_snapshot(server_instance &   inst,
     }
 
     // 6b. a snapshot saved under a different adapter set is incompatible with this
-    // instance: the KV was computed under different tensors. empty fp = pre-v2
-    // file, allowed with a warning (backward compat). the fingerprint read is
-    // serialized against attach/detach (see step 4).
-    if (!read.data->adapter_fp.empty()) {
+    // instance: the KV was computed under different tensors. the file version
+    // decides what an empty fingerprint means: v1 never had the field
+    // (warn-allow, legacy), while v2 always stamps it, so a v2 empty fp means
+    // "saved with zero adapters" and must match exactly. the fingerprint read
+    // is serialized against attach/detach (see step 4).
+    if (!read.data->adapter_fp.empty() || read.data->version > 1) {
         const std::string current_fp = common_lora_fingerprint(inst.effective.lora_adapters);
         if (read.data->adapter_fp != current_fp) {
             return make_error(format_error_response(
@@ -1026,6 +1064,7 @@ static void push_snapshot_row(std::vector<json> & entries, const server_snapshot
         { "mtime",      meta.mtime      },
         { "n_ctx_seq",  meta.n_ctx_seq  },
         { "adapter_fp", meta.adapter_fp },
+        { "version",    meta.version    },
         { "instance",   instance_tag    },
     });
 }
@@ -1197,8 +1236,26 @@ std::string server_instances::adapter_key(const std::string & path) {
     return std::filesystem::absolute(path).lexically_normal().string();
 }
 
+std::optional<std::string> server_instances::try_adapter_key(const std::string & path) {
+    // absolute() is purely lexical on common platforms, so an embedded NUL
+    // would sail through into registry keys, fingerprints and declarations
+    // that can never load. reject it here, before any of that happens.
+    if (path.find('\0') != std::string::npos) {
+        return std::nullopt;
+    }
+    try {
+        return std::filesystem::absolute(path).lexically_normal().string();
+    } catch (const std::filesystem::filesystem_error &) {
+        return std::nullopt;
+    }
+}
+
 llama_adapter_lora * server_instances::ensure_adapter(const std::string & path) {
-    const std::string key = adapter_key(path);
+    const auto key_opt = try_adapter_key(path);
+    if (!key_opt) {
+        return nullptr;
+    }
+    const std::string key = *key_opt;
     auto it = adapter_registry.find(key);
     if (it != adapter_registry.end()) {
         it->second.refcount++;
@@ -1346,7 +1403,10 @@ bool server_instances::build_context_into(server_instance & inst) {
 
 void server_instances::teardown_instance_context(server_instance & inst) {
     // abort first so in-flight generations finish promptly; the drain guard the
-    // caller holds then waits only for stragglers, never a never-ending decode
+    // caller holds then waits only for stragglers, never a never-ending decode.
+    // this abort stays unbounded on purpose: the only caller (resize) runs a
+    // bounded abort first and only reaches here once the scheduler proved
+    // live, so this second abort is a fast-path no-op, not a stall risk.
     if (inst.ctx_server) {
         inst.ctx_server->abort_slots("instance '" + inst.cfg.name + "' resized");
         inst.ctx_server->terminate();
@@ -1391,6 +1451,44 @@ std::shared_ptr<server_instance> server_instances::build_instance(const common_i
 // and create_instance's shutdown check is mirrored here, so a build that loses a race
 // with teardown frees what it allocated and reports unavailable instead of leaking a
 // scheduler thread.
+server_http_res_ptr server_instances::cold_reload_locked() {
+    // reload the shared weights when the pool went cold (last instance destroyed)
+    if (model != nullptr) {
+        return nullptr;
+    }
+    // the registry drains at delete-last, so a cold pool never holds stale entries:
+    // inherited adapters re-resolve from the config, not from old pointers. a
+    // non-empty registry here means a refcount accounting bug: debug builds stop
+    // on it, release builds log and refuse instead of crashing the process.
+    if (!adapter_registry.empty()) {
+        GGML_ASSERT(adapter_registry.empty());
+        IST_ERR("cold reload with %zu leaked adapter entries, refusing\n", adapter_registry.size());
+        return make_error(507, "insufficient_memory_error", "adapter registry is inconsistent, restart the server");
+    }
+    common_params model_params = params;
+    model_init                 = common_init_from_params(model_params, true);
+    model                      = model_init ? model_init->model() : nullptr;
+    if (model == nullptr) {
+        IST_ERR("failed to reload model weights '%s'\n", params.model.path.c_str());
+        return make_error(507, "insufficient_memory_error", "failed to reload shared weights");
+    }
+    IST_INF("reloaded shared model weights '%s'\n", params.model.path.c_str());
+    train_ctx_cached.store(llama_model_n_ctx_train(model), std::memory_order_relaxed);
+    return nullptr;
+}
+
+void server_instances::drop_built_context_locked(server_instance & inst) {
+    // the scheduler was never started, so there is no thread to join: drop the
+    // fresh context with no thread to join, release the refs the build took
+    // and restore the declared set for a later retry
+    inst.routes.reset();
+    inst.ctx_server->terminate();
+    inst.ctx_server.reset();
+    inst.model_owner.reset();
+    release_adapter_set(inst.effective.lora_adapters);
+    inst.effective.lora_adapters = common_instance_params(params, inst.cfg).lora_adapters;
+}
+
 server_http_res_ptr server_instances::ensure_built_instance(const std::shared_ptr<server_instance> & inst) {
     std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
 
@@ -1415,19 +1513,8 @@ server_http_res_ptr server_instances::ensure_built_instance(const std::shared_pt
     }
 
     // reload the shared weights when the pool went cold (last instance destroyed)
-    if (model == nullptr) {
-        // the registry drains at delete-last, so a cold pool never holds stale entries:
-        // inherited adapters re-resolve from the config, not from old pointers
-        GGML_ASSERT(adapter_registry.empty());
-        common_params model_params = params;
-        model_init                 = common_init_from_params(model_params, true);
-        model                      = model_init ? model_init->model() : nullptr;
-        if (model == nullptr) {
-            IST_ERR("failed to reload model weights '%s'\n", params.model.path.c_str());
-            return make_error(507, "insufficient_memory_error", "failed to reload shared weights");
-        }
-        IST_INF("reloaded shared model weights '%s'\n", params.model.path.c_str());
-        train_ctx_cached.store(llama_model_n_ctx_train(model), std::memory_order_relaxed);
+    if (auto err = cold_reload_locked()) {
+        return err;
     }
 
     // materialize the window: effective params are recomputed from cfg, then the
@@ -1448,14 +1535,8 @@ server_http_res_ptr server_instances::ensure_built_instance(const std::shared_pt
         std::lock_guard<std::mutex> lock(mutex_dispatch);
         if (inst->removing || !inst->running || terminated) {
             // lost a race with teardown after the build: drop the fresh context,
-            // nothing is installed, no scheduler is started. release the refs the
-            // build took and restore the declared set for a later retry.
-            inst->routes.reset();
-            inst->ctx_server->terminate();
-            inst->ctx_server.reset();
-            inst->model_owner.reset();
-            release_adapter_set(inst->effective.lora_adapters);
-            inst->effective.lora_adapters = common_instance_params(params, inst->cfg).lora_adapters;
+            // nothing is installed, no scheduler is started.
+            drop_built_context_locked(*inst);
             return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
         }
         // start the scheduler only now that the instance is fully installed, so a
@@ -1491,19 +1572,8 @@ server_http_res_ptr server_instances::create_instance(const common_instance & cf
     }
 
     // reload the shared weights first when the pool went cold (last instance destroyed)
-    if (model == nullptr) {
-        // the registry drains at delete-last, so a cold pool never holds stale entries:
-        // inherited adapters re-resolve from the config, not from old pointers
-        GGML_ASSERT(adapter_registry.empty());
-        common_params model_params = params;
-        model_init                 = common_init_from_params(model_params, true);
-        model                      = model_init ? model_init->model() : nullptr;
-        if (model == nullptr) {
-            IST_ERR("failed to reload model weights '%s'\n", params.model.path.c_str());
-            return make_error(507, "insufficient_memory_error", "failed to reload shared weights");
-        }
-        IST_INF("reloaded shared model weights '%s'\n", params.model.path.c_str());
-        train_ctx_cached.store(llama_model_n_ctx_train(model), std::memory_order_relaxed);
+    if (auto err = cold_reload_locked()) {
+        return err;
     }
 
     bool adapter_failed = false;
@@ -1525,12 +1595,7 @@ server_http_res_ptr server_instances::create_instance(const common_instance & cf
         if (terminated) {
             // the server is shutting down mid-create: the scheduler was never
             // started, so drop the fresh context with no thread to join
-            inst->routes.reset();
-            inst->ctx_server->terminate();
-            inst->ctx_server.reset();
-            inst->model_owner.reset();
-            release_adapter_set(inst->effective.lora_adapters);
-            inst->effective.lora_adapters = common_instance_params(params, inst->cfg).lora_adapters;
+            drop_built_context_locked(*inst);
             return make_error(503, "unavailable_error", "server is shutting down");
         }
         // explicitly created means explicitly demanded: push first, then start the
@@ -1553,14 +1618,16 @@ server_http_res_ptr server_instances::destroy_instance(const std::string & name,
 
     // pinned is advisory in this branch; the force flag is accepted and ignored
     std::shared_ptr<server_instance> inst;
+    size_t inst_pos = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_dispatch);
-        for (auto it = instances.begin(); it != instances.end(); ++it) {
-            if ((*it)->cfg.name != name) {
+        for (size_t i = 0; i < instances.size(); ++i) {
+            if (instances[i]->cfg.name != name) {
                 continue;
             }
-            inst = *it;
-            instances.erase(it);
+            inst = instances[i];
+            inst_pos = i;
+            instances.erase(instances.begin() + i);
             // flip running under the same lock as the erase: any dispatch that incremented
             // before this point is drained by the guard below, any dispatch that checks
             // after sees running == false and never posts to the about-to-stop scheduler
@@ -1579,8 +1646,22 @@ server_http_res_ptr server_instances::destroy_instance(const std::string & name,
     // reports success once built is set)
     if (inst->built) {
         // abort in-flight generation, then drain the remaining dispatched requests so no
-        // HTTP reader is left hanging when the scheduler is stopped below
-        inst->ctx_server->abort_slots("instance '" + name + "' evicted");
+        // HTTP reader is left hanging when the scheduler is stopped below.
+        // bounded: the management lock is held across this call, so a stalled
+        // scheduler answers 503 instead of wedging every other management op
+        // behind it. on timeout the unlink above is rolled back (same position,
+        // running flipped back) so the instance is fully intact and a retry
+        // finds it where it always was; without the rollback the last local
+        // reference would tear down a live scheduler here.
+        if (!inst->ctx_server->abort_slots("instance '" + name + "' evicted", snapshot_deadline_ms(*inst))) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_dispatch);
+                inst->running = true;
+                instances.insert(instances.begin() + std::min(inst_pos, instances.size()), inst);
+                cond_dispatch.notify_all();  // group waiters re-pick with this member
+            }
+            return make_error("timed out aborting in-flight work, retry", ERROR_TYPE_UNAVAILABLE);
+        }
 
         {
             instance_drain_guard guard(*this, inst);
@@ -1660,8 +1741,12 @@ server_http_res_ptr server_instances::resize_instance(const std::string & name, 
     // in-flight ones; its destructor restores `removing` even when the rebuild
     // fails or throws.
     // abort in-flight generations before draining: the drain below would otherwise
-    // wait forever on a never-ending decode (same order as destroy_instance)
-    inst->ctx_server->abort_slots("instance '" + name + "' resized");
+    // wait forever on a never-ending decode (same order as destroy_instance).
+    // bounded like destroy: a stalled scheduler answers 503 with the window
+    // untouched instead of stalling the management plane.
+    if (!inst->ctx_server->abort_slots("instance '" + name + "' resized", snapshot_deadline_ms(*inst))) {
+        return make_error("timed out aborting in-flight work, retry", ERROR_TYPE_UNAVAILABLE);
+    }
     {
         instance_drain_guard guard(*this, inst);
         // pin the post-resize adapter entries BEFORE the teardown drops the old
@@ -1779,7 +1864,19 @@ server_http_res_ptr server_instances::handle_get_slots(const server_http_req & r
             }
             auto res = inst->routes->get_slots(req);
             if (res->status != 200) {
-                return res;
+                // a dying member must not fail the whole aggregate: skip it
+                // with a marker row carrying the instance (router-visible,
+                // never silent). unbuilt/destroying members were already
+                // skipped above without a marker.
+                json marker = { { "instance", inst->cfg.name } };
+                try {
+                    const json body = json::parse(res->data);
+                    marker["error"] = (body.is_object() && body.contains("error")) ? body.at("error") : body;
+                } catch (const std::exception &) {
+                    marker["error"] = res->status;
+                }
+                all_slots.push_back(std::move(marker));
+                continue;
             }
             for (auto & slot : json::parse(res->data)) {
                 slot["instance"] = inst->cfg.name;
@@ -2087,6 +2184,54 @@ server_http_res_ptr server_instances::handle_delete_instance(const server_http_r
     return destroy_instance(req.get_param("name"), !req.get_param("force").empty());
 }
 
+server_http_res_ptr server_instances::swap_adapter_set(const std::shared_ptr<server_instance> & inst,
+                                                       const adapter_set_mutator &               mutate) {
+    // exclusive access while the set changes: the drain rejects new dispatches and
+    // waits out in-flight generations, so the swap below never frees adapter tensors
+    // under a decoding slot (use-after-free) nor corrupts its output. the drain
+    // comes before the mutation because apply_snapshot reads the effective list
+    // without the management lock while its dispatch is counted.
+    instance_drain_guard guard(*this, inst);
+
+    // rollback copies: the lists stay untouched until the synchronous apply succeeds
+    const auto cfg_prev       = inst->cfg.lora;
+    const auto effective_prev = inst->effective.lora_adapters;
+
+    adapter_set_delta delta;
+    if (auto err = mutate(inst->cfg.lora, inst->effective.lora_adapters, delta)) {
+        return err;
+    }
+
+    // synchronous apply, posted directly to this instance's queue (never through
+    // dispatch(), which the guard's removing flag would reject). the drain makes
+    // the scheduler quiescent, so the task runs immediately; the deadline only
+    // trips on a stalled scheduler.
+    auto result = inst->ctx_server->set_lora_adapters(inst->effective.lora_adapters, snapshot_deadline_ms(*inst));
+    if (!result || result->is_error()) {
+        inst->cfg.lora                = cfg_prev;
+        inst->effective.lora_adapters = effective_prev;
+        release_adapter_set(delta.acquired);
+        return make_error("timed out applying the adapter set", ERROR_TYPE_UNAVAILABLE);
+    }
+    // read-back agreement: the committed set must equal the expected list.
+    // no rollback here: the set above succeeded, so the lists already describe
+    // the scheduler; a failed read-back is answered retriable and the idempotent
+    // retry re-verifies.
+    if (!verify_attached(*inst, snapshot_deadline_ms(*inst))) {
+        return make_error("could not verify the adapter set", ERROR_TYPE_UNAVAILABLE);
+    }
+    release_adapter_set(delta.released); // frees at refcount 0 while the model is alive
+
+    // the swap invalidated every slot's live KV (the scheduler cleared the prompts)
+    // AND the recorded bindings: bound slots would otherwise keep serving KV computed
+    // under the old adapters (resize semantics)
+    {
+        std::lock_guard<std::mutex> lock(mutex_dispatch);
+        inst->slot_snapshots.assign(inst->slot_snapshots.size(), std::string());
+    }
+    return nullptr;
+}
+
 server_http_res_ptr server_instances::handle_post_instance_adapters(const server_http_req & req) {
     json body;
     try {
@@ -2107,7 +2252,13 @@ server_http_res_ptr server_instances::handle_post_instance_adapters(const server
     if (!(scale > 0.0f) || !std::isfinite(scale)) {
         return make_error("'scale' must be a positive finite number", ERROR_TYPE_INVALID_REQUEST);
     }
-    const std::string key = adapter_key(path);
+    // the message carries no echo of the path: a malformed path may hold
+    // bytes (such as NUL) that truncate log lines and confuse readers
+    const auto key_opt = try_adapter_key(path);
+    if (!key_opt) {
+        return make_error("invalid adapter path", ERROR_TYPE_INVALID_REQUEST);
+    }
+    const std::string key = *key_opt;
 
     // serialized with the other management ops; dispatches never take this mutex, so
     // the drain below cannot deadlock (resize precedent, same lock order)
@@ -2139,71 +2290,42 @@ server_http_res_ptr server_instances::handle_post_instance_adapters(const server
         return make_ok(instance_to_json(*inst));
     }
 
-    // exclusive access while the set changes: the drain rejects new dispatches and
-    // waits out in-flight generations, so the swap below never frees adapter tensors
-    // under a decoding slot (use-after-free) nor corrupts its output
-    instance_drain_guard guard(*this, inst);
-
-    // rollback copies: the lists stay untouched until the synchronous apply succeeds
-    const auto cfg_prev       = inst->cfg.lora;
-    const auto effective_prev = inst->effective.lora_adapters;
-    bool       ensured        = false;
-
-    bool present = false;
-    for (auto & la : inst->effective.lora_adapters) {
-        if (adapter_key(la.path) == key) {
-            la.scale = scale; // re-attach updates the scale; the ref is already held
-            present  = true;
+    // a built window swaps through the shared core: the mutator below only
+    // edits the two lists (upsert + scale), everything else lives in one place
+    adapter_set_mutator upsert = [&](std::vector<std::pair<std::string, float>> & cfg_lora,
+                                     std::vector<common_adapter_lora_info> &     effective,
+                                     adapter_set_delta &                         delta) -> server_http_res_ptr {
+        bool present = false;
+        for (auto & la : effective) {
+            if (adapter_key(la.path) == key) {
+                la.scale = scale; // re-attach updates the scale; the ref is already held
+                present  = true;
+            }
         }
-    }
-    if (!present) {
-        llama_adapter_lora * ptr = ensure_adapter(key);
-        if (ptr == nullptr) {
-            return make_error("failed to load lora adapter '" + key + "'", ERROR_TYPE_INVALID_REQUEST);
+        if (!present) {
+            llama_adapter_lora * ptr = ensure_adapter(key);
+            if (ptr == nullptr) {
+                return make_error("failed to load lora adapter '" + key + "'", ERROR_TYPE_INVALID_REQUEST);
+            }
+            delta.acquired.push_back({ key, scale, "", "", ptr });
+            effective.push_back({ key, scale, "", "", ptr });
         }
-        ensured = true;
-        inst->effective.lora_adapters.push_back({ key, scale, "", "", ptr });
-    }
-    // cfg.lora tracks the same set in grammar form; matched independently so the
-    // two lists can never diverge even if a previous op left them inconsistent
-    bool cfg_present = false;
-    for (auto & gl : inst->cfg.lora) {
-        if (adapter_key(gl.first) == key) {
-            gl           = { key, scale };
-            cfg_present  = true;
+        // cfg.lora tracks the same set in grammar form; matched independently so the
+        // two lists can never diverge even if a previous op left them inconsistent
+        bool cfg_present = false;
+        for (auto & gl : cfg_lora) {
+            if (adapter_key(gl.first) == key) {
+                gl           = { key, scale };
+                cfg_present  = true;
+            }
         }
-    }
-    if (!cfg_present) {
-        inst->cfg.lora.emplace_back(key, scale);
-    }
-
-    // synchronous apply, posted directly to this instance's queue (never through
-    // dispatch(), which the guard's removing flag would reject). the drain makes
-    // the scheduler quiescent, so the task runs immediately; the deadline only
-    // trips on a stalled scheduler.
-    auto result = inst->ctx_server->set_lora_adapters(inst->effective.lora_adapters, snapshot_deadline_ms(*inst));
-    if (!result || result->is_error()) {
-        inst->cfg.lora               = cfg_prev;
-        inst->effective.lora_adapters = effective_prev;
-        if (ensured) {
-            release_adapter(key);
+        if (!cfg_present) {
+            cfg_lora.emplace_back(key, scale);
         }
-        return make_error("timed out applying the adapter set", ERROR_TYPE_UNAVAILABLE);
-    }
-    // read-back agreement: the committed set must equal the expected list.
-    // no rollback here: the set above succeeded, so the lists already describe
-    // the scheduler; a failed read-back is answered retriable and the idempotent
-    // retry re-verifies.
-    if (!verify_attached(*inst, snapshot_deadline_ms(*inst))) {
-        return make_error("could not verify the adapter set", ERROR_TYPE_UNAVAILABLE);
-    }
-
-    // the swap invalidated every slot's live KV (the scheduler cleared the prompts)
-    // AND the recorded bindings: bound slots would otherwise keep serving KV computed
-    // under the old adapters (resize semantics)
-    {
-        std::lock_guard<std::mutex> lock(mutex_dispatch);
-        inst->slot_snapshots.assign(inst->slot_snapshots.size(), std::string());
+        return nullptr;
+    };
+    if (auto err = swap_adapter_set(inst, upsert)) {
+        return err;
     }
 
     IST_INF("instance '%s' attached adapter '%s' (scale = %g)\n", inst->cfg.name.c_str(), key.c_str(), scale);
@@ -2232,7 +2354,13 @@ server_http_res_ptr server_instances::handle_delete_instance_adapters(const serv
     if (path.empty()) {
         return make_error("'path' is required (body or ?path= query)", ERROR_TYPE_INVALID_REQUEST);
     }
-    const std::string key = adapter_key(path);
+    // same boundary as attach: a malformed path is a caller bug (400),
+    // answered before any instance lookup, drain, or registry touch
+    const auto key_opt = try_adapter_key(path);
+    if (!key_opt) {
+        return make_error("invalid adapter path", ERROR_TYPE_INVALID_REQUEST);
+    }
+    const std::string key = *key_opt;
 
     std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
 
@@ -2276,34 +2404,44 @@ server_http_res_ptr server_instances::handle_delete_instance_adapters(const serv
         });
     }
 
-    // built window: drain FIRST, then mutate. apply_snapshot reads the effective
-    // list without mutex_mgmt while its dispatch is counted, so mutating before
-    // the drain would race it (the drain only waits out dispatches counted
-    // before it starts).
-    instance_drain_guard guard(*this, inst);
-
-    const auto effective_prev = inst->effective.lora_adapters;
-    const auto cfg_prev       = inst->cfg.lora;
-
-    // remove the key from both lists (they are kept in sync); the removed entries
-    // carry the refs to drop.
-    std::vector<common_adapter_lora_info> removed;
+    // fast 404 before the drain: an adapter that was never attached stalls no
+    // traffic and holds the management plane only for the scan below. the
+    // scan inside the drain stays authoritative: a racing attach can only add
+    // the key (turning this into a success), and management ops already
+    // serialize on the management lock, so the two scans cannot disagree.
     {
-        auto & eff = inst->effective.lora_adapters;
-        for (auto it = eff.begin(); it != eff.end();) {
+        bool attached = false;
+        for (const auto & la : inst->effective.lora_adapters) {
+            if (adapter_key(la.path) == key) {
+                attached = true;
+                break;
+            }
+        }
+        if (!attached) {
+            return make_error("adapter not attached to instance '" + inst->cfg.name + "'", ERROR_TYPE_NOT_FOUND);
+        }
+    }
+
+    // a built window swaps through the shared core: the mutator below only
+    // edits the two lists (erase), everything else lives in one place. the
+    // peek above already 404s the never-attached case, so the miss return
+    // below is unreachable in practice, kept as the authoritative check.
+    adapter_set_mutator erase = [&](std::vector<std::pair<std::string, float>> & cfg_lora,
+                                    std::vector<common_adapter_lora_info> &     effective,
+                                    adapter_set_delta &                         delta) -> server_http_res_ptr {
+        // remove the key from both lists (they are kept in sync); the removed
+        // entries carry the refs to drop on success
+        for (auto it = effective.begin(); it != effective.end();) {
             if (adapter_key(it->path) == key) {
-                removed.push_back(*it);
-                it = eff.erase(it);
+                delta.released.push_back(*it);
+                it = effective.erase(it);
             } else {
                 ++it;
             }
         }
-    }
-    if (removed.empty()) {
-        return make_error("adapter not attached to instance '" + inst->cfg.name + "'", ERROR_TYPE_NOT_FOUND);
-    }
-    {
-        auto & cfg_lora = inst->cfg.lora;
+        if (delta.released.empty()) {
+            return make_error("adapter not attached to instance '" + inst->cfg.name + "'", ERROR_TYPE_NOT_FOUND);
+        }
         for (auto it = cfg_lora.begin(); it != cfg_lora.end();) {
             if (adapter_key(it->first) == key) {
                 it = cfg_lora.erase(it);
@@ -2311,25 +2449,10 @@ server_http_res_ptr server_instances::handle_delete_instance_adapters(const serv
                 ++it;
             }
         }
-    }
-
-    auto result = inst->ctx_server->set_lora_adapters(inst->effective.lora_adapters, snapshot_deadline_ms(*inst));
-    if (!result || result->is_error()) {
-        inst->effective.lora_adapters = effective_prev;
-        inst->cfg.lora                = cfg_prev;
-        return make_error("timed out applying the adapter set", ERROR_TYPE_UNAVAILABLE);
-    }
-    // read-back agreement: the committed set must equal the expected list.
-    // no rollback here: the set above succeeded, so the lists already describe
-    // the scheduler; a failed read-back is answered retriable and the idempotent
-    // retry re-verifies.
-    if (!verify_attached(*inst, snapshot_deadline_ms(*inst))) {
-        return make_error("could not verify the adapter set", ERROR_TYPE_UNAVAILABLE);
-    }
-    release_adapter_set(removed); // frees at refcount 0 while the model is alive
-    {
-        std::lock_guard<std::mutex> lock(mutex_dispatch);
-        inst->slot_snapshots.assign(inst->slot_snapshots.size(), std::string());
+        return nullptr;
+    };
+    if (auto err = swap_adapter_set(inst, erase)) {
+        return err;
     }
 
     IST_INF("instance '%s' detached adapter '%s'\n", inst->cfg.name.c_str(), key.c_str());
@@ -2415,21 +2538,11 @@ server_http_res_ptr server_instances::handle_post_instance_snapshot(const server
             return make_error("too many concurrent snapshot switches, retry", ERROR_TYPE_UNAVAILABLE);
         }
 
-        auto result = inst->ctx_server->slot_save_copy(id_slot, deadline_ms);
-        if (!result) {
-            return make_error("snapshot save timed out", ERROR_TYPE_UNAVAILABLE);
+        auto copied = kv_copy_to_data(*inst, id_slot, deadline_ms, "snapshot save timed out");
+        if (!copied.ok) {
+            return std::move(copied.error);
         }
-        if (result->is_error()) {
-            return make_error(result->to_json());
-        }
-        auto * copy = dynamic_cast<server_task_result_slot_copy *>(result.get());
-        GGML_ASSERT(copy != nullptr);
-        server_snapshot_data data;
-        data.n_ctx_seq = inst->ctx_server->get_slot_n_ctx();
-        data.tokens    = copy->tokens;
-        data.kv        = std::move(copy->buffer);
-        // record the adapter set this KV was computed under (see apply_snapshot)
-        data.adapter_fp = common_lora_fingerprint(inst->effective.lora_adapters);
+        server_snapshot_data data = std::move(copied.data);
         // await the write so a failed save never binds the slot to a file that does not
         // exist on disk (the slot KV is unchanged either way)
         auto write = snapshot_io_write(filepath, std::move(data), deadline_ms);
@@ -2455,7 +2568,9 @@ server_http_res_ptr server_instances::handle_post_instance_snapshot(const server
         std::lock_guard<std::mutex> lock(mutex_dispatch);
         inst->slot_snapshots[id_slot] = snapshot;
 
-        return make_ok(result->to_json(), 201);
+        // copy metadata: same shape as server_task_result_slot_copy::to_json
+        // (that object was consumed building data above; a move preserves sizes)
+        return make_ok({ { "id_slot", id_slot }, { "n_tokens", data.tokens.size() }, { "n_bytes", data.kv.size() } }, 201);
     }
 }
 

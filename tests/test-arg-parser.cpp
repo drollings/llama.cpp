@@ -229,6 +229,21 @@ static void test(void) {
     argv = {"binary_name", "-lm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // repeated --instance flags accumulate into one list, so duplicates and
+    // name/group collisions across flags fail just like comma-separated ones
+    {
+        common_params inst_params;
+        argv = {"binary_name", "--instance", "a", "--instance", "a"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), inst_params, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--instance", "x:group=y", "--instance", "y"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), inst_params, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--instance", "a", "--instance", "b"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), inst_params, LLAMA_EXAMPLE_SERVER));
+        assert(inst_params.instances.size() == 2);
+    }
+
     printf("test-arg-parser: test valid usage\n\n");
 
     argv = {"binary_name", "-m", "model_file.gguf"};

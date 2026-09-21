@@ -159,6 +159,59 @@ static void test_merge_as_u64_edges() {
     assert(out["total"]["adapter"] == UINT64_MAX);
 }
 
+// the fan-out collector: fast children are collected, slow ones skip at the
+// deadline, failing fetches skip, and the output sorts by model name no
+// matter the completion order. two slow tasks run concurrently (max, not
+// sum): a serial implementation needs both sleeps back to back.
+static void test_fanout_collect_deadline_skip() {
+    server_model_meta slow_a;
+    slow_a.name = "a";
+    slow_a.port = 2;
+    server_model_meta slow_b;
+    slow_b.name = "d";
+    slow_b.port = 5;
+    server_model_meta fast_c;
+    fast_c.name = "c";
+    fast_c.port = 3;
+    server_model_meta fast_b;
+    fast_b.name = "b";
+    fast_b.port = 4;
+    instances_fetch_fn fetch = [](const server_model_meta & meta)
+            -> std::optional<std::pair<std::string, json>> {
+        if (meta.name == "a" || meta.name == "d") {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+            return std::make_pair(meta.name, json{ { "instances", json::array() } });
+        }
+        if (meta.name == "c") {
+            return std::nullopt;
+        }
+        return std::make_pair(meta.name, json{ { "instances", json::array() } });
+    };
+    const int64_t t0 = ggml_time_ms();
+    auto out = instances_fanout_collect({ slow_a, fast_c, fast_b, slow_b }, fetch, t0 + 400);
+    const int64_t wall = ggml_time_ms() - t0;
+    // slow pair skipped at the deadline, failing fetch skipped, fast collected
+    assert(out.size() == 1);
+    assert(out[0].first == "b");
+    // concurrent, not serial: both 1500ms sleeps overlap (a serial collector
+    // needs 3000ms+ for the slow pair alone, plus abandoned-task joins)
+    assert(wall < 2600);
+
+    // deterministic order: names sorted even though submission order was not
+    instances_fetch_fn quick = [](const server_model_meta & meta)
+            -> std::optional<std::pair<std::string, json>> {
+        return std::make_pair(meta.name, json{ { "instances", json::array() } });
+    };
+    server_model_meta m1;
+    m1.name = "zulu";
+    server_model_meta m2;
+    m2.name = "alpha";
+    auto ordered = instances_fanout_collect({ m1, m2 }, quick, ggml_time_ms() + 5000);
+    assert(ordered.size() == 2);
+    assert(ordered[0].first == "alpha");
+    assert(ordered[1].first == "zulu");
+}
+
 // golden for the /instances envelope shape: exact key sets and value types as
 // served today. later changes must keep this green unless they state a new shape.
 static void test_instances_envelope_shape() {
@@ -569,10 +622,11 @@ static void test_envelope_snapshot_row_shape() {
     const json body = json::parse(res->data);
     assert(body["snapshots"].is_array() && body["snapshots"].size() == 1);
     const json row = body["snapshots"][0];
-    assert(row.is_object() && row.size() == 6);
+    assert(row.is_object() && row.size() == 7);
     assert(row["name"] == "work");
     assert(row["n_ctx_seq"] == 64);
     assert(row["adapter_fp"] == "abcdef");
+    assert(row["version"] == 2);
     assert(row["instance"] == "ledger");
     assert(row["size"].is_number_integer());
     assert(row["mtime"].is_number_integer());
@@ -587,6 +641,7 @@ int main() {    test_layout_paths();
     test_merge_adapter_additive();
     test_merge_adapter_missing_key();
     test_merge_as_u64_edges();
+    test_fanout_collect_deadline_skip();
     test_instances_envelope_shape();
     test_pick_best_candidate();
     test_displayed_n_ctx_unbuilt();
