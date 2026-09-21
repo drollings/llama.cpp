@@ -243,7 +243,7 @@ public:
     server_models(const common_params & params, int argc, char ** argv);
     ~server_models();
 
-    server_response sse; // for real-time updates via SSE endpoint
+    server_result_queue<server_task_result_ptr> sse; // for real-time updates via SSE endpoint
 
     // (re-)load the list of models from various sources and prepare the metadata mapping
     // - if this is called the first time, simply populate the metadata

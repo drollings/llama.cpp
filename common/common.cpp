@@ -480,6 +480,14 @@ void common_instance_validate(const common_instance & inst) {
     };
     check("instance name", inst.name);
     check("instance group", inst.group);
+    // a space can never survive the CLI layer (it splits argv), so an adapter
+    // path containing one is rejected here rather than failing later at load
+    for (const auto & la : inst.lora) {
+        if (la.first.find(' ') != std::string::npos) {
+            throw std::invalid_argument(string_format(
+                "invalid lora path '%s': spaces are not allowed", la.first.c_str()));
+        }
+    }
     // 'latest' is a reserved routing token (base:latest:<name|group>), so no
     // instance or group may claim it, otherwise the alias would be ambiguous
     if (inst.name == "latest") {
@@ -621,6 +629,14 @@ std::string common_instances_to_string(const std::vector<common_instance> & inst
         }
         if (inst.is_default) {
             s += ":default";
+        }
+        // the adapter list in grammar form: paths print verbatim (they never
+        // contain ':' or ','), the scale only when it differs from the default
+        for (const auto & la : inst.lora) {
+            s += ":lora=" + la.first;
+            if (la.second != 1.0f) {
+                s += ":" + std::to_string(la.second);
+            }
         }
 
         parts.push_back(s);

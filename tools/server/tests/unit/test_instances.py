@@ -1120,3 +1120,28 @@ def test_instances_adapter_unknown_404():
     res = requests.delete(base + "/instances/a/adapters?path=" + urllib.parse.quote(lora, safe=""))
     assert res.status_code == 200
     assert _adapters_of("a") == []
+
+
+def test_instances_row_bytes_include_adapter():
+    """Live per-row identity with an adapter attached: POST attach then GET
+    shows total_bytes == model + context + compute + adapter while
+    vram_bytes stays context + compute."""
+    global server
+    _moe_server()
+    server.instances = ["a:ctx=512"]
+    server.start()
+    lora = _adapter_path()
+
+    assert _complete("a").status_code == 200
+    res = server.make_request("POST", "/instances/a/adapters", data={"path": lora})
+    assert res.status_code == 200
+
+    body = _get_instances()
+    assert len(body["instances"]) == 1
+    row = body["instances"][0]
+    assert row["id"] == "stories15m-moe:a"
+    assert row["adapter_bytes"] > 0
+    assert row["total_bytes"] == (
+        row["model_bytes"] + row["context_bytes"] + row["compute_bytes"] + row["adapter_bytes"]
+    )
+    assert row["vram_bytes"] == row["context_bytes"] + row["compute_bytes"]

@@ -1,9 +1,17 @@
 #include "common.h"
+#include "ggml.h"
+#include "gguf.h"
 #include "llama.h"
 #include "server-instances.h"
+#include "server-models.h"
 
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #undef NDEBUG
@@ -153,8 +161,7 @@ static void test_instance_params() {
     assert(p.n_parallel == 1); // divergence from _swarm_api: never inherits base.n_parallel
 }
 
-static void test_instances_lora_grammar() {
-    // repeatable lora= with explicit and default scales
+static void test_instances_lora_grammar() {    // repeatable lora= with explicit and default scales
     auto v = common_instances_parse("a:lora=./x.gguf:0.5:lora=./y.gguf,b:lora=./z.gguf");
     assert(v.size() == 2);
     assert(v[0].lora.size() == 2);
@@ -177,6 +184,71 @@ static void test_instances_lora_grammar() {
     expect_parse_error("a:lora=./x.gguf:0");  // zero scale
     expect_parse_error("a:lora=./x.gguf:-2"); // negative scale
     expect_parse_error("a:lora=./x.gguf:lora=./x.gguf"); // duplicate path
+}
+
+// multiple lora= entries keep order and scales; non-finite scales are rejected.
+static void test_instances_lora_multi_scale() {
+    auto v = common_instances_parse("a:lora=./x.gguf:0.5:lora=./y.gguf:lora=./z.gguf:2.0");
+    assert(v.size() == 1 && v[0].lora.size() == 3);
+    assert(v[0].lora[0].first == "./x.gguf" && v[0].lora[0].second == 0.5f);
+    assert(v[0].lora[1].first == "./y.gguf" && v[0].lora[1].second == 1.0f);
+    assert(v[0].lora[2].first == "./z.gguf" && v[0].lora[2].second == 2.0f);
+
+    expect_parse_error("a:lora=./x.gguf:nan"); // not a positive finite scale
+    expect_parse_error("a:lora=./x.gguf:inf");
+    expect_parse_error("a:lora=./x.gguf:-inf");
+}
+
+// separator discipline: ',' splits instances so a parsed path never contains
+// one; a ':' inside the path breaks the option parse.
+static void test_instances_lora_separators() {
+    auto v = common_instances_parse("a:lora=./x,y.gguf");
+    assert(v.size() == 2);
+    assert(v[0].lora.size() == 1 && v[0].lora[0].first == "./x");
+    assert(v[1].name == "y.gguf" && v[1].lora.empty());
+    expect_parse_error("a:lora=./x:0.5.gguf"); // ':' inside the path
+}
+
+// specs written before lora= existed still parse with an empty adapter list.
+static void test_instances_lora_compat() {
+    auto v = common_instances_parse("swarm0:group=swarm:ctx=16384:parallel=1,ledger:ctx=65536:pinned:default");
+    assert(v.size() == 2);
+    assert(v[0].lora.empty() && v[1].lora.empty());
+}
+
+// to_string emits the adapter list and the result reparses to the same list.
+static void test_instances_lora_round_trip() {
+    auto v = common_instances_parse("a:lora=./x.gguf:0.5:lora=./y.gguf,b:ctx=512");
+    assert(v.size() == 2);
+    const std::string s = common_instances_to_string(v);
+    assert(s.find(":lora=./x.gguf:") != std::string::npos);
+    assert(s.find(":lora=./y.gguf") != std::string::npos);
+    // default scale prints bare (no scale suffix after the path)
+    assert(s.find(":lora=./y.gguf:") == std::string::npos);
+
+    const auto reparsed = common_instances_parse(s);
+    assert(reparsed.size() == 2);
+    assert(reparsed[0].lora.size() == 2);
+    assert(reparsed[0].lora[0].first == "./x.gguf" && reparsed[0].lora[0].second == 0.5f);
+    assert(reparsed[0].lora[1].first == "./y.gguf" && reparsed[0].lora[1].second == 1.0f);
+    assert(reparsed[1].lora.empty());
+}
+
+// a space can never survive the CLI layer, so adapter paths with spaces are
+// rejected at validation.
+static void test_instances_lora_validate() {
+    expect_parse_error("a:lora=./x y.gguf");
+    common_instance inst;
+    inst.name  = "a";
+    inst.group = "a";
+    inst.lora.emplace_back("./x y.gguf", 1.0f);
+    bool threw = false;
+    try {
+        common_instance_validate(inst);
+    } catch (const std::invalid_argument &) {
+        threw = true;
+    }
+    assert(threw);
 }
 
 static void test_instance_params_lora() {
@@ -458,8 +530,1194 @@ static void test_borrowed_model_adapter_skip(const common_params & base, const s
     llama_adapter_lora_free(pool_adapter);
 }
 
+// golden for one built and one unbuilt window through the live envelope:
+// exact row key set, loaded/unloaded states, zero bytes while unbuilt, and
+// the total_bytes/vram_bytes identities. runs against the real model fixture.
+static void test_instances_envelope_built_unbuilt(const common_params & base) {
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfg_cold;
+    cfg_cold.name     = "cold";
+    cfg_cold.group    = "cold";
+    cfg_cold.ctx_size = 256;
+    cfg_cold.parallel = 1;
+    common_instance cfg_warm;
+    cfg_warm.name        = "warm";
+    cfg_warm.group       = "warm";
+    cfg_warm.ctx_size    = 256;
+    cfg_warm.parallel    = 1;
+    cfg_warm.is_default  = true;
+    params.instances.push_back(cfg_cold);
+    params.instances.push_back(cfg_warm);
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req list_req { {}, {}, "/instances", "", "", {}, no_stop };
+    server_http_req props_req { {}, {}, "/props", "", "", {}, no_stop };
+
+    // before any demand both windows are registered but unbuilt
+    {
+        auto res = mgr.handle_get_instances(list_req);
+        assert(res->status == 200);
+        const json body = json::parse(res->data);
+        assert(body["instances"].size() == 2);
+        for (const auto & row : body["instances"]) {
+            assert(row["state"] == "unloaded");
+            assert(row["context_bytes"] == 0);
+            assert(row["compute_bytes"] == 0);
+            assert(row["model_bytes"] == 0);
+            assert(row["adapter_bytes"] == 0);
+            assert(row["total_bytes"] == 0);
+            assert(row["vram_bytes"] == 0);
+            assert(row["last_used"] == -1);
+            assert(row["last_used_epoch"] == -1);
+        }
+        const json total = body["total"];
+        assert(total["model"] == 0 && total["context"] == 0 && total["compute"] == 0);
+    }
+
+    // one demand builds exactly one window: warm loads, cold stays unbuilt
+    assert(mgr.handle_get_props(props_req)->status == 200);
+    {
+        auto res = mgr.handle_get_instances(list_req);
+        assert(res->status == 200);
+        const json body = json::parse(res->data);
+        assert(body["instances"].size() == 2);
+
+        const json * cold = nullptr;
+        const json * warm = nullptr;
+        for (const auto & row : body["instances"]) {
+            const std::string id = row["id"].get<std::string>();
+            if (id.find(":cold") != std::string::npos) {
+                cold = &row;
+            } else if (id.find(":warm") != std::string::npos) {
+                warm = &row;
+            }
+        }
+        assert(cold != nullptr && warm != nullptr);
+        assert((*cold)["state"] == "unloaded");
+        assert((*cold)["context_bytes"] == 0);
+        assert((*warm)["state"] == "loaded");
+        assert((*warm)["n_ctx"] == 256);
+        assert((*warm)["parallel"] == 1);
+        assert((*warm)["is_default"] == true);
+        // byte identities hold on the built row too
+        const uint64_t m  = (*warm)["model_bytes"].get<uint64_t>();
+        const uint64_t cx = (*warm)["context_bytes"].get<uint64_t>();
+        const uint64_t co = (*warm)["compute_bytes"].get<uint64_t>();
+        assert((*warm)["total_bytes"] == m + cx + co);
+        assert((*warm)["vram_bytes"] == cx + co);
+    }
+
+    mgr.terminate();
+}
+
+// cancelling a still-queued task removes it before any scheduler runs it:
+// the handler never fires and no result is delivered.
+static void test_queue_stop_cancels_pending() {
+    static_assert(HTTP_POLLING_SECONDS == 1, "polling cadence for scheduler waits");
+    server_queue                                queue;
+    server_result_queue<server_task_result_ptr> response;
+    std::atomic<bool> executed{false};
+    queue.on_new_task([&](server_task && task, bool) -> bool {
+        if (task.type == SERVER_TASK_TYPE_INSTANCE_OP) {
+            executed.store(true);
+        }
+        return true;
+    });
+    queue.on_update_slots([]() {});
+
+    server_response_reader rd(queue, response, 0);
+    server_task task(SERVER_TASK_TYPE_INSTANCE_OP);
+    task.id = rd.get_new_id();
+    task.instance_op = []() -> json { return json{ { "ok", true } }; };
+    rd.post_task(std::move(task));
+
+    rd.stop(); // no scheduler is running: the task is still queued
+
+    std::thread loop([&]() { queue.start_loop(-1); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    queue.terminate();
+    loop.join();
+
+    assert(!executed.load());
+    assert(rd.next([]() { return true; }) == nullptr);
+}
+
+#if 0
+// compile check (keep disabled): a result handle whose element type has no int
+// id must fail on the queue's static_assert (uncomment to verify)
+struct test_queue_result_bad_id {
+    std::string id;
+};
+static void test_queue_wrong_type_rejected() {
+    server_result_queue<std::unique_ptr<test_queue_result_bad_id>> queue;
+    (void) queue;
+}
+#endif
+
+// a timed-out manager-to-scheduler task must not run late: with the scheduler
+// held by a blocking op, a short-deadline swap times out, and after the
+// blocker releases the installed set is unchanged (the pending task was
+// cancelled, not left to commit).
+static void test_scheduler_timeout_cancels_pending(const common_params & base) {
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfg;
+    cfg.name        = "solo";
+    cfg.group       = "solo";
+    cfg.ctx_size    = 256;
+    cfg.parallel    = 1;
+    cfg.is_default  = true;
+    params.instances.push_back(cfg);
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req props_req { {}, {}, "/props", "", "", {}, no_stop };
+    assert(mgr.handle_get_props(props_req)->status == 200);
+    server_context * ctx = mgr.instances.front()->ctx_server.get();
+    assert(ctx != nullptr);
+
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+    std::thread blocker([&]() {
+        ctx->instance_op([&]() -> json {
+            entered.store(true);
+            while (!release.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return json{ { "success", true } };
+        });
+    });
+    while (!entered.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // the scheduler is occupied: the swap must time out. the desired set is a
+    // null-ptr entry that touches no file, so only its installation is observed.
+    std::vector<common_adapter_lora_info> desired = { { "m1-test.gguf", 1.0f, "", "", nullptr } };
+    auto timed_out = ctx->set_lora_adapters(desired, ggml_time_ms() + 50);
+    assert(timed_out == nullptr);
+
+    release.store(true);
+    blocker.join();
+
+    server_http_req lora_req { {}, {}, "/lora-adapters", "", "", {}, no_stop };
+    auto lora_res = mgr.handle_get_lora_adapters(lora_req);
+    assert(lora_res->status == 200);
+    assert(json::parse(lora_res->data).empty());
+
+    mgr.terminate();
+}
+
+// bounded read of the scheduler's installed adapter list through the
+// existing GET_LORA task: a set list reads back with the same paths, scales
+// and pointers, and re-setting the identical list is a no-op that leaves the
+// pointers identical.
+static void test_get_lora_adapters_round_trip(const common_params & base) {
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfg;
+    cfg.name        = "solo";
+    cfg.group       = "solo";
+    cfg.ctx_size    = 256;
+    cfg.parallel    = 1;
+    cfg.is_default  = true;
+    params.instances.push_back(cfg);
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req props_req { {}, {}, "/props", "", "", {}, no_stop };
+    assert(mgr.handle_get_props(props_req)->status == 200);
+    server_context * ctx = mgr.instances.front()->ctx_server.get();
+    assert(ctx != nullptr);
+
+    const int64_t no_deadline = ggml_time_ms() + 5000;
+
+    auto empty = ctx->get_lora_adapters(no_deadline);
+    assert(empty.has_value() && empty->empty());
+
+    // null-ptr entries touch no file: only the list plumbing is observed
+    std::vector<common_adapter_lora_info> list = {
+        { "m2-a.gguf", 0.5f, "", "", nullptr },
+        { "m2-b.gguf", 1.0f, "", "", nullptr },
+    };
+    assert(ctx->set_lora_adapters(list, no_deadline) != nullptr);
+
+    auto got = ctx->get_lora_adapters(no_deadline);
+    assert(got.has_value() && got->size() == 2);
+    assert((*got)[0].path == "m2-a.gguf" && (*got)[0].scale == 0.5f && (*got)[0].ptr == nullptr);
+    assert((*got)[1].path == "m2-b.gguf" && (*got)[1].scale == 1.0f && (*got)[1].ptr == nullptr);
+
+    // identical list: the scheduler short-circuits, pointers stay identical
+    assert(ctx->set_lora_adapters(*got, no_deadline) != nullptr);
+    auto got2 = ctx->get_lora_adapters(no_deadline);
+    assert(got2.has_value() && got2->size() == 2);
+    assert((*got2)[0].ptr == (*got)[0].ptr && (*got2)[1].ptr == (*got)[1].ptr);
+    assert((*got2)[0].path == (*got)[0].path && (*got2)[1].path == (*got)[1].path);
+
+    mgr.terminate();
+}
+
+// test-only: synthesize a minimal loadable LoRA GGUF for `model`: one rank-8
+// pair on blk.0.attn_q.weight with deterministic data. hermetic: no network,
+// no fixture file.
+static std::string test_write_tiny_lora(llama_model * model, const std::string & path) {
+    const int n_embd = llama_model_n_embd(model);
+    const int rank   = 8;
+    ggml_init_params gparams = { 16 * 1024 * 1024, nullptr, false };
+    ggml_context * gctx = ggml_init(gparams);
+    assert(gctx != nullptr);
+    ggml_tensor * a = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n_embd, rank);
+    ggml_tensor * b = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, rank, n_embd);
+    ggml_set_name(a, "blk.0.attn_q.weight.lora_a");
+    ggml_set_name(b, "blk.0.attn_q.weight.lora_b");
+    for (int64_t i = 0; i < ggml_nelements(a); i++) {
+        ((float *) a->data)[i] = 0.001f * (float) (i % 7);
+    }
+    for (int64_t i = 0; i < ggml_nelements(b); i++) {
+        ((float *) b->data)[i] = 0.001f * (float) (i % 5);
+    }
+    gguf_context * ggu = gguf_init_empty();
+    gguf_set_val_str(ggu, "general.type", "adapter");
+    gguf_set_val_str(ggu, "general.architecture", "llama");
+    gguf_set_val_str(ggu, "adapter.type", "lora");
+    gguf_set_val_f32(ggu, "adapter.lora.alpha", 8.0f);
+    gguf_add_tensor(ggu, a);
+    gguf_add_tensor(ggu, b);
+    const bool ok = gguf_write_to_file(ggu, path.c_str(), false);
+    gguf_free(ggu);
+    ggml_free(gctx);
+    assert(ok);
+    return path;
+}
+
+// test-only: load the shared weights model-only to size the synthetic LoRAs,
+// then write two files: file1 and a byte-identical file2 under a distinct
+// path (the registry keys on path, so file2 is a second entry).
+static void test_write_lora_pair(const common_params & base, const std::string & dir,
+                                 std::string & file1, std::string & file2) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+
+    common_params params = base;
+    auto model_init = common_init_from_params(params, true);
+    llama_model * model = model_init->model();
+    assert(model != nullptr);
+
+    file1 = (fs::path(dir) / "m3-a.gguf").string();
+    file2 = (fs::path(dir) / "m3-b.gguf").string();
+    test_write_tiny_lora(model, file1);
+    fs::copy_file(file1, file2, ec);
+    assert(!ec);
+}
+
+static server_http_req test_req(const std::map<std::string, std::string> & params,
+                                const std::string & path,
+                                const std::string & body) {
+    static const std::function<bool()> no_stop = []() { return false; };
+    return server_http_req { params, {}, path, "", body, {}, no_stop };
+}
+
+static std::shared_ptr<server_instance> test_find(server_instances & mgr, const std::string & name) {
+    for (const auto & inst : mgr.instances) {
+        if (inst->cfg.name == name) {
+            return inst;
+        }
+    }
+    return nullptr;
+}
+
+// pool sharing: a declared adapter resolves to the pool's entry on
+// demand-build (ptr non-null, installed identical), and attaching the same
+// file to a second instance observes the same ptr. a distinct file, even with
+// identical bytes, resolves to a distinct ptr. read-after-post agreement holds.
+static void test_pool_adapter_shared_ptr(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m3-shared").string();
+    fs::remove_all(dir, ec);
+    std::string file1;
+    std::string file2;
+    test_write_lora_pair(base, dir, file1, file2);
+
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfga;
+    cfga.name        = "a";
+    cfga.group       = "a";
+    cfga.ctx_size    = 256;
+    cfga.parallel    = 1;
+    cfga.is_default  = true;
+    cfga.lora.emplace_back(file1, 1.0f);
+    params.instances.push_back(cfga);
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req props_req { {}, {}, "/props", "", "", {}, no_stop };
+    assert(mgr.handle_get_props(props_req)->status == 200);
+
+    auto inst_a = test_find(mgr, "a");
+    assert(inst_a && inst_a->built);
+    assert(inst_a->effective.lora_adapters.size() == 1);
+    llama_adapter_lora * pool_ptr = inst_a->effective.lora_adapters[0].ptr;
+    assert(pool_ptr != nullptr);
+
+    const int64_t deadline = ggml_time_ms() + 5000;
+    auto installed_a = inst_a->ctx_server->get_lora_adapters(deadline);
+    assert(installed_a.has_value() && installed_a->size() == 1);
+    assert((*installed_a)[0].ptr == pool_ptr);
+
+    // second instance shares the file: the same registry entry, the same ptr
+    auto create = mgr.handle_post_instances(test_req({}, "/instances",
+        safe_json_to_str({ { "name", "b" }, { "ctx_size", 256 } })));
+    assert(create->status == 201);
+    auto attach = mgr.handle_post_instance_adapters(test_req({ { "name", "b" } },
+        "/instances/b/adapters", safe_json_to_str({ { "path", file1 }, { "scale", 1.0f } })));
+    assert(attach->status == 200);
+
+    auto inst_b = test_find(mgr, "b");
+    assert(inst_b && inst_b->built);
+    auto installed_b = inst_b->ctx_server->get_lora_adapters(deadline);
+    assert(installed_b.has_value() && installed_b->size() == 1);
+    assert((*installed_b)[0].ptr == pool_ptr);
+
+    // distinct file: a distinct entry with a distinct ptr
+    attach = mgr.handle_post_instance_adapters(test_req({ { "name", "b" } },
+        "/instances/b/adapters", safe_json_to_str({ { "path", file2 }, { "scale", 0.5f } })));
+    assert(attach->status == 200);
+    installed_b = inst_b->ctx_server->get_lora_adapters(deadline);
+    assert(installed_b.has_value() && installed_b->size() == 2);
+    assert((*installed_b)[1].ptr != nullptr);
+    assert((*installed_b)[1].ptr != pool_ptr);
+
+    mgr.terminate();
+    fs::remove_all(dir, ec);
+}
+
+// fingerprint over pool refs: stable, order-independent, never a ptr input,
+// and "" for the empty set.
+static void test_pool_adapter_fingerprint(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m3-fp").string();
+    fs::remove_all(dir, ec);
+    std::string file1;
+    std::string file2;
+    test_write_lora_pair(base, dir, file1, file2);
+
+    assert(common_lora_fingerprint({}).empty());
+
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfga;
+    cfga.name        = "a";
+    cfga.group       = "a";
+    cfga.ctx_size    = 256;
+    cfga.parallel    = 1;
+    cfga.is_default  = true;
+    cfga.lora.emplace_back(file1, 1.0f);
+    cfga.lora.emplace_back(file2, 0.5f);
+    params.instances.push_back(cfga);
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req props_req { {}, {}, "/props", "", "", {}, no_stop };
+    assert(mgr.handle_get_props(props_req)->status == 200);
+
+    auto inst_a = test_find(mgr, "a");
+    assert(inst_a && inst_a->built);
+    const std::string fp = common_lora_fingerprint(inst_a->effective.lora_adapters);
+    assert(!fp.empty());
+
+    // order-independent: the same set listed backwards hashes alike
+    auto swapped = inst_a->effective.lora_adapters;
+    std::swap(swapped[0], swapped[1]);
+    assert(common_lora_fingerprint(swapped) == fp);
+
+    // ptr never an input: the same paths/scales with null ptrs hash alike
+    auto nulled = inst_a->effective.lora_adapters;
+    for (auto & la : nulled) {
+        la.ptr = nullptr;
+    }
+    assert(common_lora_fingerprint(nulled) == fp);
+
+    mgr.terminate();
+    fs::remove_all(dir, ec);
+}
+
+// detach then re-attach reuses the surviving registry entry: the ptr is
+// identical (no reload) while another instance holds its ref.
+static void test_pool_adapter_detach_reattach(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m3-reattach").string();
+    fs::remove_all(dir, ec);
+    std::string file1;
+    std::string file2;
+    test_write_lora_pair(base, dir, file1, file2);
+
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    const int64_t deadline = ggml_time_ms() + 5000;
+    assert(mgr.handle_post_instances(test_req({}, "/instances",
+        safe_json_to_str({ { "name", "a" }, { "ctx_size", 256 } })))->status == 201);
+    assert(mgr.handle_post_instances(test_req({}, "/instances",
+        safe_json_to_str({ { "name", "b" }, { "ctx_size", 256 } })))->status == 201);
+    assert(mgr.handle_post_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", file1 } })))->status == 200);
+    assert(mgr.handle_post_instance_adapters(test_req({ { "name", "b" } },
+        "/instances/b/adapters", safe_json_to_str({ { "path", file1 } })))->status == 200);
+
+    auto inst_a = test_find(mgr, "a");
+    assert(inst_a && inst_a->built);
+    llama_adapter_lora * before = inst_a->effective.lora_adapters[0].ptr;
+    assert(before != nullptr);
+
+    assert(mgr.handle_delete_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", file1 } })))->status == 200);
+    auto get = mgr.handle_get_instance_adapters(test_req({ { "name", "a" } }, "/instances/a/adapters", ""));
+    assert(get->status == 200 && json::parse(get->data).empty());
+
+    // b still holds its ref, so the entry survives and the re-attach reuses it
+    assert(mgr.handle_post_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", file1 } })))->status == 200);
+    assert(inst_a->effective.lora_adapters.size() == 1);
+    assert(inst_a->effective.lora_adapters[0].ptr == before);
+    auto installed = inst_a->ctx_server->get_lora_adapters(deadline);
+    assert(installed.has_value() && installed->size() == 1);
+    assert((*installed)[0].ptr == before);
+
+    mgr.terminate();
+    fs::remove_all(dir, ec);
+}
+
+// a detach racing a snapshot save: both serialize on the management mutex, so
+// the fingerprint read never races the set mutation (TSan asserts this).
+static void test_pool_adapter_concurrent_detach_snapshot(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m3-race").string();
+    fs::remove_all(dir, ec);
+    std::string file1;
+    std::string file2;
+    test_write_lora_pair(base, dir, file1, file2);
+
+    common_params params = base;
+    params.n_ctx          = 256;
+    params.n_parallel     = 1;
+    params.warmup         = false;
+    params.slot_save_path = (fs::path(dir) / "slots").string() + "/";
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    assert(mgr.handle_post_instances(test_req({}, "/instances",
+        safe_json_to_str({ { "name", "a" }, { "ctx_size", 256 } })))->status == 201);
+    assert(mgr.handle_post_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", file1 } })))->status == 200);
+    mgr.start_loops();
+
+    std::atomic<int> saves_ok{0};
+    std::thread saver([&]() {
+        for (int i = 0; i < 20; i++) {
+            auto res = mgr.handle_post_instance_snapshot(test_req({ { "name", "a" } },
+                "/instances/a/snapshot", safe_json_to_str({ { "name", "w1" } })));
+            if (res->status == 201) {
+                saves_ok++;
+            }
+        }
+    });
+    auto detach = mgr.handle_delete_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", file1 } })));
+    assert(detach->status == 200);
+    saver.join();
+    assert(saves_ok.load() == 20);
+
+    mgr.terminate();
+    fs::remove_all(dir, ec);
+}
+
+// resize rebuilds the window from the pool: the installed set is the same
+// borrowed entry, not a reload. a failing factory maps to the adapter 400.
+static void test_pool_adapter_resize_borrowed(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m3-resize").string();
+    fs::remove_all(dir, ec);
+    std::string file1;
+    std::string file2;
+    test_write_lora_pair(base, dir, file1, file2);
+
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfga;
+    cfga.name        = "a";
+    cfga.group       = "a";
+    cfga.ctx_size    = 256;
+    cfga.parallel    = 1;
+    cfga.is_default  = true;
+    params.instances.push_back(cfga);
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req props_req { {}, {}, "/props", "", "", {}, no_stop };
+    assert(mgr.handle_get_props(props_req)->status == 200);
+
+    const int64_t deadline = ggml_time_ms() + 5000;
+    assert(mgr.handle_post_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", file1 } })))->status == 200);
+
+    auto inst_a = test_find(mgr, "a");
+    assert(inst_a && inst_a->built);
+    llama_adapter_lora * before = inst_a->effective.lora_adapters[0].ptr;
+    assert(before != nullptr);
+
+    auto resize = [&](int32_t n_ctx) {
+        return mgr.handle_post_instance_resize(test_req({ { "name", "a" } },
+            "/instances/a/resize", safe_json_to_str({ { "ctx_size", n_ctx } })));
+    };
+    assert(resize(512)->status == 200);
+    assert(inst_a->built);
+    assert(inst_a->effective.lora_adapters.size() == 1);
+    assert(inst_a->effective.lora_adapters[0].ptr == before);
+    auto installed = inst_a->ctx_server->get_lora_adapters(deadline);
+    assert(installed.has_value() && installed->size() == 1);
+    assert((*installed)[0].ptr == before);
+
+    // fail-to-load factory: the adapter error maps to 400, never 507
+    mgr.set_context_builder([](server_instance & inst) {
+        inst.adapter_failed = true;
+        return false;
+    });
+    assert(resize(1024)->status == 400);
+    assert(!inst_a->built);
+
+    // recovery re-resolves from the declaration on the next demand
+    mgr.set_context_builder(nullptr);
+    assert(resize(256)->status == 200);
+    assert(mgr.handle_get_props(props_req)->status == 200);
+    assert(inst_a->built);
+    assert(inst_a->effective.lora_adapters.size() == 1);
+    assert(inst_a->effective.lora_adapters[0].ptr != nullptr);
+    installed = inst_a->ctx_server->get_lora_adapters(deadline);
+    assert(installed.has_value() && installed->size() == 1);
+    assert((*installed)[0].ptr == inst_a->effective.lora_adapters[0].ptr);
+
+    mgr.terminate();
+    fs::remove_all(dir, ec);
+}
+
+// debt_ledger is a plain container: add/size round-trip, fields readable.
+static void test_debt_ledger_visible() {
+    debt_ledger ledger;
+    assert(ledger.size() == 0);
+    ledger.add("pool:a", "destroy", 123);
+    ledger.add("pool:b", "resize", 456);
+    assert(ledger.size() == 2);
+    assert(ledger.entries[0].instance == "pool:a");
+    assert(ledger.entries[0].task == "destroy");
+    assert(ledger.entries[0].t_ms == 123);
+    assert(ledger.entries[1].instance == "pool:b");
+    assert(ledger.entries[1].task == "resize");
+    assert(ledger.entries[1].t_ms == 456);
+}
+
+// destroy carries its debt: an unbuilt registered instance destroyed under a
+// deny factory (any build would fail) still records who held what.
+static void test_destroy_carries_debt(const common_params & base) {
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfga;
+    cfga.name     = "a";
+    cfga.group    = "a";
+    cfga.ctx_size = 256;
+    cfga.parallel = 1;
+    params.instances.push_back(cfga);
+
+    server_instances mgr;
+    mgr.set_context_builder([](server_instance &) { return false; });
+    assert(mgr.load(params));
+
+    auto inst = test_find(mgr, "a");
+    assert(inst && !inst->built);
+
+    auto res = mgr.handle_delete_instance(test_req({ { "name", "a" } }, "/instances/a", ""));
+    assert(res->status == 200);
+    assert(inst->adapter_debts.size() == 1);
+    const std::string & debt = inst->adapter_debts[0];
+    assert(debt.find("a") != std::string::npos);
+    assert(debt.find("destroy") != std::string::npos);
+    assert(debt.find("use=") != std::string::npos);
+    assert(debt.find("refs=") != std::string::npos);
+
+    mgr.terminate();
+}
+
+// successful resizes record no debt.
+static void test_resize_no_debt(const common_params & base) {
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfga;
+    cfga.name        = "a";
+    cfga.group       = "a";
+    cfga.ctx_size    = 256;
+    cfga.parallel    = 1;
+    cfga.is_default  = true;
+    params.instances.push_back(cfga);
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req props_req { {}, {}, "/props", "", "", {}, no_stop };
+    assert(mgr.handle_get_props(props_req)->status == 200);
+
+    auto resize = [&](int32_t n_ctx) {
+        return mgr.handle_post_instance_resize(test_req({ { "name", "a" } },
+            "/instances/a/resize", safe_json_to_str({ { "ctx_size", n_ctx } })));
+    };
+    assert(resize(512)->status == 200);
+    assert(resize(256)->status == 200);
+
+    auto inst = test_find(mgr, "a");
+    assert(inst && inst->built);
+    assert(inst->adapter_debts.empty());
+
+    mgr.terminate();
+}
+
+// byte identities with an attached adapter: total adds every leg including
+// adapters, vram stays context+compute, and the envelope totals agree.
+static void test_adapter_bytes_identities(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m5-ident").string();
+    fs::remove_all(dir, ec);
+    std::string file1;
+    std::string file2;
+    test_write_lora_pair(base, dir, file1, file2);
+
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfga;
+    cfga.name        = "a";
+    cfga.group       = "a";
+    cfga.ctx_size    = 256;
+    cfga.parallel    = 1;
+    cfga.is_default  = true;
+    cfga.lora.emplace_back(file1, 1.0f);
+    params.instances.push_back(cfga);
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req props_req { {}, {}, "/props", "", "", {}, no_stop };
+    assert(mgr.handle_get_props(props_req)->status == 200);
+
+    server_http_req list_req { {}, {}, "/instances", "", "", {}, no_stop };
+    auto res = mgr.handle_get_instances(list_req);
+    assert(res->status == 200);
+    const json body = json::parse(res->data);
+    assert(body["instances"].size() == 1);
+    const json row = body["instances"][0];
+
+    const uint64_t m  = row["model_bytes"].get<uint64_t>();
+    const uint64_t cx = row["context_bytes"].get<uint64_t>();
+    const uint64_t co = row["compute_bytes"].get<uint64_t>();
+    const uint64_t ad = row["adapter_bytes"].get<uint64_t>();
+    assert(ad > 0);
+    assert(ad == llama_adapter_lora_buf_size(test_find(mgr, "a")->effective.lora_adapters[0].ptr));
+    assert(row["total_bytes"] == m + cx + co + ad);
+    assert(row["vram_bytes"] == cx + co);
+
+    const json total = body["total"];
+    assert(total["adapter"].get<uint64_t>() >= ad);
+    assert(total["total"] == total["model"].get<uint64_t>() + total["context"].get<uint64_t>() +
+                             total["compute"].get<uint64_t>() + total["adapter"].get<uint64_t>());
+
+    mgr.terminate();
+    fs::remove_all(dir, ec);
+}
+
+// an unbuilt window owns no buffers: every byte field reads zero, even with
+// declared adapters or an attach recorded while unbuilt.
+static void test_adapter_bytes_unbuilt_zero(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m5-unbuilt").string();
+    fs::remove_all(dir, ec);
+    std::string file1;
+    std::string file2;
+    test_write_lora_pair(base, dir, file1, file2);
+
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfga;
+    cfga.name     = "a";
+    cfga.group    = "a";
+    cfga.ctx_size = 256;
+    cfga.parallel = 1;
+    cfga.lora.emplace_back(file1, 1.0f);
+    params.instances.push_back(cfga);
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    // attach while unbuilt: declaration only, still no buffers
+    assert(mgr.handle_post_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", file2 } })))->status == 200);
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req list_req { {}, {}, "/instances", "", "", {}, no_stop };
+    auto res = mgr.handle_get_instances(list_req);
+    assert(res->status == 200);
+    const json body = json::parse(res->data);
+    assert(body["instances"].size() == 1);
+    const json row = body["instances"][0];
+    assert(row["state"] == "unloaded");
+    assert(row["model_bytes"] == 0 && row["context_bytes"] == 0);
+    assert(row["compute_bytes"] == 0 && row["adapter_bytes"] == 0);
+    assert(row["total_bytes"] == 0 && row["vram_bytes"] == 0);
+
+    mgr.terminate();
+    fs::remove_all(dir, ec);
+}
+
+// pool sharing counts per row but once per pool: two instances on one file
+// each report the full entry size, the envelope adapter total counts one file.
+static void test_adapter_bytes_pool_shared(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m5-pool").string();
+    fs::remove_all(dir, ec);
+    std::string file1;
+    std::string file2;
+    test_write_lora_pair(base, dir, file1, file2);
+
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    assert(mgr.handle_post_instances(test_req({}, "/instances",
+        safe_json_to_str({ { "name", "a" }, { "ctx_size", 256 } })))->status == 201);
+    assert(mgr.handle_post_instances(test_req({}, "/instances",
+        safe_json_to_str({ { "name", "b" }, { "ctx_size", 256 } })))->status == 201);
+    assert(mgr.handle_post_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", file1 } })))->status == 200);
+    assert(mgr.handle_post_instance_adapters(test_req({ { "name", "b" } },
+        "/instances/b/adapters", safe_json_to_str({ { "path", file1 } })))->status == 200);
+
+    const uint64_t entry = llama_adapter_lora_buf_size(test_find(mgr, "a")->effective.lora_adapters[0].ptr);
+    assert(entry > 0);
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req list_req { {}, {}, "/instances", "", "", {}, no_stop };
+    const json body = json::parse(mgr.handle_get_instances(list_req)->data);
+    // the legacy default (built at load with no adapters) plus a and b
+    assert(body["instances"].size() == 3);
+    for (const auto & row : body["instances"]) {
+        const std::string id = row["id"].get<std::string>();
+        if (id.size() >= 2 && (id.compare(id.size() - 2, 2, ":a") == 0 ||
+                               id.compare(id.size() - 2, 2, ":b") == 0)) {
+            assert(row["adapter_bytes"] == entry);
+        } else {
+            assert(row["adapter_bytes"] == 0);
+        }
+    }
+    assert(body["total"]["adapter"] == entry);
+
+    mgr.terminate();
+    fs::remove_all(dir, ec);
+}
+
+// allocation failure (never adapter failure) answers 507 with the device
+// memory text on both create and resize.
+static void test_oom_text_create_resize(const common_params & base) {
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfga;
+    cfga.name     = "a";
+    cfga.group    = "a";
+    cfga.ctx_size = 256;
+    cfga.parallel = 1;
+    params.instances.push_back(cfga);
+
+    server_instances mgr;
+    mgr.set_context_builder([](server_instance &) { return false; });
+    assert(mgr.load(params));
+
+    auto create = mgr.handle_post_instances(test_req({}, "/instances",
+        safe_json_to_str({ { "name", "b" }, { "ctx_size", 256 } })));
+    assert(create->status == 507);
+    assert(create->data.find("not enough device memory") != std::string::npos);
+
+    mgr.set_context_builder(nullptr);
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req props_req { {}, {}, "/props", "", "", {}, no_stop };
+    assert(mgr.handle_get_props(props_req)->status == 200);
+
+    mgr.set_context_builder([](server_instance &) { return false; });
+    auto resize = mgr.handle_post_instance_resize(test_req({ { "name", "a" } },
+        "/instances/a/resize", safe_json_to_str({ { "ctx_size", 512 } })));
+    assert(resize->status == 507);
+    assert(resize->data.find("not enough device memory") != std::string::npos);
+
+    mgr.terminate();
+}
+
+// test-only: write a version-1 snapshot file (no adapter_fp field) with the
+// given payload. the layout is the documented on-disk contract: magic, version,
+// n_ctx_seq, n_tokens, kv_size, tokens, kv.
+static void test_write_snapshot_v1(const std::string & path, int32_t n_ctx_seq,
+                                   const llama_tokens & tokens, const std::vector<uint8_t> & kv) {
+    std::ofstream out(path, std::ios::binary);
+    assert(out.is_open());
+    const uint32_t magic   = 0x534C5041;
+    const uint32_t version = 1;
+    const int32_t  n_tokens = (int32_t) tokens.size();
+    const uint64_t kv_size  = (uint64_t) kv.size();
+    out.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+    out.write(reinterpret_cast<const char *>(&version), sizeof(version));
+    out.write(reinterpret_cast<const char *>(&n_ctx_seq), sizeof(n_ctx_seq));
+    out.write(reinterpret_cast<const char *>(&n_tokens), sizeof(n_tokens));
+    out.write(reinterpret_cast<const char *>(&kv_size), sizeof(kv_size));
+    out.write(reinterpret_cast<const char *>(tokens.data()), n_tokens * (std::streamsize) sizeof(llama_token));
+    out.write(reinterpret_cast<const char *>(kv.data()), (std::streamsize) kv.size());
+    out.close();
+    assert(out.good());
+}
+
+// spelling normalization: two spellings of one file resolve to one registry
+// entry (same ptr while held, one row) and one fingerprint at equal scales.
+static void test_instances_lora_normalize(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m7-norm").string();
+    fs::remove_all(dir, ec);
+    std::string file1;
+    std::string file2;
+    test_write_lora_pair(base, dir, file1, file2);
+
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    assert(mgr.handle_post_instances(test_req({}, "/instances",
+        safe_json_to_str({ { "name", "a" }, { "ctx_size", 256 } })))->status == 201);
+
+    // second spelling of the same file: the dot-segment collapses to file1
+    const std::string alt = (fs::path(dir) / "." / "m3-a.gguf").string();
+    assert(mgr.handle_post_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", file1 } })))->status == 200);
+    auto inst_a = test_find(mgr, "a");
+    assert(inst_a && inst_a->built);
+    llama_adapter_lora * first_ptr = inst_a->effective.lora_adapters[0].ptr;
+    assert(first_ptr != nullptr);
+    const std::string first_fp = common_lora_fingerprint(inst_a->effective.lora_adapters);
+    assert(!first_fp.empty());
+
+    // re-attach under the other spelling: the same entry, scale updated, one row
+    assert(mgr.handle_post_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", alt }, { "scale", 0.5f } })))->status == 200);
+    assert(inst_a->effective.lora_adapters.size() == 1);
+    assert(inst_a->effective.lora_adapters[0].ptr == first_ptr);
+    assert(inst_a->effective.lora_adapters[0].scale == 0.5f);
+    auto get = mgr.handle_get_instance_adapters(test_req({ { "name", "a" } }, "/instances/a/adapters", ""));
+    assert(get->status == 200 && json::parse(get->data).size() == 1);
+
+    // same spelling-independent fingerprint at equal scales
+    assert(mgr.handle_delete_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", file1 } })))->status == 200);
+    assert(mgr.handle_post_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", alt } })))->status == 200);
+    assert(inst_a->effective.lora_adapters.size() == 1);
+    assert(common_lora_fingerprint(inst_a->effective.lora_adapters) == first_fp);
+
+    mgr.terminate();
+    fs::remove_all(dir, ec);
+}
+
+// M6 setup: pool with a slot-save dir, one built instance with file1 attached,
+// loops (scheduler + pool I/O worker) running. returns the adapter file path.
+static std::string test_m6_setup(server_instances & mgr, const common_params & base, const std::string & dir) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    std::string file1;
+    std::string file2;
+    test_write_lora_pair(base, dir, file1, file2);
+
+    common_params params = base;
+    params.n_ctx          = 256;
+    params.n_parallel     = 1;
+    params.warmup         = false;
+    params.slot_save_path = (fs::path(dir) / "slots").string() + "/";
+    assert(mgr.load(params));
+
+    assert(mgr.handle_post_instances(test_req({}, "/instances",
+        safe_json_to_str({ { "name", "a" }, { "ctx_size", 256 } })))->status == 201);
+    assert(mgr.handle_post_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", file1 } })))->status == 200);
+    mgr.start_loops();
+    return file1;
+}
+
+static server_http_res_ptr test_m6_switch(server_instances & mgr, const std::string & snapshot) {
+    auto forward = [](server_routes & routes, const server_http_req & req) {
+        return routes.get_props(req);
+    };
+    return mgr.dispatch(test_req({}, "/completion", safe_json_to_str({
+        { "model",    mgr.base_name + ":a" },
+        { "snapshot", snapshot },
+    })), forward);
+}
+
+// the save stamps the live adapter fingerprint into the file.
+static void test_snapshot_records_fp(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m6-record").string();
+
+    server_instances mgr;
+    test_m6_setup(mgr, base, dir);
+
+    assert(mgr.handle_post_instance_snapshot(test_req({ { "name", "a" } },
+        "/instances/a/snapshot", safe_json_to_str({ { "name", "w1" } })))->status == 201);
+
+    auto inst = test_find(mgr, "a");
+    assert(inst && inst->built);
+    const std::string live_fp = common_lora_fingerprint(inst->effective.lora_adapters);
+    assert(!live_fp.empty());
+
+    auto st = server_snapshot_read_status(mgr.snapshot_instance_path("a", "w1"));
+    assert(st.status == server_snapshot_status::OK && st.data.has_value());
+    assert(st.data->adapter_fp == live_fp);
+
+    mgr.terminate();
+    fs::remove_all(dir, ec);
+}
+
+// a snapshot saved under a different adapter set is rejected on switch.
+static void test_snapshot_mismatch_400(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m6-mismatch").string();
+
+    server_instances mgr;
+    test_m6_setup(mgr, base, dir);
+
+    assert(mgr.handle_post_instance_snapshot(test_req({ { "name", "a" } },
+        "/instances/a/snapshot", safe_json_to_str({ { "name", "w1" } })))->status == 201);
+
+    // w2 carries w1's valid KV under a foreign fingerprint
+    auto st = server_snapshot_read_status(mgr.snapshot_instance_path("a", "w1"));
+    assert(st.status == server_snapshot_status::OK && st.data.has_value());
+    server_snapshot_data foreign = std::move(*st.data);
+    foreign.adapter_fp = "0123456789abcdef";
+    assert(server_snapshot_write(mgr.snapshot_instance_path("a", "w2"), foreign));
+
+    auto res = test_m6_switch(mgr, "w2");
+    assert(res->status == 400);
+    assert(res->data.find("adapter") != std::string::npos);
+
+    mgr.terminate();
+    fs::remove_all(dir, ec);
+}
+
+// a pre-v2 file (no fingerprint at all) restores with a warning, not an error.
+static void test_snapshot_prev2_allows(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m6-prev2").string();
+
+    server_instances mgr;
+    test_m6_setup(mgr, base, dir);
+
+    assert(mgr.handle_post_instance_snapshot(test_req({ { "name", "a" } },
+        "/instances/a/snapshot", safe_json_to_str({ { "name", "w1" } })))->status == 201);
+
+    // w3: w1's valid KV as a real v1 file (no fp field on disk)
+    auto st = server_snapshot_read_status(mgr.snapshot_instance_path("a", "w1"));
+    assert(st.status == server_snapshot_status::OK && st.data.has_value());
+    test_write_snapshot_v1(mgr.snapshot_instance_path("a", "w3"),
+                           st.data->n_ctx_seq, st.data->tokens, st.data->kv);
+    auto check = server_snapshot_read_status(mgr.snapshot_instance_path("a", "w3"));
+    assert(check.status == server_snapshot_status::OK && check.data.has_value());
+    assert(check.data->adapter_fp.empty());
+
+    auto res = test_m6_switch(mgr, "w3");
+    assert(res->status == 200);
+
+    mgr.terminate();
+    fs::remove_all(dir, ec);
+}
+
+// adapter drift between save and restore is rejected: save attached, detach,
+// then restoring the attached-fp snapshot fails.
+static void test_snapshot_drift_400(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m6-drift").string();
+
+    server_instances mgr;
+    const std::string file1 = test_m6_setup(mgr, base, dir);
+
+    assert(mgr.handle_post_instance_snapshot(test_req({ { "name", "a" } },
+        "/instances/a/snapshot", safe_json_to_str({ { "name", "w1" } })))->status == 201);
+    assert(mgr.handle_delete_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", file1 } })))->status == 200);
+
+    auto res = test_m6_switch(mgr, "w1");
+    assert(res->status == 400);
+    assert(res->data.find("adapter") != std::string::npos);
+
+    mgr.terminate();
+    fs::remove_all(dir, ec);
+}
+
+// live aggregate parity: two live managers (one with a real attached adapter)
+// plus a mock child envelope advertising adapter bytes, merged through the
+// production router merge. merged adapter is the sum; merged total is the sum
+// of the adapter-inclusive child totals, never re-added.
+static void test_live_merge_adapter_parity(const common_params & base) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string dir = (fs::temp_directory_path(ec) / "llama-m13-live").string();
+    fs::remove_all(dir, ec);
+    std::string file1;
+    std::string file2;
+    test_write_lora_pair(base, dir, file1, file2);
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req list_req { {}, {}, "/instances", "", "", {}, no_stop };
+
+    // live server one: a window with a real attached adapter
+    common_params params_a = base;
+    params_a.n_ctx      = 256;
+    params_a.n_parallel = 1;
+    params_a.warmup     = false;
+    server_instances mgr_a;
+    assert(mgr_a.load(params_a));
+    assert(mgr_a.handle_post_instances(test_req({}, "/instances",
+        safe_json_to_str({ { "name", "a" }, { "ctx_size", 256 } })))->status == 201);
+    assert(mgr_a.handle_post_instance_adapters(test_req({ { "name", "a" } },
+        "/instances/a/adapters", safe_json_to_str({ { "path", file1 } })))->status == 200);
+    const json env_a = json::parse(mgr_a.handle_get_instances(list_req)->data);
+    assert(env_a["total"]["adapter"].get<uint64_t>() > 0);
+
+    // live server two: a plain window, no adapters
+    common_params params_b = base;
+    params_b.n_ctx      = 256;
+    params_b.n_parallel = 1;
+    params_b.warmup     = false;
+    server_instances mgr_b;
+    assert(mgr_b.load(params_b));
+    assert(mgr_b.handle_post_instances(test_req({}, "/instances",
+        safe_json_to_str({ { "name", "b" }, { "ctx_size", 256 } })))->status == 201);
+    const json env_b = json::parse(mgr_b.handle_get_instances(list_req)->data);
+    assert(env_b["total"]["adapter"] == 0);
+
+    // mock router child: a canned envelope advertising adapter bytes
+    const json env_m = {
+        { "instances", json::array({ json{ { "id", "mock:m" } } }) },
+        { "snapshots", json::array({ json{ { "name", "s1" } } }) },
+        { "total",     json{ { "model", 50 }, { "context", 6 }, { "compute", 3 }, { "adapter", 40 }, { "total", 99 } } },
+    };
+
+    const json out = server_models_merge_instances({
+        { mgr_a.base_name, env_a },
+        { mgr_b.base_name, env_b },
+        { "mock",          env_m },
+    });
+
+    const uint64_t ad_a = env_a["total"]["adapter"].get<uint64_t>();
+    const uint64_t t_a  = env_a["total"]["total"].get<uint64_t>();
+    const uint64_t t_b  = env_b["total"]["total"].get<uint64_t>();
+    const json total = out["total"];
+    assert(total["adapter"] == ad_a + 40);
+    assert(total["total"] == t_a + t_b + 99);
+    assert(total["total"] == total["model"].get<uint64_t>() + total["context"].get<uint64_t>() +
+                             total["compute"].get<uint64_t>() + total["adapter"].get<uint64_t>());
+    // rows: live rows pass through, the mock snapshot gains its model tag
+    assert(out["instances"].size() == env_a["instances"].size() + env_b["instances"].size() + 1);
+    assert(out["snapshots"].size() == 1);
+    assert(out["snapshots"][0]["model"] == "mock");
+
+    mgr_a.terminate();
+    mgr_b.terminate();
+    fs::remove_all(dir, ec);
+}
+
 int main(int argc, char ** argv) {
     test_instances_parse_round_trip();
+    test_instances_lora_multi_scale();
+    test_instances_lora_separators();
+    test_instances_lora_compat();
+    test_instances_lora_round_trip();
+    test_instances_lora_validate();
+    test_debt_ledger_visible();
     test_instances_parse_errors();
     test_instances_parse_valid_names();
     test_instance_params();
@@ -498,7 +1756,28 @@ int main(int argc, char ** argv) {
     }
 
     ggml_backend_load_all();
+    test_queue_stop_cancels_pending();
+    test_get_lora_adapters_round_trip(params);
+    test_pool_adapter_shared_ptr(params);
+    test_pool_adapter_fingerprint(params);
+    test_pool_adapter_detach_reattach(params);
+    test_pool_adapter_concurrent_detach_snapshot(params);
+    test_pool_adapter_resize_borrowed(params);
+    test_destroy_carries_debt(params);
+    test_resize_no_debt(params);
+    test_adapter_bytes_identities(params);
+    test_adapter_bytes_unbuilt_zero(params);
+    test_adapter_bytes_pool_shared(params);
+    test_oom_text_create_resize(params);
+    test_snapshot_records_fp(params);
+    test_snapshot_mismatch_400(params);
+    test_snapshot_prev2_allows(params);
+    test_snapshot_drift_400(params);
+    test_instances_lora_normalize(params);
+    test_live_merge_adapter_parity(params);
     test_borrowed_model(params);
+    test_scheduler_timeout_cancels_pending(params);
+    test_instances_envelope_built_unbuilt(params);
     test_demand_build_starts_one_loop(params);
     test_start_loops_skips_unbuilt(params);
     test_resize_teardown_rebuild(params);

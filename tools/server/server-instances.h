@@ -26,6 +26,24 @@
 // applies it after the null-model check.
 bool server_should_warn_huge_implicit_ctx(int32_t effective_n_ctx, int32_t n_ctx_train);
 
+// per-instance adapter debt record: entries outlive the window they describe,
+// so a later reuse of the name can never resurrect them. plain data, no locks;
+// the owning instance serializes access under server_instances::mutex_mgmt.
+struct debt_ledger {
+    struct entry {
+        std::string instance;
+        std::string task;
+        int64_t     t_ms;
+    };
+    void add(std::string instance, std::string task, int64_t t_ms) {
+        entries.push_back({ std::move(instance), std::move(task), t_ms });
+    }
+    size_t size() const {
+        return entries.size();
+    }
+    std::vector<entry> entries;
+};
+
 // one named context sharing a pool's loaded weights. owns the effective params
 // (referenced by server_routes), the server_context, and the server_routes.
 struct server_instance {
@@ -73,6 +91,10 @@ struct server_instance {
     // for allocation failure (caller maps to 507). set only by
     // build_context_default; injected test builders leave it false.
     bool adapter_failed    = false;
+    // adapter debts carried past teardown: destroy records one entry AFTER the
+    // running=false flip (see destroy_instance). instance-private; guarded by
+    // server_instances::mutex_mgmt like effective.
+    std::vector<std::string> adapter_debts;
 };
 
 // manages the pool: one shared model load, many named contexts (instances).

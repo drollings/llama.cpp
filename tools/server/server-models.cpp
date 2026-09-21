@@ -1548,7 +1548,7 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
 json server_models_merge_instances(const std::vector<std::pair<std::string, json>> & per_model) {
     json instances = json::array();
     json snapshots = json::array();
-    uint64_t total_model = 0, total_context = 0, total_compute = 0, total_total = 0;
+    uint64_t total_model = 0, total_context = 0, total_compute = 0, total_adapter = 0, total_total = 0;
     const auto sat_add = [](uint64_t a, uint64_t b) {
         return a > UINT64_MAX - b ? UINT64_MAX : a + b;
     };
@@ -1596,6 +1596,9 @@ json server_models_merge_instances(const std::vector<std::pair<std::string, json
             total_model   = sat_add(total_model,   field_u64(t, "model"));
             total_context = sat_add(total_context, field_u64(t, "context"));
             total_compute = sat_add(total_compute, field_u64(t, "compute"));
+            total_adapter = sat_add(total_adapter, field_u64(t, "adapter"));
+            // each child total already includes its adapters: sum verbatim,
+            // never re-add the legs here
             total_total   = sat_add(total_total,   field_u64(t, "total"));
         }
     }
@@ -1607,6 +1610,7 @@ json server_models_merge_instances(const std::vector<std::pair<std::string, json
               { "model",   total_model   },
               { "context", total_context },
               { "compute", total_compute },
+              { "adapter", total_adapter },
               { "total",   total_total   },
           }                                     },
     };
@@ -1919,9 +1923,9 @@ void server_child::notify_to_router(const std::string & state, const json & payl
 // RAII wrapper similar to server_response_reader, but doesn't use server_queue
 static std::atomic<int> sse_client_id_counter = 0;
 struct server_models_sse_client {
-    server_response & queue_results;
+    server_result_queue<server_task_result_ptr> & queue_results;
     int client_id;
-    server_models_sse_client(server_response & q)
+    server_models_sse_client(server_result_queue<server_task_result_ptr> & q)
             : queue_results(q), client_id(sse_client_id_counter.fetch_add(1, std::memory_order_relaxed)) {
         SRV_DBG("new SSE client connected, assigned client_id=%d\n", client_id);
         queue_results.add_waiting_task_id(client_id);

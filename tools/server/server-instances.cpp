@@ -59,6 +59,33 @@ static void warn_if_huge_implicit_ctx(const llama_model * model, const common_pa
             instance_name, n_ctx_train, (double) kv_elems * bytes_per / 1073741824.0);
 }
 
+// read-back agreement for an adapter-set switch: the scheduler's committed set
+// must equal the manager's expected list. on drift the expected set is posted
+// once more; false = still diverged or a bound expired (caller answers
+// retriable). fingerprints are computed on demand, so a successful re-apply
+// makes every later fingerprint observe the corrected set.
+static bool verify_attached(server_instance & inst, int64_t deadline_ms) {
+    auto installed = inst.ctx_server->get_lora_adapters(deadline_ms);
+    if (installed && are_lora_sets_identical(*installed, inst.effective.lora_adapters)) {
+        return true;
+    }
+    auto result = inst.ctx_server->set_lora_adapters(inst.effective.lora_adapters, deadline_ms);
+    if (!result || result->is_error()) {
+        return false;
+    }
+    installed = inst.ctx_server->get_lora_adapters(deadline_ms);
+    return installed && are_lora_sets_identical(*installed, inst.effective.lora_adapters);
+}
+
+// adapter-debt guards: destroy records the debt, later milestones reconcile it.
+[[maybe_unused]] static bool has_adapter_debt(const server_instance & inst) {
+    return !inst.adapter_debts.empty();
+}
+
+[[maybe_unused]] static void clear_adapter_debts(server_instance & inst) {
+    inst.adapter_debts.clear();
+}
+
 // RAII exclusive access for destroy/resize: set removing = true, wait for in-flight
 // dispatches to drain, then restore the flag on scope exit.
 struct instance_drain_guard {
@@ -925,7 +952,8 @@ json server_instances::instance_to_json(const server_instance & inst,
         // this instance's own adapter footprint (a shared entry counts toward every
         // instance referencing it: evicting any one of them does not free it)
         { "adapter_bytes", adapter_bytes },
-        { "total_bytes", model_bytes + context_bytes + compute_bytes },
+        // every leg of the window adds up, adapters included
+        { "total_bytes", model_bytes + context_bytes + compute_bytes + adapter_bytes },
         // documented alias kept for the list() contract: context + compute
         { "vram_bytes", context_bytes + compute_bytes },
         { "last_used", t_last_used },
@@ -1545,6 +1573,19 @@ server_http_res_ptr server_instances::destroy_instance(const std::string & name,
         return make_error(format_error_response("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND));
     }
 
+    // the debt outlives the window: a later reuse of this name must never
+    // resurrect it. recorded after the running=false flip above, while the
+    // window's refs are still observable.
+    {
+        size_t refs = 0;
+        for (const auto & la : inst->effective.lora_adapters) {
+            refs += (la.ptr != nullptr);
+        }
+        inst->adapter_debts.push_back(instance_id(*inst) + " destroy t=" + std::to_string(ggml_time_ms()) +
+                                      " use=" + std::to_string(inst.use_count()) +
+                                      " refs=" + std::to_string(refs));
+    }
+
     // an unbuilt window never started a scheduler and owns no context: nothing to
     // abort, drain or join (no dispatch can be inside it: ensure_built_instance only
     // reports success once built is set)
@@ -1635,13 +1676,25 @@ server_http_res_ptr server_instances::resize_instance(const std::string & name, 
     inst->ctx_server->abort_slots("instance '" + name + "' resized");
     {
         instance_drain_guard guard(*this, inst);
+        // pin the post-resize adapter entries BEFORE the teardown drops the old
+        // refs: the overlapping refs keep shared entries alive, so the rebuild
+        // borrows them instead of reloading the files. a resolve failure answers
+        // 400 with the window untouched (never a destructive teardown for a
+        // predictable failure).
+        const int32_t prev_ctx = inst->cfg.ctx_size;
+        inst->cfg.ctx_size = new_ctx;
+        auto pinned = resolve_adapter_set(inst->cfg);
+        if (!pinned) {
+            inst->cfg.ctx_size = prev_ctx;
+            return make_error("failed to load lora adapter for instance '" + name + "'", ERROR_TYPE_INVALID_REQUEST);
+        }
         teardown_instance_context(*inst);
 
-        inst->cfg.ctx_size = new_ctx;
         if (!build_context_into(*inst)) {
             // the rebuild failed: a well-defined unbuilt window at the new size.
             // a later demand retries the build instead of serving a dangling context.
             // teardown already released the old refs; a resolve failure took none.
+            release_adapter_set(*pinned);
             IST_ERR("failed to resize instance '%s' to ctx = %d, leaving it unbuilt\n", name.c_str(), new_ctx);
             if (inst->adapter_failed) {
                 return make_error("failed to load lora adapter for instance '" + name + "'", ERROR_TYPE_INVALID_REQUEST);
@@ -1649,6 +1702,8 @@ server_http_res_ptr server_instances::resize_instance(const std::string & name, 
             return make_error(507, "insufficient_memory_error",
                               "failed to resize instance '" + name + "', not enough device memory");
         }
+        // the build resolved its own refs; drop the pins
+        release_adapter_set(*pinned);
 
         // the window was rebuilt (bindings were dropped with the old context);
         // start the scheduler exactly once under the dispatch lock
@@ -2156,6 +2211,13 @@ server_http_res_ptr server_instances::handle_post_instance_adapters(const server
         }
         return make_error("timed out applying the adapter set", ERROR_TYPE_UNAVAILABLE);
     }
+    // read-back agreement: the committed set must equal the expected list.
+    // no rollback here: the set above succeeded, so the lists already describe
+    // the scheduler; a failed read-back is answered retriable and the idempotent
+    // retry re-verifies.
+    if (!verify_attached(*inst, snapshot_deadline_ms(*inst))) {
+        return make_error("could not verify the adapter set", ERROR_TYPE_UNAVAILABLE);
+    }
 
     // the swap invalidated every slot's live KV (the scheduler cleared the prompts)
     // AND the recorded bindings: bound slots would otherwise keep serving KV computed
@@ -2286,6 +2348,13 @@ server_http_res_ptr server_instances::handle_delete_instance_adapters(const serv
         inst->effective.lora_adapters = effective_prev;
         inst->cfg.lora                = cfg_prev;
         return make_error("timed out applying the adapter set", ERROR_TYPE_UNAVAILABLE);
+    }
+    // read-back agreement: the committed set must equal the expected list.
+    // no rollback here: the set above succeeded, so the lists already describe
+    // the scheduler; a failed read-back is answered retriable and the idempotent
+    // retry re-verifies.
+    if (!verify_attached(*inst, snapshot_deadline_ms(*inst))) {
+        return make_error("could not verify the adapter set", ERROR_TYPE_UNAVAILABLE);
     }
     release_adapter_set(removed); // frees at refcount 0 while the model is alive
     {

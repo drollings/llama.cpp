@@ -39,8 +39,6 @@
 #include <windows.h>
 #endif
 
-constexpr int HTTP_POLLING_SECONDS = 1;
-
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -856,8 +854,8 @@ public:
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
 
-    server_queue    queue_tasks;
-    server_response queue_results;
+    server_queue                                queue_tasks;
+    server_result_queue<server_task_result_ptr> queue_results;
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
@@ -4451,7 +4449,7 @@ server_context_meta server_context::get_meta() const {
 // may have bypass_sleep = true if the task does not use ctx_server
 struct server_res_generator : server_res_spipe {
     server_response_reader rd;
-    server_res_generator(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds, bool bypass_sleep = false)
+    server_res_generator(server_queue & queue_tasks, server_result_queue<server_task_result_ptr> & queue_results, int sleep_idle_seconds, bool bypass_sleep = false)
             : rd(queue_tasks, queue_results, HTTP_POLLING_SECONDS) {
         // fast path in case sleeping is disabled
         bypass_sleep |= sleep_idle_seconds < 0;
@@ -4505,7 +4503,12 @@ server_task_result_ptr server_context::run_scheduler_task(server_task && task, c
     server_response_reader rd = impl->get_response_reader();
     task.id                  = rd.get_new_id();
     rd.post_task(std::move(task));
-    return rd.next(should_stop);
+    auto result = rd.next(should_stop);
+    if (result == nullptr) {
+        // drop the timed-out task so it can never run late
+        rd.stop();
+    }
+    return result;
 }
 
 server_task_result_ptr server_context::slot_save_copy(int id_slot, int64_t deadline_ms) {
@@ -4538,6 +4541,25 @@ server_task_result_ptr server_context::set_lora_adapters(std::vector<common_adap
     return run_scheduler_task(std::move(task), [deadline_ms]() {
         return deadline_ms >= 0 && ggml_time_ms() >= deadline_ms;
     });
+}
+
+std::optional<std::vector<common_adapter_lora_info>> server_context::get_lora_adapters(int64_t deadline_ms) {
+    server_task task(SERVER_TASK_TYPE_GET_LORA);
+
+    auto result = run_scheduler_task(std::move(task), [deadline_ms]() {
+        return deadline_ms >= 0 && ggml_time_ms() >= deadline_ms;
+    });
+    if (result == nullptr) {
+        return std::nullopt;
+    }
+    auto * loras = dynamic_cast<server_task_result_get_lora *>(result.get());
+    GGML_ASSERT(loras != nullptr);
+    std::vector<common_adapter_lora_info> out;
+    out.reserve(loras->loras.size());
+    for (auto & lora : loras->loras) {
+        out.push_back(lora.info);
+    }
+    return out;
 }
 
 server_task_result_ptr server_context::instance_op(const std::function<json()> & op) {

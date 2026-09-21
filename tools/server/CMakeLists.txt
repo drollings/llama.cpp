@@ -10,6 +10,8 @@ endif()
 
 # server-context containing the core server logic, used by llama-server and CLI
 
+find_package(SQLite3 REQUIRED)
+
 set(TARGET server-context)
 
 add_library(${TARGET} STATIC
@@ -23,6 +25,8 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-database.cpp
+    server-database.h
     server-instances.cpp
     server-instances.h
     server-snapshot.cpp
@@ -43,7 +47,7 @@ endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PUBLIC llama-common mtmd SQLite3::SQLite3 ${CMAKE_THREAD_LIBS_INIT})
 
 if (LLAMA_SERVER_PCH)
     target_precompile_headers(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/common/common.h)

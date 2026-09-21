@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 
 struct server_context_impl; // private implementation
@@ -152,6 +153,11 @@ struct server_context {
     server_task_result_ptr set_lora_adapters(std::vector<common_adapter_lora_info> adapters,
                                              int64_t deadline_ms);
 
+    // bounded read of the scheduler's installed adapter list, through the same
+    // choke point as the writers. nullopt on timeout (not observed, distinct
+    // from an observed empty set). no new task type: reuses GET_LORA.
+    std::optional<std::vector<common_adapter_lora_info>> get_lora_adapters(int64_t deadline_ms);
+
     // manager-only: run `op` on this instance's scheduler thread, serialized with all
     // other tasks (context lifetime is not thread-safe). `op` returns the JSON payload
     // and throws with a message to signal an error; the caller gets a
@@ -240,7 +246,7 @@ private:
     server_context_impl & ctx_server;
 
     server_queue & queue_tasks;
-    server_response & queue_results;
+    server_result_queue<server_task_result_ptr> & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
 
     // cached responses, to be used during sleep
