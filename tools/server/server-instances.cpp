@@ -65,6 +65,7 @@ static void warn_if_huge_implicit_ctx(const llama_model * model, const common_pa
 // retriable). fingerprints are computed on demand, so a successful re-apply
 // makes every later fingerprint observe the corrected set.
 static bool verify_attached(server_instance & inst, int64_t deadline_ms) {
+    // effective.lora_adapters: callers hold mutex_mgmt and the instance_drain_guard
     auto installed = inst.ctx_server->get_lora_adapters(deadline_ms);
     if (installed && are_lora_sets_identical(*installed, inst.effective.lora_adapters)) {
         return true;
@@ -203,6 +204,10 @@ bool server_instances::load(const common_params & params) {
         // guardrail at registration: a huge implicit window is almost never intended,
         // and this is the first line an operator sees for it (before any demand builds it)
         warn_if_huge_implicit_ctx(model, inst->effective, cfg.name.c_str());
+
+        // publish the display caches before the instance is reachable from the vector
+        inst->n_ctx_effective.store(inst->effective.n_ctx, std::memory_order_relaxed);
+        inst->n_parallel_effective.store(inst->effective.n_parallel, std::memory_order_relaxed);
 
         instances.push_back(std::move(inst));
 
@@ -358,7 +363,7 @@ server_instances::resolve_target server_instances::resolve(const std::string & m
 // the one place the fresh policy is defined: last_used_us == -1 sorts a cold
 // member before any used member among equally-busy candidates.
 static server_context_stats instance_stats(const server_instance & inst) {
-    if (!inst.built) {
+    if (!inst.built.load(std::memory_order_acquire)) {
         return server_context_stats{};
     }
     return inst.ctx_server->get_stats();
@@ -405,12 +410,12 @@ std::optional<size_t> server_instances::pick_best_available(const std::string & 
         // a pool-wide shutdown has begun, so a group waiter never picks a dying instance.
         // unbuilt members have no slots yet; group demand materializes the first one
         // (see dispatch_group) instead of picking it here.
-        if (inst.cfg.group != group || inst.removing || !inst.running || !inst.built) {
+        if (inst.cfg.group != group || inst.removing || !inst.running || !inst.built.load(std::memory_order_acquire)) {
             continue;
         }
 
         const server_context_stats stats = instance_stats(inst);
-        members.push_back({ i, inst.effective.n_parallel, stats.n_processing, stats.last_used_us });
+        members.push_back({ i, inst.n_parallel_effective.load(std::memory_order_relaxed), stats.n_processing, stats.last_used_us });
     }
     return pick_best_candidate(members);
 }
@@ -566,7 +571,7 @@ server_http_res_ptr server_instances::dispatch_group(const server_http_req & req
                 // no built member has a free slot: materialize the first registered
                 // member instead of waiting. one demand builds exactly one window.
                 for (const auto & it : instances) {
-                    if (it->cfg.group == group && !it->built && !it->removing && it->running) {
+                    if (it->cfg.group == group && !it->built.load(std::memory_order_acquire) && !it->removing && it->running) {
                         unbuilt = it;
                         break;
                     }
@@ -928,11 +933,12 @@ void server_instances::apply_identity(server_instance & inst) {
 }
 
 int32_t server_instances::displayed_n_ctx(const server_instance & inst) const {
-    if (inst.built) {
+    if (inst.built.load(std::memory_order_acquire)) {
         return inst.ctx_server->get_n_ctx();
     }
-    if (inst.effective.n_ctx > 0) {
-        return inst.effective.n_ctx;
+    const int32_t cached = inst.n_ctx_effective.load(std::memory_order_relaxed);
+    if (cached > 0) {
+        return cached;
     }
     return train_ctx_cached.load(std::memory_order_relaxed);
 }
@@ -955,7 +961,7 @@ json server_instances::instance_to_json(const server_instance & inst) const {
     // (create/resize/pin paths) or takes it first (get_instances_json below)
     const uint64_t adapter_bytes = instance_adapter_bytes(inst);
     // an unbuilt (registered but never demanded) window owns no buffers yet
-    if (!inst.built) {
+    if (!inst.built.load(std::memory_order_acquire)) {
         return instance_to_json(inst, 0, 0, 0, adapter_bytes);
     }
     // all memory fields derive from the three instance getters (single source of truth)
@@ -978,11 +984,11 @@ json server_instances::instance_to_json(const server_instance & inst,
         { "aliases", instance_aliases(inst.cfg.name, inst.cfg.group) },
         { "group", inst.cfg.group },
         { "n_ctx", displayed_n_ctx(inst) },
-        { "parallel", inst.effective.n_parallel },
+        { "parallel", inst.n_parallel_effective.load(std::memory_order_relaxed) },
         { "pinned", inst.cfg.pinned },
         { "is_default", inst.cfg.is_default },
         // unbuilt = registered but never demanded; its window (and bytes) do not exist yet
-        { "state", inst.built ? "loaded" : "unloaded" },
+        { "state", inst.built.load(std::memory_order_acquire) ? "loaded" : "unloaded" },
         // memory breakdown
         { "model_bytes", model_bytes },
         { "context_bytes", context_bytes },
@@ -1005,39 +1011,49 @@ json server_instances::get_instances_json() const {
     uint64_t total_model   = 0;
     uint64_t total_context = 0;
     uint64_t total_compute = 0;
+    uint64_t total_adapter = 0;
     bool     model_counted = false;
 
     // mgmt first (lock order mgmt -> dispatch): adapter accounting reads the
-    // registry and effective.lora_adapters, both mgmt-guarded
-    std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
+    // registry and effective.lora_adapters, both mgmt-guarded. the scope covers
+    // exactly the instance rows, the totals and the registry sum; the snapshot
+    // listing below does file I/O and must NOT hold this lock, because
+    // GET /instances is the router's polling endpoint and slow storage would
+    // otherwise serialize create/destroy/resize behind every poll.
     {
-        std::lock_guard<std::mutex> lock(mutex_dispatch);
-        for (const auto & inst : instances) {
-            // unbuilt windows own no buffers; they contribute identity with zero bytes
-            const uint64_t model_bytes   = inst->built ? inst->ctx_server->get_model_bytes()   : 0;
-            const uint64_t context_bytes = inst->built ? inst->ctx_server->get_context_bytes() : 0;
-            const uint64_t compute_bytes = inst->built ? inst->ctx_server->get_compute_bytes() : 0;
-            const uint64_t adapter_bytes = instance_adapter_bytes(*inst);
+        std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
+        {
+            std::lock_guard<std::mutex> lock(mutex_dispatch);
+            for (const auto & inst : instances) {
+                // unbuilt windows own no buffers; they contribute identity with zero bytes.
+                // both locks are held here (mgmt -> dispatch), so the context is stable
+                const bool     is_built      = inst->built.load(std::memory_order_acquire);
+                const uint64_t model_bytes   = is_built ? inst->ctx_server->get_model_bytes()   : 0;
+                const uint64_t context_bytes = is_built ? inst->ctx_server->get_context_bytes() : 0;
+                const uint64_t compute_bytes = is_built ? inst->ctx_server->get_compute_bytes() : 0;
+                const uint64_t adapter_bytes = instance_adapter_bytes(*inst);
 
-            instances_arr.push_back(instance_to_json(*inst, model_bytes, context_bytes, compute_bytes, adapter_bytes));
+                instances_arr.push_back(instance_to_json(*inst, model_bytes, context_bytes, compute_bytes, adapter_bytes));
 
-            if (!model_counted && model_bytes > 0) {
-                total_model += model_bytes;
-                model_counted = true;
+                if (!model_counted && model_bytes > 0) {
+                    total_model += model_bytes;
+                    model_counted = true;
+                }
+                total_context += context_bytes;
+                total_compute += compute_bytes;
             }
-            total_context += context_bytes;
-            total_compute += compute_bytes;
+        }
+
+        // pool-wide adapter footprint: each registry file counted once
+        for (const auto & kv : adapter_registry) {
+            total_adapter += llama_adapter_lora_buf_size(kv.second.adapter.get());
         }
     }
 
-    // pool-wide adapter footprint: each registry file counted once
-    uint64_t total_adapter = 0;
-    for (const auto & kv : adapter_registry) {
-        total_adapter += llama_adapter_lora_buf_size(kv.second.adapter.get());
-    }
-
     // snapshots are on-disk and independent of the live instances; list them so a cold
-    // (weight-unloaded) pool's KV snapshots stay discoverable for reactivation
+    // (weight-unloaded) pool's KV snapshots stay discoverable for reactivation.
+    // this reads only params and base_name, both immutable after load(), so it runs
+    // unlocked and never serializes management behind slow snapshot storage.
     json snapshots = pool_snapshots_json();
 
     return json{
@@ -1302,6 +1318,9 @@ std::optional<std::vector<common_adapter_lora_info>> server_instances::resolve_a
         // fingerprint is stable across restarts and re-resolution
         la.path = adapter_key(la.path);
         la.ptr  = ptr;
+        // the report-only meta travels with the mirror so a GET shape stays
+        // consistent whether the entry came from a build or a refresh
+        common_adapter_lora_fill_meta(la);
     }
     return resolved;
 }
@@ -1398,10 +1417,21 @@ bool server_instances::build_context_into(server_instance & inst) {
     // guardrail before the allocation: a huge implicit window is almost never intended
     warn_if_huge_implicit_ctx(model, inst.effective, inst.cfg.name.c_str());
 
+    // publish the display caches for the unbuilt window (and again after a successful
+    // build, where they match the context exactly); the build below is not observable
+    // through `built` until the caller release-stores true
+    inst.n_ctx_effective.store(inst.effective.n_ctx, std::memory_order_relaxed);
+    inst.n_parallel_effective.store(inst.effective.n_parallel, std::memory_order_relaxed);
+
     return context_builder(inst);
 }
 
 void server_instances::teardown_instance_context(server_instance & inst) {
+    // close the barrier first: a lock-free reader that acquire-loads false after
+    // this point never touches ctx_server, and one that still sees true is held off
+    // by the drain guard the caller holds (`removing`), which also waits out every
+    // in-flight dispatch before the context is freed below
+    inst.built.store(false, std::memory_order_release);
     // abort first so in-flight generations finish promptly; the drain guard the
     // caller holds then waits only for stragglers, never a never-ending decode.
     // this abort stays unbounded on purpose: the only caller (resize) runs a
@@ -1426,7 +1456,6 @@ void server_instances::teardown_instance_context(server_instance & inst) {
     inst.effective.lora_adapters = common_instance_params(params, inst.cfg).lora_adapters;
     inst.slot_snapshots.clear();
     inst.mutex_snapshot.clear();
-    inst.built        = false;
     inst.loop_started = false;
 }
 
@@ -1458,12 +1487,16 @@ server_http_res_ptr server_instances::cold_reload_locked() {
     }
     // the registry drains at delete-last, so a cold pool never holds stale entries:
     // inherited adapters re-resolve from the config, not from old pointers. a
-    // non-empty registry here means a refcount accounting bug: debug builds stop
-    // on it, release builds log and refuse instead of crashing the process.
+    // non-empty registry here means a refcount accounting bug. debug builds abort
+    // loudly at the source; release builds must not take a live server down for an
+    // internal accounting bug, so they log and refuse with a retriable 507.
     if (!adapter_registry.empty()) {
-        GGML_ASSERT(adapter_registry.empty());
+#ifndef NDEBUG
+        GGML_ABORT("adapter registry not drained before cold reload");
+#else
         IST_ERR("cold reload with %zu leaked adapter entries, refusing\n", adapter_registry.size());
         return make_error(507, "insufficient_memory_error", "adapter registry is inconsistent, restart the server");
+#endif
     }
     common_params model_params = params;
     model_init                 = common_init_from_params(model_params, true);
@@ -1494,7 +1527,7 @@ server_http_res_ptr server_instances::ensure_built_instance(const std::shared_pt
 
     {
         std::lock_guard<std::mutex> lock(mutex_dispatch);
-        if (inst->built) {
+        if (inst->built.load(std::memory_order_acquire)) {
             return nullptr;
         }
         bool registered = false;
@@ -1540,9 +1573,10 @@ server_http_res_ptr server_instances::ensure_built_instance(const std::shared_pt
             return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
         }
         // start the scheduler only now that the instance is fully installed, so a
-        // racing terminate() cannot leak the thread
+        // racing terminate() cannot leak the thread. the release-store publishes the
+        // context writes above to any lock-free reader that acquire-loads built.
         start_instance_loop_locked(*inst);
-        inst->built = true;
+        inst->built.store(true, std::memory_order_release);
         cond_dispatch.notify_all();  // wake group waiters so the new window can be picked
     }
 
@@ -1600,8 +1634,8 @@ server_http_res_ptr server_instances::create_instance(const common_instance & cf
         }
         // explicitly created means explicitly demanded: push first, then start the
         // scheduler under the same lock, so terminate() cannot slip between them
-        // and leak a joinable thread
-        inst->built = true;
+        // and leak a joinable thread. release-store publishes the fresh context.
+        inst->built.store(true, std::memory_order_release);
         instances.push_back(inst);
         start_instance_loop_locked(*inst);
         cond_dispatch.notify_all();  // wake group waiters so the new member can be picked
@@ -1644,7 +1678,7 @@ server_http_res_ptr server_instances::destroy_instance(const std::string & name,
     // an unbuilt window never started a scheduler and owns no context: nothing to
     // abort, drain or join (no dispatch can be inside it: ensure_built_instance only
     // reports success once built is set)
-    if (inst->built) {
+    if (inst->built.load(std::memory_order_acquire)) {
         // abort in-flight generation, then drain the remaining dispatched requests so no
         // HTTP reader is left hanging when the scheduler is stopped below.
         // bounded: the management lock is held across this call, so a stalled
@@ -1727,10 +1761,13 @@ server_http_res_ptr server_instances::resize_instance(const std::string & name, 
             return make_error(format_error_response("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND));
         }
         // an unbuilt window has no context to rebuild: record the new size, it applies
-        // when the window materializes on first demand
-        if (!inst->built) {
+        // when the window materializes on first demand. the display cache follows the
+        // declaration so a concurrent reader never sees the old size
+        if (!inst->built.load(std::memory_order_acquire)) {
             inst->cfg.ctx_size = new_ctx;
             inst->effective     = common_instance_params(params, inst->cfg);
+            inst->n_ctx_effective.store(inst->effective.n_ctx, std::memory_order_relaxed);
+            inst->n_parallel_effective.store(inst->effective.n_parallel, std::memory_order_relaxed);
             IST_INF("instance '%s' resized to ctx = %d (applies on first demand)\n", name.c_str(), new_ctx);
             return make_ok(instance_to_json(*inst));
         }
@@ -1779,10 +1816,11 @@ server_http_res_ptr server_instances::resize_instance(const std::string & name, 
         release_adapter_set(*pinned);
 
         // the window was rebuilt (bindings were dropped with the old context);
-        // start the scheduler exactly once under the dispatch lock
+        // start the scheduler exactly once under the dispatch lock. the release-store
+        // publishes the rebuilt context to lock-free readers.
         std::lock_guard<std::mutex> lock(mutex_dispatch);
         start_instance_loop_locked(*inst);
-        inst->built = true;
+        inst->built.store(true, std::memory_order_release);
         cond_dispatch.notify_all();
     }
 
@@ -1831,19 +1869,111 @@ server_http_res_ptr server_instances::handle_get_health(const server_http_req & 
     }
     // a registered-but-undemanded default is healthy too, and probing it must NOT
     // materialize its window: orchestrators poll /health constantly, and a probe
-    // is not a demand
-    if (!inst->built) {
+    // is not a demand. the guard is taken BEFORE any field is read, so the shared_ptr
+    // cannot outlive a concurrent destroy/resize into a torn context.
+    active_route_guard guard(*this, *inst);
+    if (!guard.acquired) {
+        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
+    }
+    if (!inst->built.load(std::memory_order_acquire)) {
         return make_ok({
             { "status",    "ok"      },
             { "instances", (int) snapshot_instances().size() },
         });
     }
-    // every remaining instance is loaded by construction; a destroyed instance is removed
+    return inst->routes->get_health(req);
+}
+
+server_http_res_ptr server_instances::handle_get_metrics(const server_http_req & req) {
+    // a scrape is an observability read, never a demand: it must not materialize
+    // an unbuilt window. unlike /slots there is no aggregate form, because the
+    // metrics are context-local counters and merging them would invent a gauge
+    // policy; no target therefore means the default instance.
+    const std::string model_id       = req.get_param("model");
+    const std::string instance_field = req.get_param("instance");
+
+    std::shared_ptr<server_instance> inst;
+    if (model_id.empty() && instance_field.empty()) {
+        inst = default_instance();
+    } else {
+        std::string          error;
+        const resolve_target target = resolve(model_id, instance_field, error);
+        if (target.kind != target_kind::INSTANCE) {
+            return make_error(error.empty() ? "invalid instance for metrics" : error, ERROR_TYPE_INVALID_REQUEST);
+        }
+        inst = target.inst;
+    }
+    if (!inst) {
+        return make_error("no instances loaded", ERROR_TYPE_NOT_FOUND);
+    }
+    // the target window does not exist yet: render nothing rather than allocate
+    // it as a scrape side effect. this is an exact outcome condition, not a
+    // health or confidence score. the guard is taken first so a concurrent
+    // destroy/resize cannot turn this read into a torn context dereference.
     active_route_guard guard(*this, *inst);
     if (!guard.acquired) {
         return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
     }
-    return inst->routes->get_health(req);
+    if (!inst->built.load(std::memory_order_acquire)) {
+        return make_error("instance '" + inst->cfg.name + "' has no loaded context", ERROR_TYPE_NOT_FOUND);
+    }
+    return inst->routes->get_metrics(req);
+}
+
+json server_instances::instance_error_marker(const server_http_res_ptr & res, const std::string & name) {
+    json marker = { { "instance", name } };
+    try {
+        const json body = json::parse(res->data);
+        marker["error"] = (body.is_object() && body.contains("error")) ? body.at("error") : body;
+    } catch (const std::exception &) {
+        marker["error"] = res->status;
+    }
+    return marker;
+}
+
+std::vector<server_instances::per_instance_route_result> server_instances::collect_instance_routes(
+        const server_http_req & req,
+        server_http_context::handler_t server_routes::* handler) {
+    std::vector<per_instance_route_result> out;
+    for (const auto & inst : snapshot_instances()) {
+        // guard first, then read `built`: a concurrent destroy/resize refuses here
+        // instead of letting the field read race its teardown
+        active_route_guard guard(*this, *inst);
+        if (!guard.acquired) {
+            continue;  // being destroyed/resized; not reported at all
+        }
+        per_instance_route_result row;
+        row.inst  = inst;
+        // a registered-but-undemanded window is never materialized by a listing;
+        // the caller decides whether to show it as unloaded (models) or skip it (slots)
+        row.built = inst->built.load(std::memory_order_acquire);
+        if (!row.built) {
+            out.push_back(std::move(row));
+            continue;
+        }
+        // the hook is a test-only seam (null in production)
+        server_http_res_ptr res;
+        if (aggregate_route_hook) {
+            if (auto forced = aggregate_route_hook(*inst, req)) {
+                res = std::move(*forced);
+            }
+        }
+        if (!res) {
+            res = (inst->routes.get()->*handler)(req);
+        }
+        if (res->status != 200) {
+            row.error_marker = instance_error_marker(res, inst->cfg.name);
+        } else {
+            try {
+                row.body = json::parse(res->data);
+            } catch (const std::exception &) {
+                // a 200 whose body cannot be parsed is still a failing member
+                row.error_marker = instance_error_marker(res, inst->cfg.name);
+            }
+        }
+        out.push_back(std::move(row));
+    }
+    return out;
 }
 
 server_http_res_ptr server_instances::handle_get_slots(const server_http_req & req) {
@@ -1853,33 +1983,18 @@ server_http_res_ptr server_instances::handle_get_slots(const server_http_req & r
     // no target: aggregate the slots of every instance, tagged with the instance name
     if (model_id.empty() && instance_field.empty()) {
         json all_slots = json::array();
-        for (const auto & inst : snapshot_instances()) {
-            // unbuilt windows have no slots yet; listing them must not build them
-            if (!inst->built) {
+        for (auto & row : collect_instance_routes(req, &server_routes::get_slots)) {
+            if (!row.built) {
+                continue;  // unbuilt windows have no slots yet; listing must not build them
+            }
+            if (!row.body) {
+                // a dying member must not fail the whole aggregate: skip it with a
+                // marker row carrying the instance (router-visible, never silent)
+                all_slots.push_back(std::move(row.error_marker));
                 continue;
             }
-            active_route_guard guard(*this, *inst);
-            if (!guard.acquired) {
-                continue;  // being destroyed/resized; skip it
-            }
-            auto res = inst->routes->get_slots(req);
-            if (res->status != 200) {
-                // a dying member must not fail the whole aggregate: skip it
-                // with a marker row carrying the instance (router-visible,
-                // never silent). unbuilt/destroying members were already
-                // skipped above without a marker.
-                json marker = { { "instance", inst->cfg.name } };
-                try {
-                    const json body = json::parse(res->data);
-                    marker["error"] = (body.is_object() && body.contains("error")) ? body.at("error") : body;
-                } catch (const std::exception &) {
-                    marker["error"] = res->status;
-                }
-                all_slots.push_back(std::move(marker));
-                continue;
-            }
-            for (auto & slot : json::parse(res->data)) {
-                slot["instance"] = inst->cfg.name;
+            for (auto & slot : *row.body) {
+                slot["instance"] = row.inst->cfg.name;
                 all_slots.push_back(std::move(slot));
             }
         }
@@ -1959,7 +2074,8 @@ server_http_res_ptr server_instances::handle_get_props(const server_http_req & r
         json                        instances_arr = json::array();
         std::lock_guard<std::mutex> lock(mutex_dispatch);
         for (const auto & it : instances) {
-            total_slots += it->effective.n_parallel;
+            // the display cache is lock-free; cfg.name/group are immutable after registration
+            total_slots += it->n_parallel_effective.load(std::memory_order_relaxed);
             instances_arr.push_back({
                 { "name",  it->cfg.name        },
                 { "group", it->cfg.group       },
@@ -2042,39 +2158,32 @@ server_http_res_ptr server_instances::handle_get_models(const server_http_req & 
     // the legacy /models shape ({"models": [...], "object": "list", "data": [...]})
     json models = json::array();
     json data   = json::array();
-    for (const auto & inst : snapshot_instances()) {
+    for (auto & row : collect_instance_routes(req, &server_routes::get_models)) {
         // a registered-but-undemanded window is listed without building it: a mere
-        // listing must never materialize a context
-        if (!inst->built) {
+        // listing must never materialize a context. the display caches are lock-free
+        if (!row.built) {
             data.push_back({
-                { "id",       instance_id(*inst)        },
-                { "n_ctx",    displayed_n_ctx(*inst)    },
-                { "parallel", inst->effective.n_parallel },
+                { "id",       instance_id(*row.inst)    },
+                { "n_ctx",    displayed_n_ctx(*row.inst) },
+                { "parallel", row.inst->n_parallel_effective.load(std::memory_order_relaxed) },
                 { "status",   "unloaded"                },
             });
             continue;
         }
-        active_route_guard guard(*this, *inst);
-        if (!guard.acquired) {
-            continue;  // being destroyed/resized; skip it
+        // a failing built member no longer fails the whole aggregate: emit a marker
+        // row carrying the instance (router-visible, never silent)
+        if (!row.body) {
+            data.push_back(std::move(row.error_marker));
+            continue;
         }
-        auto res = inst->routes->get_models(req);
-        if (res->status != 200) {
-            return res;
+        for (auto & m : (*row.body)["models"]) {
+            models.push_back(std::move(m));
         }
-        try {
-            json entry = json::parse(res->data);
-            for (auto & m : entry["models"]) {
-                models.push_back(std::move(m));
-            }
-            for (auto & d : entry["data"]) {
-                d["n_ctx"]    = displayed_n_ctx(*inst);
-                d["parallel"] = inst->effective.n_parallel;
-                d["status"]   = "loaded";
-                data.push_back(std::move(d));
-            }
-        } catch (const std::exception & e) {
-            IST_WRN("failed to merge /models: %s\n", e.what());
+        for (auto & d : (*row.body)["data"]) {
+            d["n_ctx"]    = displayed_n_ctx(*row.inst);
+            d["parallel"] = row.inst->n_parallel_effective.load(std::memory_order_relaxed);
+            d["status"]   = "loaded";
+            data.push_back(std::move(d));
         }
     }
     return make_ok({
@@ -2111,7 +2220,39 @@ server_http_res_ptr server_instances::handle_get_lora_adapters(const server_http
 }
 
 server_http_res_ptr server_instances::handle_post_lora_adapters(const server_http_req & req) {
-    return default_instance_forward(req, &server_routes::post_lora_adapters);
+    // the legacy writer commits to the scheduler through the stock handler (its
+    // body grammar and zero-for-unlisted scale semantics stay the only
+    // implementation). the manager mirror is then refreshed from the scheduler,
+    // so the next attach does not re-apply a stale scale.
+    std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
+
+    auto inst = default_instance();
+    if (!inst) {
+        return make_error("no instances loaded", ERROR_TYPE_NOT_FOUND);
+    }
+    // the legacy grammar needs a scheduler to apply to; an unbuilt default is the
+    // same tier as save-to-unbuilt (404)
+    if (!inst->built.load(std::memory_order_acquire)) {
+        return make_error("instance '" + inst->cfg.name + "' has no loaded context", ERROR_TYPE_NOT_FOUND);
+    }
+    active_route_guard guard(*this, *inst);
+    if (!guard.acquired) {
+        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
+    }
+    auto res = inst->routes->post_lora_adapters(req);
+    if (res->status != 200) {
+        return res;
+    }
+    if (!refresh_effective_from_scheduler(*inst, snapshot_deadline_ms(*inst))) {
+        return make_error("could not read the committed adapter set", ERROR_TYPE_UNAVAILABLE);
+    }
+    // the scale is part of the snapshot fingerprint: bound slots would otherwise
+    // keep serving KV computed under the old adapters
+    {
+        std::lock_guard<std::mutex> lock(mutex_dispatch);
+        inst->slot_snapshots.assign(inst->slot_snapshots.size(), std::string());
+    }
+    return res;
 }
 
 //
@@ -2184,6 +2325,25 @@ server_http_res_ptr server_instances::handle_delete_instance(const server_http_r
     return destroy_instance(req.get_param("name"), !req.get_param("force").empty());
 }
 
+bool server_instances::refresh_effective_from_scheduler(server_instance & inst, int64_t deadline_ms) {
+    if (!inst.ctx_server) {
+        return false;
+    }
+    auto committed = inst.ctx_server->get_lora_adapters(deadline_ms);
+    if (!committed) {
+        return false;
+    }
+    // one committed list feeds both forms: the effective list (ptrs, meta) and
+    // the grammar list (path + scale) can therefore never drift apart
+    inst.effective.lora_adapters = std::move(*committed);
+    inst.cfg.lora.clear();
+    inst.cfg.lora.reserve(inst.effective.lora_adapters.size());
+    for (const auto & la : inst.effective.lora_adapters) {
+        inst.cfg.lora.emplace_back(la.path, la.scale);
+    }
+    return true;
+}
+
 server_http_res_ptr server_instances::swap_adapter_set(const std::shared_ptr<server_instance> & inst,
                                                        const adapter_set_mutator &               mutate) {
     // exclusive access while the set changes: the drain rejects new dispatches and
@@ -2192,6 +2352,13 @@ server_http_res_ptr server_instances::swap_adapter_set(const std::shared_ptr<ser
     // comes before the mutation because apply_snapshot reads the effective list
     // without the management lock while its dispatch is counted.
     instance_drain_guard guard(*this, inst);
+
+    // the scheduler owns the live set (a legacy POST writes it directly), so the
+    // mirror is refreshed before the mutation: an attach/detach is then additive
+    // over what the scheduler actually holds instead of reverting a legacy scale.
+    if (!refresh_effective_from_scheduler(*inst, snapshot_deadline_ms(*inst))) {
+        return make_error("could not read the committed adapter set", ERROR_TYPE_UNAVAILABLE);
+    }
 
     // rollback copies: the lists stay untouched until the synchronous apply succeeds
     const auto cfg_prev       = inst->cfg.lora;
@@ -2272,7 +2439,7 @@ server_http_res_ptr server_instances::handle_post_instance_adapters(const server
     // an unbuilt window has no scheduler to apply to: record the declaration, it
     // resolves (takes refs) when the window materializes. matches the resize-on-
     // unbuilt precedent, and avoids forcing a window allocation for a bookkeeping op.
-    if (!inst->built) {
+    if (!inst->built.load(std::memory_order_acquire)) {
         bool present = false;
         for (auto & gl : inst->cfg.lora) {
             if (adapter_key(gl.first) == key) {
@@ -2371,7 +2538,7 @@ server_http_res_ptr server_instances::handle_delete_instance_adapters(const serv
 
     // an unbuilt window has no scheduler and no in-flight dispatch can be inside
     // it: mutate the declaration lists directly (no drain needed).
-    if (!inst->built) {
+    if (!inst->built.load(std::memory_order_acquire)) {
         std::vector<common_adapter_lora_info> removed;
         {
             auto & eff = inst->effective.lora_adapters;
@@ -2512,7 +2679,7 @@ server_http_res_ptr server_instances::handle_post_instance_snapshot(const server
     }
     // saving needs live KV; unlike a generation request, a save must not materialize
     // a window as a side effect
-    if (!inst->built) {
+    if (!inst->built.load(std::memory_order_acquire)) {
         return make_error(format_error_response("instance '" + name + "' has no loaded context",
                                                 ERROR_TYPE_NOT_FOUND));
     }

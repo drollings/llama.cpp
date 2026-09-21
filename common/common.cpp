@@ -1613,22 +1613,12 @@ common_init_result::common_init_result(common_params & params, llama_model * mod
 void common_init_result::init_from_model(common_params & params, struct llama_context_params & cparams, llama_model * model) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    // report-only fields for GET /lora-adapters; shared by the pool-owned and
-    // context-owned paths below.
-    const auto read_lora_meta = [](common_adapter_lora_info & la) {
-        char buf[1024];
-        llama_adapter_meta_val_str(la.ptr, "adapter.lora.task_name", buf, sizeof(buf));
-        la.task_name = buf;
-        llama_adapter_meta_val_str(la.ptr, "adapter.lora.prompt_prefix", buf, sizeof(buf));
-        la.prompt_prefix = buf;
-    };
-
     // load and optionally apply lora adapters
     for (auto & la : params.lora_adapters) {
         if (la.ptr != nullptr) {
             // pool owns this adapter (registered in model->loras); reference it.
             // do NOT llama_adapter_lora_init it again, and do NOT push to pimpl->lora.
-            read_lora_meta(la);
+            common_adapter_lora_fill_meta(la);
             continue;
         }
         llama_adapter_lora_ptr lora;
@@ -1639,7 +1629,7 @@ void common_init_result::init_from_model(common_params & params, struct llama_co
         }
 
         la.ptr = lora.get();
-        read_lora_meta(la);
+        common_adapter_lora_fill_meta(la);
         pimpl->lora.emplace_back(std::move(lora)); // copy to list of loaded adapters
     }
 
@@ -1973,6 +1963,14 @@ void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, lla
     if (ctx_dft) {
         common_context_seq_add(ctx_dft, seq_id, p0, p1, delta);
     }
+}
+
+void common_adapter_lora_fill_meta(common_adapter_lora_info & la) {
+    char buf[1024];
+    llama_adapter_meta_val_str(la.ptr, "adapter.lora.task_name", buf, sizeof(buf));
+    la.task_name = buf;
+    llama_adapter_meta_val_str(la.ptr, "adapter.lora.prompt_prefix", buf, sizeof(buf));
+    la.prompt_prefix = buf;
 }
 
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {

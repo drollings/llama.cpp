@@ -66,8 +66,21 @@ struct server_instance {
     bool removing          = false;
     bool running           = true;
     int  n_active_dispatch = 0;
-    bool built             = false;
+    // the synchronization barrier for the whole window: a release-store of true
+    // happens after ctx_server/routes/effective are fully written; an acquire-load
+    // of true therefore makes every one of those writes visible. the stores stay
+    // under mutex_dispatch as before (readers that take active_route_guard get the
+    // same edge from that mutex). teardown release-stores false BEFORE it aborts or
+    // frees the context, so a reader that sees false never touches ctx_server.
+    std::atomic<bool> built{false};
     bool loop_started      = false;
+    // lock-free display caches of the effective window: written wherever
+    // `effective` or the unbuilt `cfg.ctx_size` changes, read by lock-free display
+    // paths (displayed_n_ctx, handle_get_models, handle_get_props, group pick) so a
+    // concurrent lazy build/resize can never tear a display read. mirrors
+    // train_ctx_cached; the values are the same computations as before.
+    std::atomic<int32_t> n_ctx_effective{0};
+    std::atomic<int32_t> n_parallel_effective{1};
     // transient reason of the last build_context_into failure, reset on entry:
     // true when the adapter set failed to resolve (caller maps to 400), false
     // for allocation failure (caller maps to 507). set only by
@@ -96,6 +109,13 @@ struct server_instances {
     // when no build is in flight.
     void set_context_builder(context_builder_fn builder);
 
+    // test-only seam for the aggregate member iteration: when set, a non-null
+    // result is used in place of the real per-instance route handler, letting a
+    // unit test force one member's /models (or /slots) to return non-200 without
+    // an HTTP server. returning nullopt falls through to the real handler. null
+    // in production.
+    std::function<std::optional<server_http_res_ptr>(server_instance &, const server_http_req &)> aggregate_route_hook;
+
     // shared weights, loaded exactly once (model_only mode). shared_ptr so every
     // instance holds a copy (server_instance::model_owner); the weights are freed only
     // when the pool and every instance have released their copy, so a context that still
@@ -108,6 +128,8 @@ struct server_instances {
     // when their refcount hits 0 OR when the pool tears down - always BEFORE the
     // model is freed (llama_adapter_lora_free erases from model->loras, and
     // ~llama_model deletes whatever is still registered: wrong order double-frees).
+    // a cold reload (last instance gone, weights unloaded) must find it empty;
+    // debug builds abort on a leftover, release builds log and refuse with 507.
     struct adapter_registry_entry {
         llama_adapter_lora_ptr adapter; // owns via llama_adapter_lora_free
         size_t                 refcount = 0;
@@ -204,6 +226,7 @@ struct server_instances {
 
     // --- HTTP handlers (wired by server.cpp, one per endpoint) ---
     server_http_res_ptr handle_get_health(const server_http_req & req);
+    server_http_res_ptr handle_get_metrics(const server_http_req & req);
     server_http_res_ptr handle_get_slots(const server_http_req & req);
     server_http_res_ptr handle_post_slots(const server_http_req & req);
     server_http_res_ptr handle_get_props(const server_http_req & req);
@@ -236,10 +259,10 @@ struct server_instances {
 
     // --- pool snapshot I/O worker lifecycle: file read/write never runs on a
     //     scheduler thread. start_loops() owns the single start together with
-    //     the scheduler starts (M2 choke point); terminate() owns the single
-    //     stop. both are idempotent. a post before start or after stop returns
-    //     nullopt so callers fail fast with the existing retriable 503 instead
-    //     of waiting on a future that will never complete.
+    //     the scheduler starts; terminate() owns the single stop. both are
+    //     idempotent. a post before start or after stop returns nullopt so
+    //     callers fail fast with the existing retriable 503 instead of waiting
+    //     on a future that will never complete.
     void start_io_worker();
     void stop_io_worker();
     // post a job to the single FIFO pool I/O worker. the queue is hard-bounded by
@@ -268,6 +291,30 @@ struct server_instances {
     };
 
   private:
+    // one member's outcome in an aggregate iteration. `inst` is null only when
+    // the member was skipped because active_route_guard refused (destroy/resize
+    // in flight) and is not reported at all. an unbuilt member yields
+    // built == false and is never materialized. a built member yields either a
+    // parsed 200 body or an error_marker ({instance, error}) for a non-200.
+    struct per_instance_route_result {
+        std::shared_ptr<server_instance> inst;
+        bool                             built = false;
+        std::optional<json>              body;
+        json                             error_marker;
+    };
+
+    // the single copy of the aggregate per-member iteration policy shared by
+    // /slots and /models: walk snapshot_instances(), guard first (skip when
+    // refused), never build an unbuilt member, call the given server_routes
+    // handler, and classify a non-200 as an error marker. classification is an
+    // outcome signal (status != 200), never a confidence score; a skipped member
+    // is always marked, never silently dropped, never cached.
+    std::vector<per_instance_route_result> collect_instance_routes(
+        const server_http_req & req,
+        server_http_context::handler_t server_routes::* handler);
+
+    static json instance_error_marker(const server_http_res_ptr & res, const std::string & name);
+
     // the only place a scheduler thread is constructed: starts the loop once per
     // built context, no-op afterwards. caller must hold mutex_dispatch (debug
     // assert); every teardown joins the thread before the instance is released,
@@ -323,6 +370,13 @@ struct server_instances {
     // caller shapes its own success response), error result otherwise.
     server_http_res_ptr swap_adapter_set(const std::shared_ptr<server_instance> & inst,
                                          const adapter_set_mutator &               mutate);
+
+    // the scheduler is the single writer of the live adapter set; the manager
+    // mirror (effective.lora_adapters and cfg.lora) is refreshed from it so a
+    // legacy write can never be reverted by a later attach. reads the committed
+    // set through the existing GET_LORA choke point; on timeout returns false
+    // and leaves both lists untouched. caller holds mutex_mgmt.
+    bool refresh_effective_from_scheduler(server_instance & inst, int64_t deadline_ms);
 
     // deadline-bounded copy of one slot's live KV, stamped with the adapter set
     // the KV was computed under. shared by switch-away save-back and explicit

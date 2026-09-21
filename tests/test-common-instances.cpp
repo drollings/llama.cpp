@@ -5,14 +5,23 @@
 #include "server-instances.h"
 #include "server-models.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
+
+// capture the build mode BEFORE NDEBUG is undefined for assert() below: the
+// library under test is compiled in the same configuration, so this picks the
+// release-only cold-reload branch (debug builds must abort, so their body is compiled out)
+#ifdef NDEBUG
+#define TEST_LIBRARY_NDEBUG 1
+#endif
 
 #undef NDEBUG
 #include <cassert>
@@ -699,6 +708,213 @@ static void test_resize_teardown_rebuild(const common_params & base) {
     assert(inst->effective.n_ctx == 1024);
 
     mgr.terminate();
+}
+
+// the display caches (n_ctx_effective / n_parallel_effective) track the
+// requested size across register -> unbuilt resize -> lazy build -> built resize,
+// so a lock-free read never needs the mutable `effective` params.
+static void test_display_cache_transitions(const common_params & base) {
+    common_params params = base;
+    params.n_ctx      = 128;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfg;
+    cfg.name     = "a";
+    cfg.group    = "a";
+    cfg.ctx_size = 256;
+    cfg.parallel = 1;
+    params.instances.push_back(cfg);
+
+    server_instances mgr;
+    assert(mgr.load(params));
+    const auto inst = mgr.instances.front();
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req props_req { {}, {}, "/props", "", "", {}, no_stop };
+    auto resize_req = [&](int32_t n_ctx) {
+        return server_http_req { { { "name", "a" } }, {}, "/instances/a/resize", "",
+                                 safe_json_to_str({ { "ctx_size", n_ctx } }), {}, no_stop };
+    };
+
+    // registered but unbuilt: the cache reports the requested size
+    assert(!inst->built.load());
+    assert(mgr.displayed_n_ctx(*inst) == 256);
+    assert(inst->n_parallel_effective.load() == 1);
+
+    // unbuilt resize: the declaration changes and the display follows it
+    auto res = mgr.handle_post_instance_resize(resize_req(512));
+    assert(res->status == 200);
+    assert(!inst->built.load());
+    assert(mgr.displayed_n_ctx(*inst) == 512);
+
+    // lazy build: the cache must equal the real context size
+    assert(mgr.handle_get_props(props_req)->status == 200);
+    assert(inst->built.load());
+    assert(mgr.displayed_n_ctx(*inst) == inst->ctx_server->get_n_ctx());
+    assert(inst->n_ctx_effective.load() == inst->ctx_server->get_n_ctx());
+
+    // built resize: the cache follows the rebuilt context. the context size is
+    // padded by the backend to a 256 multiple, so compare against get_n_ctx().
+    res = mgr.handle_post_instance_resize(resize_req(256));
+    assert(res->status == 200);
+    assert(inst->built.load());
+    assert(mgr.displayed_n_ctx(*inst) == 256);
+    assert(mgr.displayed_n_ctx(*inst) == inst->ctx_server->get_n_ctx());
+    assert(inst->n_ctx_effective.load() == inst->ctx_server->get_n_ctx());
+
+    mgr.terminate();
+}
+
+// readers hammer the lock-free display paths while writers create, demand,
+// resize and destroy instances. the atomic `built` flag and the display caches
+// must keep every returned row consistent (no torn context, n_ctx >= 0,
+// parallel >= 1) and leave the pool back at its single default member.
+static void test_built_publish_stress(const common_params & base) {
+    common_params params = base;
+    params.n_ctx      = 128;
+    params.n_parallel = 1;
+    params.warmup     = false;
+    params.endpoint_slots = true;
+
+    common_instance cfg;
+    cfg.name       = "base";
+    cfg.group      = "base";
+    cfg.ctx_size   = 128;
+    cfg.parallel   = 1;
+    cfg.is_default = true;
+    params.instances.push_back(cfg);
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    std::atomic<bool> stop{false};
+    std::atomic<int>  errors{0};
+
+    const auto req = [&](const char * path) {
+        return server_http_req { {}, {}, path, "", "", {}, no_stop };
+    };
+
+    auto reader = [&]() {
+        while (!stop.load(std::memory_order_relaxed)) {
+            try {
+                auto m = mgr.handle_get_models(req("/models"));
+                if (m->status == 200) {
+                    json body = json::parse(m->data);
+                    for (auto & d : body["data"]) {
+                        if (d["n_ctx"].get<int>() < 0 || d["parallel"].get<int>() < 1) {
+                            ++errors;
+                        }
+                    }
+                }
+                auto p = mgr.handle_get_props(req("/props"));
+                if (p->status == 200) {
+                    json body = json::parse(p->data);
+                    for (auto & it : body["instances"]) {
+                        if (it["n_ctx"].get<int>() < 0) {
+                            ++errors;
+                        }
+                    }
+                }
+                json env = json::parse(mgr.handle_get_instances(req("/instances"))->data);
+                for (auto & it : env["instances"]) {
+                    if (it["n_ctx"].get<int>() < 0 || it["parallel"].get<int>() < 1) {
+                        ++errors;
+                    }
+                }
+            } catch (const std::exception &) {
+                ++errors;
+            }
+        }
+    };
+
+    auto writer = [&](int id) {
+        for (int k = 0; k < 15; ++k) {
+            const std::string name = "w" + std::to_string(id) + "_" + std::to_string(k);
+            server_http_req create { {}, {}, "/instances", "",
+                safe_json_to_str({ { "name", name }, { "ctx_size", 128 }, { "group", "g" } }), {}, no_stop };
+            if (mgr.handle_post_instances(create)->status != 201) {
+                ++errors;
+                continue;
+            }
+            std::string error;
+            auto target = mgr.resolve(name, "", error);
+            if (target.kind == server_instances::target_kind::INSTANCE) {
+                // the targeted /slots path materializes the window (and must not be a
+                // mere display read); the status is irrelevant here
+                server_http_req demand { { { "instance", name } }, {}, "/slots", "", "", {}, no_stop };
+                mgr.handle_get_slots(demand);
+            }
+            server_http_req resize { { { "name", name } }, {}, "/instances/" + name + "/resize", "",
+                safe_json_to_str({ { "ctx_size", 192 } }), {}, no_stop };
+            mgr.handle_post_instance_resize(resize);
+            server_http_req del { { { "name", name } }, {}, "/instances/" + name, "", "", {}, no_stop };
+            mgr.handle_delete_instance(del);
+        }
+    };
+
+    std::vector<std::thread> readers;
+    for (int i = 0; i < 3; ++i) {
+        readers.emplace_back(reader);
+    }
+    std::thread wa(writer, 0);
+    std::thread wb(writer, 1);
+    wa.join();
+    wb.join();
+    stop.store(true, std::memory_order_relaxed);
+    for (auto & t : readers) {
+        t.join();
+    }
+
+    assert(errors.load() == 0);
+
+    // every writer destroyed its instances: only the default remains
+    json env = json::parse(mgr.handle_get_instances(req("/instances"))->data);
+    assert(env["instances"].size() == 1);
+
+    mgr.terminate();
+}
+
+// a cold reload that finds the adapter registry non-empty is a refcount bug.
+// the debug build aborts at the source, so this body only exists in release
+// builds (NDEBUG), where the contract is a logged 507 and a surviving process.
+static void test_cold_reload_registry_mismatch(const common_params & base) {
+#ifdef TEST_LIBRARY_NDEBUG
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfg;
+    cfg.name     = "a";
+    cfg.group    = "a";
+    cfg.ctx_size = 256;
+    cfg.parallel = 1;
+    params.instances.push_back(cfg);
+
+    server_instances mgr;
+    assert(mgr.load(params));
+    assert(mgr.model != nullptr);
+
+    // a leaked registry entry (never attached, never released). the release path
+    // only inspects emptiness, so a null adapter is enough and keeps teardown safe
+    mgr.adapter_registry["leaked"] = server_instances::adapter_registry_entry{};
+
+    // force the cold state without going through destroy's registry drain
+    mgr.model = nullptr;
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req create { {}, {}, "/instances", "",
+        safe_json_to_str({ { "name", "b" }, { "ctx_size", 256 } }), {}, no_stop };
+    auto res = mgr.handle_post_instances(create);
+    assert(res->status == 507);
+    assert(res->data.find("inconsistent") != std::string::npos);
+
+    mgr.terminate();
+#else
+    (void) base;
+#endif
 }
 
 // pool simulation: the pool loads the adapter once against the shared model, then
@@ -1811,7 +2027,7 @@ static void test_instances_lora_normalize(const common_params & base) {
     fs::remove_all(dir, ec);
 }
 
-// M6 setup: pool with a slot-save dir, one built instance with file1 attached,
+// setup: pool with a slot-save dir, one built instance with file1 attached,
 // loops (scheduler + pool I/O worker) running. returns the adapter file path.
 static std::string test_m6_setup(server_instances & mgr, const common_params & base, const std::string & dir) {
     namespace fs = std::filesystem;
@@ -2096,6 +2312,285 @@ static void test_live_merge_adapter_parity(const common_params & base) {
     fs::remove_all(dir, ec);
 }
 
+// calibration matrix for the aggregate fan-out scheduling policy. the
+// collector takes an injectable fetch, so the policy is measured directly with
+// no HTTP. every number is caller latency (task-value), never child health;
+// nothing is cached or persisted, and a skipped child is simply absent.
+static void test_fanout_calibration() {
+    // fan-out width 2 keeps the batch schedule deterministic with small K
+    setenv("LLAMA_SERVER_TEST_AGG_FANOUT_MAX", "2", 1);
+
+    auto make_targets = [](int k) {
+        std::vector<server_model_meta> targets;
+        for (int i = 0; i < k; ++i) {
+            server_model_meta m;
+            // zero-padded so name sort == index order
+            m.name = "c" + std::to_string(100 + i);
+            targets.push_back(m);
+        }
+        return targets;
+    };
+
+    // healthy control: K fast children, none may be skipped, output sorted
+    {
+        const int     K        = 8;
+        const int64_t fetch_ms = 15;
+        auto          targets  = make_targets(K);
+        instances_fetch_fn fetch = [fetch_ms](const server_model_meta & m) -> std::optional<std::pair<std::string, json>> {
+            std::this_thread::sleep_for(std::chrono::milliseconds(fetch_ms));
+            return std::make_pair(m.name, json{ { "id", m.name } });
+        };
+
+        std::vector<double> lat;
+        lat.reserve(50);
+        for (int run = 0; run < 50; ++run) {
+            const int64_t t0 = ggml_time_us();
+            auto          rows = instances_fanout_collect(targets, fetch, ggml_time_ms() + 5000);
+            lat.push_back((ggml_time_us() - t0) / 1000.0);
+
+            assert((int) rows.size() == K);  // skip-precision 1.0
+            for (int i = 0; i < K; ++i) {
+                assert(rows[i].first == targets[i].name);  // deterministic sort
+            }
+        }
+        std::sort(lat.begin(), lat.end());
+        const double p50    = lat[lat.size() / 2];
+        const double p95    = lat[(size_t) (lat.size() * 0.95)];
+        const double serial = K * fetch_ms;
+        assert(p95 <= serial * 1.20);
+        fprintf(stdout, "fanout healthy control: K=%d p50=%.2f ms p95=%.2f ms serial=%.2f ms\n", K, p50, p95, serial);
+    }
+
+    // one poisoned child: emulates the real socket timeout by sleeping past the
+    // per-child cap and returning nullopt; exactly one absence, K-1 live rows
+    {
+        const int K       = 4;
+        auto      targets = make_targets(K);
+        instances_fetch_fn fetch = [](const server_model_meta & m) -> std::optional<std::pair<std::string, json>> {
+            if (m.name == "c101") {
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                return std::nullopt;  // timed out
+            }
+            return std::make_pair(m.name, json{ { "id", m.name } });
+        };
+        auto rows = instances_fanout_collect(targets, fetch, ggml_time_ms() + 5000);
+        assert(rows.size() == K - 1);  // skip-recall 1.0
+        for (const auto & r : rows) {
+            assert(r.first != "c101");
+        }
+        fprintf(stdout, "fanout poisoned child: %zu/%d live rows, one absence\n", rows.size(), K);
+    }
+
+    // budget exhaustion: a fetch that ignores the per-child cap and sleeps past
+    // the global budget; the call must return within budget + one per-child
+    // timeout + slack, and must never hang
+    {
+        const int     K         = 4;
+        const int64_t budget_ms = 100;
+        const int64_t slow_ms   = 500;
+        auto          targets   = make_targets(K);
+        instances_fetch_fn fetch = [slow_ms](const server_model_meta & m) -> std::optional<std::pair<std::string, json>> {
+            if (m.name == "c101") {
+                std::this_thread::sleep_for(std::chrono::milliseconds(slow_ms));
+            }
+            return std::make_pair(m.name, json{ { "id", m.name } });
+        };
+        const int64_t t0      = ggml_time_us();
+        auto          rows    = instances_fanout_collect(targets, fetch, ggml_time_ms() + budget_ms);
+        const double  elapsed = (ggml_time_us() - t0) / 1000.0;
+        // no batch after the budget, but an in-flight read cannot be cancelled
+        assert(elapsed <= budget_ms + slow_ms + 250);
+        bool has_fast = false;
+        for (const auto & r : rows) {
+            has_fast = has_fast || r.first == "c100";
+        }
+        assert(has_fast);
+        fprintf(stdout, "fanout budget exhaustion: elapsed=%.2f ms bound=%.2f ms\n", elapsed,
+                (double) (budget_ms + slow_ms));
+    }
+
+    unsetenv("LLAMA_SERVER_TEST_AGG_FANOUT_MAX");
+}
+
+// /v1/models uses the same per-member skip-and-continue policy as /slots. a
+// failing built member yields a marker row instead of failing the whole
+// aggregate; the healthy envelope and the slots path are unchanged.
+static void test_models_skip_and_continue(const common_params & base) {
+    common_params params = base;
+    params.n_ctx          = 256;
+    params.n_parallel     = 1;
+    params.warmup         = false;
+    params.endpoint_slots = true;
+    for (const char * name : { "a", "b" }) {
+        common_instance cfg;
+        cfg.name     = name;
+        cfg.group    = name;
+        cfg.ctx_size = 256;
+        cfg.parallel = 1;
+        params.instances.push_back(cfg);
+    }
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    auto demand = [&](const char * name) {
+        server_http_req req { { { "instance", name } }, {}, "/slots", "", "", {}, no_stop };
+        assert(mgr.handle_get_slots(req)->status == 200);
+    };
+    demand("a");
+    demand("b");
+
+    server_http_req models_req { {}, {}, "/models", "", "", {}, no_stop };
+
+    // healthy envelope is unchanged
+    auto healthy = mgr.handle_get_models(models_req);
+    assert(healthy->status == 200);
+    json h = json::parse(healthy->data);
+    assert(h.contains("models") && h.contains("object") && h.contains("data"));
+    assert(h["object"] == "list");
+    assert(h["data"].size() == 2);
+    for (auto & d : h["data"]) {
+        assert(d["status"] == "loaded");
+        assert(!d.contains("error"));
+    }
+
+    // force exactly one member's route to non-200
+    mgr.aggregate_route_hook = [](server_instance & inst,
+                                  const server_http_req &) -> std::optional<server_http_res_ptr> {
+        if (inst.cfg.name == "b") {
+            auto r  = std::make_unique<server_http_res>();
+            r->status = 500;
+            r->data   = safe_json_to_str({ { "error", { { "message", "forced" } } } });
+            return r;
+        }
+        return std::nullopt;
+    };
+
+    auto partial = mgr.handle_get_models(models_req);
+    assert(partial->status == 200);
+    json p = json::parse(partial->data);
+    assert(p["data"].size() == 2);
+    int loaded = 0;
+    int markers = 0;
+    for (auto & d : p["data"]) {
+        if (d.contains("error")) {
+            ++markers;
+            assert(d["instance"] == "b");
+        } else {
+            ++loaded;
+            assert(d["status"] == "loaded");
+        }
+    }
+    assert(loaded == 1 && markers == 1);
+    assert(p["models"].size() >= 1);  // the healthy member's model entry survived
+
+    // slots path unchanged: the same forced failure still yields a marker
+    server_http_req slots_req { {}, {}, "/slots", "", "", {}, no_stop };
+    auto slots = mgr.handle_get_slots(slots_req);
+    assert(slots->status == 200);
+    json s = json::parse(slots->data);
+    int slot_markers = 0;
+    int slot_rows    = 0;
+    for (auto & row : s) {
+        if (row.contains("error")) {
+            ++slot_markers;
+            assert(row["instance"] == "b");
+        } else {
+            ++slot_rows;
+            assert(row.contains("instance"));
+        }
+    }
+    assert(slot_markers == 1);
+    assert(slot_rows >= 1);
+
+    mgr.aggregate_route_hook = nullptr;
+    mgr.terminate();
+}
+
+// GET /instances must not hold mutex_mgmt across the on-disk snapshot
+// listing, or slow storage would serialize create/destroy/resize behind every
+// router poll. a smoke guard: the listing is made slow with many snapshot files
+// and a concurrent management op must not wait for it.
+static void test_instances_listing_off_management_lock(const common_params & base) {
+    namespace fs = std::filesystem;
+
+    common_params params = base;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+
+    common_instance cfg;
+    cfg.name     = "a";
+    cfg.group    = "a";
+    cfg.ctx_size = 256;
+    cfg.parallel = 1;
+    params.instances.push_back(cfg);
+
+    const std::string dir = (fs::temp_directory_path() / ("llama_m8_" + std::to_string(ggml_time_us()))).string();
+    params.slot_save_path = dir + "/";
+
+    server_instances mgr;
+    assert(mgr.load(params));
+
+    // populate the per-instance snapshot dir with many header-parse targets
+    const fs::path snap_dir = fs::path(mgr.snapshot_instance_path("a", "probe")).parent_path();
+    fs::create_directories(snap_dir);
+    const int N = 4000;
+    for (int i = 0; i < N; ++i) {
+        std::ofstream out(snap_dir / ("s" + std::to_string(i) + ".bin"), std::ios::binary);
+    }
+
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req list_req { {}, {}, "/instances", "", "", {}, no_stop };
+
+    int64_t listing_ms = 0;
+    std::thread lister([&]() {
+        const int64_t t0 = ggml_time_us();
+        auto          res = mgr.handle_get_instances(list_req);
+        listing_ms        = (ggml_time_us() - t0) / 1000;
+        assert(res->status == 200);
+    });
+
+    // let the lister acquire mutex_mgmt and enter the snapshot listing
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    const int64_t t0 = ggml_time_us();
+    auto pin = mgr.handle_post_instance_pin(
+        server_http_req { { { "name", "a" } }, {}, "/instances/a/pin", "", "", {}, no_stop });
+    const int64_t pin_ms = (ggml_time_us() - t0) / 1000;
+    assert(pin->status == 200);
+
+    lister.join();
+
+    // the listing must actually be the slow side of the race
+    assert(listing_ms > 20);
+    // the management op must not wait for the listing (half the listing is a
+    // generous margin: without the fix the pin waits out the remaining listing)
+    assert(pin_ms * 2 < listing_ms);
+    fprintf(stdout, "instances listing off mgmt lock: listing=%lld ms pin=%lld ms\n", (long long) listing_ms,
+            (long long) pin_ms);
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    mgr.terminate();
+}
+
+// start_loops must start the pool I/O worker, so a server that advertises
+// ready only after start_loops can never hand out the I/O-busy 503 to the first
+// snapshot switch. observable through the manager: a post succeeds only once the
+// worker runs.
+static void test_start_loops_starts_io_worker() {
+    server_instances mgr;
+    assert(!mgr.snapshot_io_post([]() {}).has_value());  // no worker before the single start
+    mgr.start_loops();
+    auto fut = mgr.snapshot_io_post([]() {});
+    assert(fut.has_value());
+    fut->wait();
+    fut->get();
+    mgr.terminate();
+}
+
 int main(int argc, char ** argv) {
     test_instances_parse_round_trip();
     test_instances_lora_multi_scale();
@@ -2115,6 +2610,8 @@ int main(int argc, char ** argv) {
     test_lora_fingerprint();
     test_adapter_buf_size_null();
     test_resolve_honors_explicit_instance();
+    test_fanout_calibration();
+    test_start_loops_starts_io_worker();
 
     common_params params;
     std::string   adapter_path;
@@ -2166,6 +2663,8 @@ int main(int argc, char ** argv) {
     test_snapshot_v2_empty_on_nonempty_400s(params);
     test_instances_lora_normalize(params);
     test_live_merge_adapter_parity(params);
+    test_models_skip_and_continue(params);
+    test_instances_listing_off_management_lock(params);
     test_borrowed_model(params);
     test_scheduler_timeout_cancels_pending(params);
     test_destroy_bounded_on_wedged_scheduler(params);
@@ -2174,6 +2673,9 @@ int main(int argc, char ** argv) {
     test_demand_build_starts_one_loop(params);
     test_start_loops_skips_unbuilt(params);
     test_resize_teardown_rebuild(params);
+    test_display_cache_transitions(params);
+    test_built_publish_stress(params);
+    test_cold_reload_registry_mismatch(params);
     if (!adapter_path.empty()) {
         test_borrowed_model_adapter_skip(params, adapter_path);
     } else {

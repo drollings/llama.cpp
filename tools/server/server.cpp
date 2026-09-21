@@ -207,6 +207,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // functions of instances_mgr.
     if (use_instances) {
         routes.get_health             = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_health(req); };
+        routes.get_metrics            = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_metrics(req); };
         routes.get_slots              = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_slots(req); };
         routes.post_slots             = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_slots(req); };
         routes.get_props              = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_props(req); };
@@ -543,6 +544,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
                 SRV_ERR("%s", "exiting due to instance loading error\n");
                 return 1;
             }
+            // start the scheduler loops and the pool I/O worker BEFORE advertising
+            // ready: the HTTP middleware admits requests once is_ready is true, and a
+            // snapshot switch posted before the I/O worker exists would get a
+            // retriable 503 for no caller fault. start_loops is idempotent and this
+            // is the single start site (runtime create starts its own loop).
+            instances_mgr.start_loops();
             ctx_http.is_ready.store(true);
             SRV_INF("%s", "instances loaded\n");
 
@@ -630,10 +637,6 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
 
         if (use_instances) {
-            // the manager owns one scheduler thread per instance (also needed for runtime
-            // create/destroy/resize via the management API)
-            instances_mgr.start_loops();
-
             // this call blocks the main thread until the HTTP server stops
             if (ctx_http.thread.joinable()) {
                 ctx_http.thread.join();

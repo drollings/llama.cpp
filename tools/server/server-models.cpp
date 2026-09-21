@@ -432,6 +432,26 @@ static constexpr int INSTANCES_AGG_TIMEOUT_MS = 5000;
 // measures caller latency, not child health: a skipped child is reported by
 // absence (as today), never scored, persisted, or cached.
 static constexpr int64_t INSTANCES_AGG_TOTAL_MS = 15000;
+// concurrency cap for one fan-out batch: a child beyond this waits for the next
+// batch. small test values let the scheduling bounds be exercised without
+// starting the production-sized set of children.
+static constexpr size_t INSTANCES_FANOUT_MAX = 8;
+
+// the three fan-out constants are overridable so tests can drive the scheduling
+// boundaries with a handful of children instead of waiting out the production
+// seconds-long budgets. unset keeps the production values.
+static int instances_agg_child_timeout_ms() {
+    const char * env = std::getenv("LLAMA_SERVER_TEST_AGG_CHILD_TIMEOUT_MS");
+    return env != nullptr ? std::max(1, std::atoi(env)) : INSTANCES_AGG_TIMEOUT_MS;
+}
+static int64_t instances_agg_total_ms() {
+    const char * env = std::getenv("LLAMA_SERVER_TEST_AGG_TOTAL_MS");
+    return env != nullptr ? std::max<int64_t>(1, std::atoll(env)) : INSTANCES_AGG_TOTAL_MS;
+}
+static size_t instances_fanout_max() {
+    const char * env = std::getenv("LLAMA_SERVER_TEST_AGG_FANOUT_MAX");
+    return env != nullptr ? (size_t) std::max(1, std::atoi(env)) : INSTANCES_FANOUT_MAX;
+}
 
 static std::filesystem::path get_server_exec_path() {
 #if defined(_WIN32)
@@ -1628,9 +1648,9 @@ json server_models_merge_instances(const std::vector<std::pair<std::string, json
 static std::optional<std::pair<std::string, json>> fetch_child_instances(const server_model_meta & meta) {
     try {
         httplib::Client cli(CHILD_ADDR, meta.port);
-        cli.set_connection_timeout(0, INSTANCES_AGG_TIMEOUT_MS * 1000);
-        cli.set_read_timeout(0, INSTANCES_AGG_TIMEOUT_MS * 1000);
-        cli.set_write_timeout(0, INSTANCES_AGG_TIMEOUT_MS * 1000);
+        cli.set_connection_timeout(0, instances_agg_child_timeout_ms() * 1000);
+        cli.set_read_timeout(0, instances_agg_child_timeout_ms() * 1000);
+        cli.set_write_timeout(0, instances_agg_child_timeout_ms() * 1000);
         auto resp = cli.Get("/instances");
         if (!resp || resp->status != 200) {
             return std::nullopt;
@@ -1646,15 +1666,28 @@ std::vector<std::pair<std::string, json>> instances_fanout_collect(
         const std::vector<server_model_meta> & targets,
         const instances_fetch_fn &             fetch,
         int64_t                                deadline_ms) {
-    // bounded fan-out: at most FANOUT_MAX concurrent fetches (one async task
-    // per child would be a thundering herd under many children). each batch's
-    // futures are collected up to the shared deadline; a late child skips
-    // exactly like a dead one. the cap bounds caller latency, not child
+    // bounded fan-out: at most instances_fanout_max() concurrent fetches (one
+    // async task per child would be a thundering herd under many children).
+    // each batch's futures are collected up to the shared deadline; a late child
+    // skips exactly like a dead one. the cap bounds caller latency, not child
     // health: nothing about a skipped child is recorded.
-    static constexpr size_t FANOUT_MAX = 8;
+    //
+    // contract: deadline_ms bounds the *scheduling* of new batches, never child
+    // health. the hard worst case is the budget plus one per-child socket timeout,
+    // because an in-flight blocking read cannot be cancelled: once the budget is
+    // spent no further batch starts, but the batch already running still pays its
+    // stragglers up to the per-child timeout. results are pure caller latency; a
+    // skipped child is simply absent, never scored or persisted.
     std::vector<std::pair<std::string, json>> per_model;
-    for (size_t begin = 0; begin < targets.size(); begin += FANOUT_MAX) {
-        const size_t end = std::min(begin + FANOUT_MAX, targets.size());
+    const size_t fanout_max = instances_fanout_max();
+    for (size_t begin = 0; begin < targets.size(); begin += fanout_max) {
+        // no new work after the budget: the previous batch's destructors already
+        // paid their in-flight timeout, and launching another batch would stack
+        // another one on top of the bound above
+        if (deadline_ms - ggml_time_ms() <= 0) {
+            break;
+        }
+        const size_t end = std::min(begin + fanout_max, targets.size());
         std::vector<std::future<std::optional<std::pair<std::string, json>>>> futs;
         for (size_t i = begin; i < end; ++i) {
             futs.push_back(std::async(std::launch::async, fetch, targets[i]));
@@ -1721,7 +1754,7 @@ json server_models::get_instances_aggregate(const std::string & only) {
         }
     }
 
-    const int64_t deadline_ms = ggml_time_ms() + INSTANCES_AGG_TOTAL_MS;
+    const int64_t deadline_ms = ggml_time_ms() + instances_agg_total_ms();
     auto per_model = instances_fanout_collect(targets, fetch_child_instances, deadline_ms);
     return server_models_merge_instances(per_model);
 }

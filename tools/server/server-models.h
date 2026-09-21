@@ -120,6 +120,9 @@ struct server_model_meta {
 // skips exactly like an unreachable child (never fatal to the aggregate).
 // results sort by model name so parallel completion order never leaks into
 // the output. a fetch returning nullopt (or throwing) skips that child.
+// deadline_ms bounds scheduling of new batches; the hard worst case is
+// deadline_ms plus one per-child socket timeout, because an in-flight read
+// cannot be cancelled. it measures caller latency, never child health.
 using instances_fetch_fn = std::function<std::optional<std::pair<std::string, json>>(const server_model_meta &)>;
 std::vector<std::pair<std::string, json>> instances_fanout_collect(
     const std::vector<server_model_meta> & targets,

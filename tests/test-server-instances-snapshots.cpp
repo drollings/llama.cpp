@@ -333,19 +333,20 @@ static void test_pick_best_candidate() {
     }) == std::optional<size_t>(1));
 }
 
-// the pure unbuilt cases of the n_ctx display rule: explicit sizes report as
-// requested; inheriting reports 0 until the weights are loaded (the model
-// default comes from a live pool, covered by the server golden).
+// the pure unbuilt cases of the n_ctx display rule: an unbuilt window reports the
+// size published in the lock-free display cache (explicit sizes as requested,
+// 0 while inheriting until the weights are loaded; the model default comes from a
+// live pool, covered by the server golden).
 static void test_displayed_n_ctx_unbuilt() {
     server_instances mgr; // weights never loaded
     server_instance  inst;
-    inst.built = false;
-    inst.effective.n_parallel = 1;
+    inst.built.store(false, std::memory_order_relaxed);
+    inst.n_parallel_effective.store(1, std::memory_order_relaxed);
 
-    inst.effective.n_ctx = 256;
+    inst.n_ctx_effective.store(256, std::memory_order_relaxed);
     assert(mgr.displayed_n_ctx(inst) == 256);
 
-    inst.effective.n_ctx = 0;
+    inst.n_ctx_effective.store(0, std::memory_order_relaxed);
     assert(mgr.displayed_n_ctx(inst) == 0);
 }
 

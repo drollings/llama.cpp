@@ -146,7 +146,9 @@ struct server_context {
 
     // replace the instance's adapter set. the caller must hold the pool's
     // instance_drain_guard (no slot processing, no interleaving save/restore) and
-    // pool ownership of every adapter in the list (see M4). runs the swap on the
+    // pool ownership of every adapter in the list (each raw ptr must be a live
+    // registry entry the caller holds a ref for, so the tensor cannot be freed
+    // during the swap). runs the swap on the
     // scheduler thread and WAITS for it with a deadline; returns the task result
     // (null on timeout). post directly to this context's queue, never through
     // pool dispatch (the drain guard's removing flag would reject it).

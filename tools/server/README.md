@@ -2132,10 +2132,16 @@ Group dispatch picks the member with the fewest busy slots, then the least recen
 waiting up to `--instance-wait` seconds for a free member before returning `503`.
 
 Endpoints without a `model` field (`/health`, `/props`, `/tokenize`, `/detokenize`,
-`/apply-template`, `/control`, `/lora-adapters`) run on the `default` instance.
-`/models` lists one entry per instance (tagged with `n_ctx`, `parallel`, `status`).
-`/slots` aggregates every instance's slots when no target is given, tagging each with
-`instance`. `/props` adds `total_slots` and an `instances` array.
+`/apply-template`, `/control`) run on the `default` instance. `/metrics` renders the
+resolved target instance (the default when untargeted, `404` for an unbuilt target, `400`
+for a GROUP or unknown target) and a scrape never builds a window. The legacy
+`GET/POST /lora-adapters` targets the default instance: `POST` requires a built default
+(`404` otherwise), refreshes that instance's resolved set so a later attach cannot revert
+the scale, and revokes its slot-snapshot bindings. `/models` lists one entry per instance
+(tagged with `n_ctx`, `parallel`, `status`); a member whose route fails is reported as an
+`{"instance", "error"}` marker row instead of failing the whole aggregate. `/slots`
+aggregates every instance's slots when no target is given, tagging each with `instance`.
+`/props` adds `total_slots` and an `instances` array.
 
 ### Management API
 

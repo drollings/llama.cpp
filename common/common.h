@@ -1012,6 +1012,10 @@ struct llama_context_params   common_context_params_to_llama(const common_params
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
 
+// fill the report-only task_name / prompt_prefix fields from the adapter's
+// loaded GGUF metadata. la.ptr must be non-null.
+void common_adapter_lora_fill_meta(common_adapter_lora_info & la);
+
 // short stable hash of the sorted (path, scale) adapter set; "" when empty.
 // used to fingerprint snapshots so a restore under a different adapter set is rejected.
 std::string common_lora_fingerprint(const std::vector<common_adapter_lora_info> & loras);

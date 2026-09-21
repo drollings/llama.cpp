@@ -9,8 +9,12 @@ through untouched; snapshot rows are tagged with their owning model on merge.
 """
 
 import json
+import os
+import signal
 import socket
+import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -202,4 +206,85 @@ def test_router_aggregate_unloaded_child_skipped():
         assert any(i.startswith("agg-a:") for i in ids)
         assert not any(i.startswith("agg-b:") for i in ids)
     finally:
+        srv.stop()
+
+
+# --- caller-latency bound on the router aggregate ------------------------------
+
+AGG_SLOW_PRESET = """\
+[agg-a]
+hf-repo = ggml-org/test-model-stories260K:F32
+instance = w:ctx=512
+
+[agg-b]
+hf-repo = ggml-org/test-model-stories260K:F32
+instance = w:ctx=512
+
+[agg-c]
+hf-repo = ggml-org/test-model-stories260K:F32
+instance = w:ctx=512
+"""
+
+# small scheduling windows so three children exercise three batches without the
+# production 8-per-batch / multi-second budget.
+AGG_TOTAL_MS = 100
+AGG_CHILD_TIMEOUT_MS = 300
+AGG_FANOUT_MAX = 1
+
+
+def _child_pid_for_alias(router_pid, alias):
+    for pid in subprocess.check_output(["pgrep", "-P", str(router_pid)]).decode().split():
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                if alias.encode() in f.read().split(b"\0"):
+                    return int(pid)
+        except OSError:
+            pass
+    return None
+
+
+def test_router_aggregate_slow_child_deadline_bound(monkeypatch):
+    """A child frozen past its per-child socket timeout is absent while a healthy
+    sibling is still reported, and the caller pays at most the budget plus one
+    per-child timeout (an in-flight read cannot be cancelled)."""
+    import tempfile
+    preset_path = os.path.join(tempfile.mkdtemp(), "agg.ini")
+    with open(preset_path, "w") as f:
+        f.write(AGG_SLOW_PRESET)
+    monkeypatch.setenv("LLAMA_SERVER_TEST_AGG_TOTAL_MS", str(AGG_TOTAL_MS))
+    monkeypatch.setenv("LLAMA_SERVER_TEST_AGG_CHILD_TIMEOUT_MS", str(AGG_CHILD_TIMEOUT_MS))
+    monkeypatch.setenv("LLAMA_SERVER_TEST_AGG_FANOUT_MAX", str(AGG_FANOUT_MAX))
+
+    srv = ServerPreset.router()
+    srv.server_port = _free_port()
+    srv.models_preset = preset_path
+    srv.models_max = 4
+    srv.start()
+    suspended = []
+    try:
+        for model in ("agg-a", "agg-b", "agg-c"):
+            res = srv.make_request("POST", "/models/load", data={"model": model}, timeout=180)
+            assert res.status_code == 200, res.body
+        for model in ("agg-a", "agg-b", "agg-c"):
+            _wait_for_model(srv, model)
+        for alias in ("agg-b", "agg-c"):
+            pid = _child_pid_for_alias(srv.process.pid, alias)
+            assert pid is not None, f"child {alias} not found"
+            os.kill(pid, signal.SIGSTOP)
+            suspended.append(pid)
+
+        t0 = time.monotonic()
+        env = srv.make_request("GET", "/instances", timeout=60).body
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+
+        ids = {inst["id"] for inst in env["instances"]}
+        assert any(i.startswith("agg-a:") for i in ids)
+        assert not any(i.startswith("agg-b:") for i in ids)
+        assert not any(i.startswith("agg-c:") for i in ids)
+
+        bound = AGG_TOTAL_MS + AGG_CHILD_TIMEOUT_MS
+        assert elapsed_ms <= bound + 150, f"aggregate took {elapsed_ms:.0f} ms, budget {bound} ms"
+    finally:
+        for pid in suspended:
+            os.kill(pid, signal.SIGCONT)
         srv.stop()

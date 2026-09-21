@@ -358,7 +358,7 @@ def test_instances_post_invalid_name_400():
     assert res.status_code == 201
 
 
-# --- M2: snapshot management round-trip (save / list / apply / delete) ---
+# --- snapshot management round-trip (save / list / apply / delete) ---
 def test_instances_snapshot_management():
     global server
     snap_dir = tempfile.mkdtemp()
@@ -400,7 +400,7 @@ def test_instances_snapshot_management():
     assert not any(s["name"] == "foo" for s in res.body["snapshots"])
 
 
-# --- M7: a snapshot-save burst at startup resolves fast and never hangs ---
+# --- a snapshot-save burst at startup resolves fast and never hangs ---
 def test_instances_snapshot_startup_burst():
     """Snapshot saves fired the moment the server accepts requests must each
     resolve with a valid status, never hang, and never 500. Saves landing
@@ -441,7 +441,7 @@ def test_instances_snapshot_startup_burst():
     assert res.status_code == 201
 
 
-# --- M10: sequential snapshot switches stay within budget (never 503) ---
+# --- sequential snapshot switches stay within budget (never 503) ---
 def test_instances_snapshot_switch_within_budget():
     """A save / switch-away / switch-back cycle runs one switch at a time with
     an empty I/O queue, so every step must succeed: a switch within the
@@ -512,7 +512,7 @@ def test_instances_snapshot_missing_404():
     assert res.status_code == 404
 
 
-# --- M2: a corrupt .bin yields a clean 400 (not a 500) ---
+# --- a corrupt .bin yields a clean 400 (not a 500) ---
 def test_instances_snapshot_corrupt_400():
     global server
     snap_dir = tempfile.mkdtemp()
@@ -536,7 +536,7 @@ def test_instances_snapshot_corrupt_400():
     assert res.status_code == 400
 
 
-# --- M2: restoring a snapshot saved at a different ctx size is rejected (400) ---
+# --- restoring a snapshot saved at a different ctx size is rejected (400) ---
 def test_instances_snapshot_wrong_nctx_400():
     global server
     snap_dir = tempfile.mkdtemp()
@@ -561,7 +561,7 @@ def test_instances_snapshot_wrong_nctx_400():
     assert res.status_code == 400
 
 
-# --- M3: a group waiter with --instance-wait -1 never 503s on a busy group that frees ---
+# --- a group waiter with --instance-wait -1 never 503s on a busy group that frees ---
 def test_instances_group_wait_forever():
     global server
     server.instances = [
@@ -837,6 +837,15 @@ def _adapters_of(name: str):
     res = server.make_request("GET", f"/instances/{name}/adapters")
     assert res.status_code == 200
     return res.body
+
+
+def _legacy_lora_scale(path: str):
+    res = server.make_request("GET", "/lora-adapters")
+    assert res.status_code == 200
+    for entry in res.body:
+        if entry.get("path") == path:
+            return entry.get("scale")
+    return None
 
 
 def _complete(instance: str, **kw):
@@ -1145,3 +1154,95 @@ def test_instances_row_bytes_include_adapter():
         row["model_bytes"] + row["context_bytes"] + row["compute_bytes"] + row["adapter_bytes"]
     )
     assert row["vram_bytes"] == row["context_bytes"] + row["compute_bytes"]
+
+
+def test_instances_legacy_lora_scale_survives_attach():
+    """The legacy writer commits to the scheduler; the manager mirror follows it,
+    so a later attach is additive and never reverts the legacy scale."""
+    _moe_server()
+    lora = _adapter_path()
+    server.lora_files = [lora]
+    server.instances = ["a:ctx=512"]
+    server.start()
+    assert _complete("a").status_code == 200
+
+    res = server.make_request("POST", "/lora-adapters", data=[{"id": 0, "scale": 0.5}])
+    assert res.status_code == 200
+    assert _adapters_of("a") == [{"path": lora, "scale": 0.5}]
+    assert _legacy_lora_scale(lora) == 0.5
+
+    lora2 = lora + ".copy.gguf"
+    shutil.copyfile(lora, lora2)
+    try:
+        res = server.make_request("POST", "/instances/a/adapters", data={"path": lora2})
+        assert res.status_code == 200
+        assert _adapters_of("a") == [{"path": lora, "scale": 0.5}, {"path": lora2, "scale": 1.0}]
+        assert _legacy_lora_scale(lora) == 0.5
+    finally:
+        os.remove(lora2)
+
+
+def test_instances_legacy_lora_reflected_by_instance_get():
+    """GET /instances/:name/adapters reads the mirror the legacy writer refreshed."""
+    _moe_server()
+    lora = _adapter_path()
+    server.lora_files = [lora]
+    server.instances = ["a:ctx=512"]
+    server.start()
+    assert _complete("a").status_code == 200
+
+    res = server.make_request("POST", "/lora-adapters", data=[{"id": 0, "scale": 0.25}])
+    assert res.status_code == 200
+    assert _adapters_of("a") == [{"path": lora, "scale": 0.25}]
+
+
+def test_instances_legacy_lora_revokes_binding():
+    """A legacy scale change is part of the snapshot fingerprint: a bound slot is
+    unbound so the next restore reaches the fingerprint check (400) instead of
+    short-circuiting on stale bound KV."""
+    _moe_server()
+    lora = _adapter_path()
+    server.lora_files = [lora]
+    server.instances = ["a:ctx=512"]
+    server.slot_save_path = tempfile.mkdtemp()
+    server.start()
+
+    assert _complete("a", n_predict=8).status_code == 200
+    res = server.make_request("POST", "/instances/a/snapshot", data={"name": "work"})
+    assert res.status_code == 201
+    assert _complete("a", snapshot="work", n_predict=2).status_code == 200
+
+    res = server.make_request("POST", "/lora-adapters", data=[{"id": 0, "scale": 0.5}])
+    assert res.status_code == 200
+    res = server.make_request("POST", "/completion", data={
+        "model": "stories15m-moe:a", "snapshot": "work", "prompt": "x", "n_predict": 2,
+    })
+    assert res.status_code == 400
+
+
+def test_instances_legacy_lora_unbuilt_default_404():
+    """The legacy writer needs a scheduler; an unbuilt default is 404 and the
+    rejected write must not materialize a window."""
+    _moe_server()
+    server.instances = ["a:ctx=512", "b:ctx=512"]
+    server.start()
+
+    res = server.make_request("POST", "/lora-adapters", data=[{"id": 0, "scale": 0.5}])
+    assert res.status_code == 404
+    states = {inst["id"]: inst["state"] for inst in _get_instances()["instances"]}
+    assert states["stories15m-moe:a"] == "unloaded"
+    assert states["stories15m-moe:b"] == "unloaded"
+
+
+def test_instances_snapshot_after_ready_no_io_busy():
+    """Startup ordering: ready is advertised only after the scheduler loops and the
+    pool I/O worker start, so the first snapshot switch can never observe the
+    retriable I/O-busy 503 for no caller fault."""
+    _moe_server()
+    server.instances = ["a:ctx=512"]
+    server.slot_save_path = tempfile.mkdtemp()
+    server.start()
+
+    res = _complete("a", snapshot="missing", n_predict=1)
+    message = res.body.get("error", {}).get("message", "") if isinstance(res.body, dict) else ""
+    assert "snapshot io worker is busy" not in message
