@@ -223,6 +223,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
+| `--instance INSTANCE` | define a named context instance sharing this model's weights, format: `name[:group=G][:ctx=N][:parallel=M][:pinned][:default][:lora=PATH[:SCALE]...]` (repeatable, comma-separated values also accepted)<br/>(env: LLAMA_ARG_INSTANCES) |
+| `--instance-wait SECONDS` | how long a group-targeted request waits for a free instance before returning 503 (default: 60; -1 = wait forever)<br/>(env: LLAMA_ARG_INSTANCE_WAIT) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
@@ -1648,6 +1650,11 @@ For further documentation about this endpoint, please refer to [server internal 
 
 ## Using multiple models
 
+> Note: router mode (this section) is **out of scope** for the `_multi_context` branch. The
+> router machinery is kept in the binary but unused; it is not deleted and not modified. The
+> branch's in-process multi-context feature is documented in
+> [Using multiple instances](#using-multiple-instances) below.
+
 `llama-server` can be launched in a **router mode** that exposes an API for dynamically loading and unloading models. The main process (the "router") automatically forwards each request to the appropriate model instance.
 
 To start in router mode, launch `llama-server` **without specifying any model**:
@@ -2049,6 +2056,202 @@ Response:
   "success": true
 }
 ```
+
+## Using multiple instances
+
+One `llama-server` process serves **one model weights file**, and may allocate any number of
+named context windows ("instances") that all **share those weights**. The weights are loaded
+exactly once; each instance owns only its own KV cache and compute buffers.
+
+Start with `--instance`, one per named context. The base model configuration (`--ctx-size`,
+`--parallel`, ...) is inherited by every instance, and each instance may override it:
+
+```
+name[:group=G][:ctx=N][:parallel=M][:pinned][:default][:lora=PATH[:SCALE]...]
+```
+
+- `name` (required) and `group` are `[A-Za-z0-9._-]` strings; `group` defaults to `name`.
+- `ctx=N` sets the instance's context window. `0` (or absent) inherits the base `--ctx-size`.
+- `parallel=M` sets the number of slots in the instance's window (continuous batching).
+  `0` (or absent) means `1` - it **never** inherits the global `--parallel`.
+- `pinned` and `default` are advisory flags (see below). `default` marks the target of a bare
+  `<base>` request.
+- `lora=PATH[:SCALE]` declares a LoRA adapter for the instance (repeatable). `SCALE`
+  defaults to `1.0` and must be positive and finite; `PATH` must not contain `:` or `,`.
+  An instance with no `lora=` inherits the base `--lora` set. The adapter file is loaded
+  once per pool and shared by every instance that references it (see below).
+
+```sh
+# one process, three instances sharing the same weights
+llama-server -m model.gguf \
+  --alias base \
+  --instance work:group=jobs:ctx=8192 \
+  --instance chat:group=jobs:ctx=8192:parallel=4 \
+  --instance ledger:ctx=4096:pinned:default
+```
+
+`--instance-wait SECONDS` bounds how long a request targeting a group waits for a free member
+before returning `503` (default: `60`, `-1` = wait forever).
+
+### Context vs. slots (load-bearing rule)
+
+An instance's `ctx=N` is allocated **exactly** - it is never multiplied or divided by its
+`parallel` slot count. `parallel=M` splits that one window into `M` slots sharing it. To run
+`N` full-size conversations concurrently, create `N` instances at `parallel=1`; do **not** use
+one instance at `parallel=N` (that yields `N` slots of `ctx/N` tokens each).
+
+Worked example: with `--ctx-size 8192`, two instances at `parallel=1` give two independent
+8192-token conversations. One instance at `parallel=2` gives two 4096-token slots - each slot
+context is `n_ctx / n_parallel`.
+
+### Routing requests
+
+A request is routed to an instance by the `model` field (body for POST, query for GET) or by
+the `instance` field. The pool identity is `base` (the first `--alias`, else the model name,
+else the file name):
+
+| `model` value | Target |
+| --- | --- |
+| *(empty)* | the `instance` field, else the `default` instance, else the sole instance, else `400 ambiguous` |
+| `base` | the `default` instance (or the sole instance, or `400 ambiguous`) |
+| `base:latest` | the `default` instance |
+| `base:work` | the instance named `work` (exact name match wins over group) |
+| `base:jobs` | the group `jobs` - dispatches to its least-busy free member |
+| `base:latest:work` | the instance named `work` via the reserved `latest` pin |
+| `base:latest:jobs` | the group `jobs` via the reserved `latest` pin - dispatches to its least-busy free member |
+| anything else | `404 model not found on this child` |
+
+`latest` is a reserved routing token: no instance name or group may be called
+`latest` (rejected with `400`), and ids with more than three `:`-separated
+components never resolve.
+
+The explicit `instance` field overrides the instance/group component of `model`. A request
+may also carry `snapshot` (apply a saved KV snapshot, see below) and `id_slot` (default `0`).
+
+Group dispatch picks the member with the fewest busy slots, then the least recently used,
+waiting up to `--instance-wait` seconds for a free member before returning `503`.
+
+Endpoints without a `model` field (`/health`, `/props`, `/tokenize`, `/detokenize`,
+`/apply-template`, `/control`) run on the `default` instance. `/metrics` renders the
+resolved target instance (the default when untargeted, `404` for an unbuilt target, `400`
+for a GROUP or unknown target) and a scrape never builds a window. The legacy
+`GET/POST /lora-adapters` targets the default instance: `POST` requires a built default
+(`404` otherwise), refreshes that instance's resolved set so a later attach cannot revert
+the scale, and revokes its slot-snapshot bindings. `/models` lists one entry per instance
+(tagged with `n_ctx`, `parallel`, `status`); a member whose route fails is reported as an
+`{"instance", "error"}` marker row instead of failing the whole aggregate. `/slots`
+aggregates every instance's slots when no target is given, tagging each with `instance`.
+`/props` adds `total_slots` and an `instances` array.
+
+### Management API
+
+#### GET `/instances`: list instances, memory and snapshots
+
+```json
+{
+  "instances": [ {
+    "id": "base:work", "aliases": [...], "group": "jobs",
+    "n_ctx": 8192, "parallel": 1, "pinned": false, "is_default": false,
+    "state": "loaded",
+<    "model_bytes": 0, "context_bytes": 0, "compute_bytes": 0, "adapter_bytes": 0,
+    "total_bytes": 0, "vram_bytes": 0, "last_used": -1, "last_used_epoch": -1
+  } ],
+  "snapshots": [ { "name": "...", "size": 0, "mtime": 0, "n_ctx_seq": 0, "adapter_fp": "...", "instance": "work" } ],
+  "total": { "model": 0, "context": 0, "compute": 0, "adapter": 0, "total": 0 }
+}
+```
+
+`state` is `"loaded"` once the window exists, `"unloaded"` while the instance is
+registered but never demanded (a mere listing never materializes a window).
+`n_ctx` is the actual window size: explicit `ctx=` is reported as configured,
+while an inheriting instance reports the model default once built (or while the
+weights are loaded), `0` only when the weights are unloaded. `last_used` is the
+monotonic microsecond stamp of the last completion (`-1` when unused or
+unbuilt); `last_used_epoch` is the same event in unix epoch seconds for
+cross-process idle math. The shared `model_bytes` are
+counted once in `total.model`. When the last instance is deleted the weights are freed, the
+pool reports `instances: []` and all-zero totals, and a later `POST /instances` reloads them.
+
+#### POST `/instances`: create an instance
+
+Body: `{ "name": "work", "group": "jobs", "ctx_size": 8192, "parallel": 2, "pinned": false, "default": false }`.
+`group` defaults to `name`. Returns `201` with the instance JSON; `409` on a duplicate name or
+a name/group collision; `400` on an invalid name/group; `507` if the context cannot be
+allocated.
+
+#### POST `/instances/:name/pin`, `/instances/:name/unpin`
+
+Toggle the advisory `pinned` flag. Pinned is never enforced in this branch.
+
+#### POST `/instances/:name/resize`
+
+Body: `{ "ctx_size": 4096 }`. Tears down the old context and rebuilds the
+instance's window at the new size (the KV cache is rebuilt; slot snapshot
+bindings are cleared). Returns `200` with `{ "n_ctx": <actual size> }`. If the
+rebuild fails the instance is left unbuilt and the endpoint returns `507`; a
+later demand retries the build at the new size. Resizing an unbuilt instance
+only records the size for its first demand.
+
+#### DELETE `/instances/:name`
+
+Destroys the instance. In-flight requests are aborted and drained before the scheduler
+thread is stopped. Deleting the last instance unloads the shared weights. Returns
+`{ "success": true }`; `404` if the instance does not exist.
+
+#### Snapshot save / restore
+
+`--slot-save-path DIR` must be set (`501` without it). Snapshots are scoped
+per instance: new files are written as
+`DIR/<model_key>/<instance>/<snapshot>.bin`, where `model_key` is the pool
+identity sanitized (`/` and `:` become `_`) plus a short deterministic hash so
+identities that sanitize alike never share a directory. Files written before
+per-instance scoping live flat at `DIR/<model_key>/<snapshot>.bin` (legacy
+layout); reads fall back to them, per-instance lists include them tagged
+`"instance": null`, and a fresh save supersedes them.
+
+- `POST /instances/:name/snapshot` body `{ "name": "foo" }` saves slot `0`'s KV and binds it.
+  Returns `201`.
+- `GET /instances/:name/snapshots` returns `200` with `{ "snapshots": [...] }`
+  for that instance's namespace (own files plus legacy flat files).
+- `DELETE /instances/:name/snapshot/foo` removes the file and unbinds it. Returns
+  `{ "success": true }`.
+- A request carrying `"snapshot": "foo"` loads that snapshot into the slot, replacing its KV
+  and prompt; while the slot is bound to a snapshot, later requests extend it and the
+  extended KV is saved back when the slot switches away. A snapshot saved under a different
+  context size is rejected with `400`; a missing snapshot is `404`; a corrupt file is
+  `400`; a busy worker or a timed-out switch is `503`. A snapshot saved under a different
+  adapter set is rejected with `400` (see below).
+
+#### Per-instance LoRA adapters
+
+Each instance may carry its own LoRA adapter set: declared at startup with
+`--instance NAME:lora=PATH[:SCALE]...`, or attached at runtime. Every adapter file is
+loaded **once per pool** against the shared weights and referenced by any number of
+instances; deleting the last reference frees it, and deleting the last instance drains
+the whole registry before the weights are unloaded.
+
+- `POST /instances/:name/adapters` body `{ "path": "a.gguf", "scale": 1.0 }` attaches
+  (re-attach updates the scale). Returns `200` with the instance JSON; `400` on a bad
+  path/scale or an unloadable file; `404` on an unknown instance. Attaching to an
+  unbuilt window records the declaration; it resolves when the window materializes.
+- `GET /instances/:name/adapters` returns `[ { "path": "...", "scale": 1.0 } ]` in
+  instance order; `404` on an unknown instance.
+- `DELETE /instances/:name/adapters` body `{ "path": "a.gguf" }` detaches (`?path=`
+  accepted as an alias, since filesystem paths cannot fit a `:path` URL segment).
+  Returns `{ "success": true }`; `404` on an unknown instance or adapter.
+
+Attach/detach run under an exclusive drain (in-flight generations finish first) and
+apply synchronously: the next request always sees the new set. The swap invalidates
+every slot's live KV and revokes snapshot bindings (like resize). Each instance reports
+its own `adapter_bytes`; `total.adapter` counts each file once.
+
+Snapshots record the adapter fingerprint they were saved under (`adapter_fp` in the
+listing). Restoring under a different set returns `400 "snapshot adapter set does not
+match this instance"`. Files written before fingerprints (no `adapter_fp`) restore with
+a warning for backward compatibility.
+
+ The legacy `GET/POST /lora-adapters` endpoints are unchanged: they address the default
+ instance's scale-only adapter list.
 
 ## API errors
 

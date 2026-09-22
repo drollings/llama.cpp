@@ -16,6 +16,13 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
+
+// pure merge for GET /instances aggregation across children (implemented in
+// server-models.cpp). each entry pairs a child model name with its
+// GET /instances envelope; see server_models::get_instances_aggregate.
+json server_models_merge_instances(const std::vector<std::pair<std::string, json>> & per_model);
 
 /**
  * state diagram:
@@ -106,6 +113,21 @@ struct server_model_meta {
     void update_args(common_preset_context & ctx_presets, std::string bin_path);
     void update_caps();
 };
+
+// bounded fan-out collector for GET /instances aggregation (implemented in
+// server-models.cpp). runs fetch over targets with a capped number of
+// concurrent workers and collects results up to deadline_ms; a late task
+// skips exactly like an unreachable child (never fatal to the aggregate).
+// results sort by model name so parallel completion order never leaks into
+// the output. a fetch returning nullopt (or throwing) skips that child.
+// deadline_ms bounds scheduling of new batches; the hard worst case is
+// deadline_ms plus one per-child socket timeout, because an in-flight read
+// cannot be cancelled. it measures caller latency, never child health.
+using instances_fetch_fn = std::function<std::optional<std::pair<std::string, json>>(const server_model_meta &)>;
+std::vector<std::pair<std::string, json>> instances_fanout_collect(
+    const std::vector<server_model_meta> & targets,
+    const instances_fetch_fn &             fetch,
+    int64_t                                deadline_ms);
 
 struct server_models_routes;
 struct server_lru_sched; // defined in server-models.cpp
@@ -236,7 +258,7 @@ public:
     server_models(const common_params & params, int argc, char ** argv);
     ~server_models();
 
-    server_response sse; // for real-time updates via SSE endpoint
+    server_result_queue<server_task_result_ptr> sse; // for real-time updates via SSE endpoint
 
     // (re-)load the list of models from various sources and prepare the metadata mapping
     // - if this is called the first time, simply populate the metadata
@@ -300,6 +322,13 @@ public:
 
     // proxy an HTTP request to the model instance
     server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached = false);
+
+    // aggregate GET /instances across every running child (or just `only`
+    // when non-empty): concatenated instance rows, snapshots tagged with
+    // their owning "model", 64-bit-summed totals. children without the
+    // management API (no --instance flags) or unreachable children are
+    // skipped, never fatal. thread-safe.
+    json get_instances_aggregate(const std::string & only = "");
 
     // handle message sent from server_child::notify_to_router()
     // raw input must starts with CMD_CHILD_TO_ROUTER_STATE, followed by a JSON string
@@ -372,6 +401,10 @@ struct server_models_routes {
     server_http_context::handler_t router_stream_get;
     server_http_context::handler_t router_streams_lookup;
     server_http_context::handler_t router_stream_delete;
+
+    // GET /instances[?model=<child>]: the aggregate instance envelope across
+    // children (see server_models::get_instances_aggregate)
+    server_http_context::handler_t get_router_instances;
 };
 
 /**

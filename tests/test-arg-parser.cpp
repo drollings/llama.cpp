@@ -229,6 +229,21 @@ static void test(void) {
     argv = {"binary_name", "-lm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // repeated --instance flags accumulate into one list, so duplicates and
+    // name/group collisions across flags fail just like comma-separated ones
+    {
+        common_params inst_params;
+        argv = {"binary_name", "--instance", "a", "--instance", "a"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), inst_params, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--instance", "x:group=y", "--instance", "y"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), inst_params, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--instance", "a", "--instance", "b"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), inst_params, LLAMA_EXAMPLE_SERVER));
+        assert(inst_params.instances.size() == 2);
+    }
+
     printf("test-arg-parser: test valid usage\n\n");
 
     argv = {"binary_name", "-m", "model_file.gguf"};
@@ -272,6 +287,13 @@ static void test(void) {
         common_params synth_params;
         argv = {"binary_name", "--spec-synth-len", "3.4x"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
+    }
+
+    {
+        common_params kv_params;
+        argv = {"binary_name", "--kv-unified-per-slot", "2048"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_SERVER));
+        assert(kv_params.kv_unified_per_slot == 2048);
     }
 
     argv = {"binary_name", "-lm", "none"};
@@ -361,6 +383,15 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "overwritten.gguf");
     assert(params.cpuparams.n_threads == 1010);
+
+    {
+        common_params kv_params;
+        setenv("LLAMA_ARG_KV_UNIFIED_PER_SLOT", "2048", true);
+        argv = {"binary_name"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_SERVER));
+        assert(kv_params.kv_unified_per_slot == 2048);
+        unsetenv("LLAMA_ARG_KV_UNIFIED_PER_SLOT");
+    }
 #endif // _WIN32
 
     printf("test-arg-parser: test download functions\n\n");

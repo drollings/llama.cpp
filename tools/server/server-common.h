@@ -23,6 +23,19 @@
 
 using json = common_json;
 
+// race-free aggregate of one context's slot activity, published by the scheduler
+// thread and read by the manager for group routing and last-used reporting.
+// single writer (the scheduler), lock-free for readers; values are best-effort
+// and may be stale by design. the task-time queue re-check stays the correctness
+// gate and must not be skipped based on these numbers.
+struct server_context_stats {
+    int     n_processing     = 0;  // slots currently processing (busy)
+    int64_t last_used_us     = -1; // max t_last_used over slots, monotonic us, -1 = never
+    int64_t last_used_wall_s = -1; // max t_last_used_wall_s over slots, epoch s, -1 = never
+    int32_t n_ctx_slot       = 0;  // per-slot context, fixed at load
+    int32_t n_ctx_total      = 0;  // whole-window context, fixed at load
+};
+
 #define SLT_DBG(slot, fmt, ...) LOG_DBG("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
 #define SLT_TRC(slot, fmt, ...) LOG_TRC("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
 #define SLT_INF(slot, fmt, ...) LOG_INF("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
@@ -124,6 +137,15 @@ bool are_lora_equal(
         const std::vector<common_adapter_lora_info> & l1,
         const std::vector<common_adapter_lora_info> & l2);
 
+// strict identity for whole-set swaps (per-instance attach/detach): path, scale
+// AND pointer must match element-wise. are_lora_equal ignores path, so a freed
+// adapter whose heap address is reused by a different file would compare equal
+// and skip the KV invalidation. same path+scale+ptr implies the same object,
+// hence the same tensors.
+bool are_lora_sets_identical(
+        const std::vector<common_adapter_lora_info> & l1,
+        const std::vector<common_adapter_lora_info> & l2);
+
 // get the ids of all enabled loras
 std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_info> & loras);
 
@@ -221,6 +243,9 @@ public:
     size_t size() const { return tokens.size(); }
 
     bool empty() const { return tokens.empty(); }
+
+    // true if the sequence actually contains image/audio chunks.
+    bool has_media() const { return !map_idx_to_media.empty(); }
 
     void clear() {
         map_idx_to_media.clear();

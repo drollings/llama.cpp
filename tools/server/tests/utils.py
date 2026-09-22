@@ -93,6 +93,9 @@ class ServerProcess:
     models_dir: str | None = None
     models_max: int | None = None
     models_preset: str | None = None
+    instances: List[str] | None = None
+    instance_wait_seconds: int | None = None
+    kv_unified_per_slot: int | None = None
     no_models_autoload: bool | None = None
     lora_files: List[str] | None = None
     enable_ctx_shift: int | None = False
@@ -182,6 +185,13 @@ class ServerProcess:
             server_args.extend(["--models-max", self.models_max])
         if self.models_preset:
             server_args.extend(["--models-preset", self.models_preset])
+        if self.instances:
+            for instance in self.instances:
+                server_args.extend(["--instance", instance])
+        if self.instance_wait_seconds is not None:
+            server_args.extend(["--instance-wait", self.instance_wait_seconds])
+        if self.kv_unified_per_slot is not None:
+            server_args.extend(["--kv-unified-per-slot", self.kv_unified_per_slot])
         if self.cors_origins:
             server_args.extend(["--cors-origins", self.cors_origins])
         if self.n_batch:

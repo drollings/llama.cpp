@@ -15,6 +15,7 @@
 
 #include <functional>
 #include <optional>
+#include <future>
 #include <algorithm>
 #include <thread>
 #include <mutex>
@@ -423,6 +424,34 @@ struct server_lru_sched {
 // short loopback budget for the resumable stream router to child JSON calls (probe, lookup,
 // delete). distinct from params.timeout_read/write which only applies to the generation proxy
 static constexpr int STREAM_LOOKUP_TIMEOUT_MS = 250;
+
+// per-child GET /instances fan-out budget for the router aggregate below
+static constexpr int INSTANCES_AGG_TIMEOUT_MS = 5000;
+// global wall-clock budget for the whole aggregate (fetch all children and
+// merge): bounds how long slow children may tax the aggregate caller. this
+// measures caller latency, not child health: a skipped child is reported by
+// absence (as today), never scored, persisted, or cached.
+static constexpr int64_t INSTANCES_AGG_TOTAL_MS = 15000;
+// concurrency cap for one fan-out batch: a child beyond this waits for the next
+// batch. small test values let the scheduling bounds be exercised without
+// starting the production-sized set of children.
+static constexpr size_t INSTANCES_FANOUT_MAX = 8;
+
+// the three fan-out constants are overridable so tests can drive the scheduling
+// boundaries with a handful of children instead of waiting out the production
+// seconds-long budgets. unset keeps the production values.
+static int instances_agg_child_timeout_ms() {
+    const char * env = std::getenv("LLAMA_SERVER_TEST_AGG_CHILD_TIMEOUT_MS");
+    return env != nullptr ? std::max(1, std::atoi(env)) : INSTANCES_AGG_TIMEOUT_MS;
+}
+static int64_t instances_agg_total_ms() {
+    const char * env = std::getenv("LLAMA_SERVER_TEST_AGG_TOTAL_MS");
+    return env != nullptr ? std::max<int64_t>(1, std::atoll(env)) : INSTANCES_AGG_TOTAL_MS;
+}
+static size_t instances_fanout_max() {
+    const char * env = std::getenv("LLAMA_SERVER_TEST_AGG_FANOUT_MAX");
+    return env != nullptr ? (size_t) std::max(1, std::atoi(env)) : INSTANCES_FANOUT_MAX;
+}
 
 static std::filesystem::path get_server_exec_path() {
 #if defined(_WIN32)
@@ -1536,6 +1565,200 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
     return true;
 }
 
+// pure merge for GET /instances aggregation across children. each entry pairs
+// a child model name with its GET /instances envelope. instance rows pass
+// through untouched (child ids are already <alias>:<name> qualified);
+// snapshot rows gain their owning "model"; totals sum with 64-bit saturation
+// (each child loads its own weights, so model bytes sum across children).
+// envelopes that are not objects (pre-envelope forks) contribute nothing.
+json server_models_merge_instances(const std::vector<std::pair<std::string, json>> & per_model) {
+    json instances = json::array();
+    json snapshots = json::array();
+    uint64_t total_model = 0, total_context = 0, total_compute = 0, total_adapter = 0, total_total = 0;
+    const auto sat_add = [](uint64_t a, uint64_t b) {
+        return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+    };
+    const auto as_u64 = [](const json & v) -> uint64_t {
+        // common_json only exposes is_number_integer (true for unsigned too),
+        // and get<>() static_casts without range checks — so a negative cast
+        // result is either truly negative or >= 2^63. the dump disambiguates
+        // exactly (a leading '-' is a genuine negative).
+        if (!v.is_number_integer()) {
+            return 0;
+        }
+        const int64_t n = v.get<int64_t>();
+        if (n >= 0) {
+            return (uint64_t) n;
+        }
+        return v.dump().rfind('-', 0) == 0 ? 0 : UINT64_MAX;
+    };
+    const auto field_u64 = [&](const json & obj, const std::string & key) -> uint64_t {
+        if (!obj.is_object() || !obj.contains(key)) {
+            return 0;
+        }
+        return as_u64(obj.at(key));
+    };
+    for (const auto & item : per_model) {
+        const std::string & model    = item.first;
+        const json &        envelope = item.second;
+        if (!envelope.is_object()) {
+            continue;
+        }
+        if (envelope.contains("instances") && envelope.at("instances").is_array()) {
+            instances.insert(envelope.at("instances"));
+        }
+        if (envelope.contains("snapshots") && envelope.at("snapshots").is_array()) {
+            for (const json & entry : envelope.at("snapshots")) {
+                json tagged = entry;
+                if (tagged.is_object()) {
+                    tagged["model"] = model;
+                }
+                snapshots.push_back(tagged);
+            }
+        }
+        // the child envelope nests its sums under "total"
+        if (envelope.contains("total") && envelope.at("total").is_object()) {
+            const json & t = envelope.at("total");
+            total_model   = sat_add(total_model,   field_u64(t, "model"));
+            total_context = sat_add(total_context, field_u64(t, "context"));
+            total_compute = sat_add(total_compute, field_u64(t, "compute"));
+            total_adapter = sat_add(total_adapter, field_u64(t, "adapter"));
+            // each child total already includes its adapters: sum verbatim,
+            // never re-add the legs here
+            total_total   = sat_add(total_total,   field_u64(t, "total"));
+        }
+    }
+    return {
+        { "instances", std::move(instances) },
+        { "snapshots", std::move(snapshots) },
+        { "total",
+          {
+              { "model",   total_model   },
+              { "context", total_context },
+              { "compute", total_compute },
+              { "adapter", total_adapter },
+              { "total",   total_total   },
+          }                                     },
+    };
+}
+
+// one child's envelope: nullopt when the child is unreachable, non-200, or
+// garbled (a child without instance grammar 404s, a dead child refuses).
+// never throws, never fatal to the aggregate.
+static std::optional<std::pair<std::string, json>> fetch_child_instances(const server_model_meta & meta) {
+    try {
+        httplib::Client cli(CHILD_ADDR, meta.port);
+        cli.set_connection_timeout(0, instances_agg_child_timeout_ms() * 1000);
+        cli.set_read_timeout(0, instances_agg_child_timeout_ms() * 1000);
+        cli.set_write_timeout(0, instances_agg_child_timeout_ms() * 1000);
+        auto resp = cli.Get("/instances");
+        if (!resp || resp->status != 200) {
+            return std::nullopt;
+        }
+        json envelope = json::parse(resp->body);
+        return std::make_pair(meta.name, std::move(envelope));
+    } catch (const std::exception &) {
+        return std::nullopt;
+    }
+}
+
+std::vector<std::pair<std::string, json>> instances_fanout_collect(
+        const std::vector<server_model_meta> & targets,
+        const instances_fetch_fn &             fetch,
+        int64_t                                deadline_ms) {
+    // bounded fan-out: at most instances_fanout_max() concurrent fetches (one
+    // async task per child would be a thundering herd under many children).
+    // each batch's futures are collected up to the shared deadline; a late child
+    // skips exactly like a dead one. the cap bounds caller latency, not child
+    // health: nothing about a skipped child is recorded.
+    //
+    // contract: deadline_ms bounds the *scheduling* of new batches, never child
+    // health. the hard worst case is the budget plus one per-child socket timeout,
+    // because an in-flight blocking read cannot be cancelled: once the budget is
+    // spent no further batch starts, but the batch already running still pays its
+    // stragglers up to the per-child timeout. results are pure caller latency; a
+    // skipped child is simply absent, never scored or persisted.
+    std::vector<std::pair<std::string, json>> per_model;
+    const size_t fanout_max = instances_fanout_max();
+    for (size_t begin = 0; begin < targets.size(); begin += fanout_max) {
+        // no new work after the budget: the previous batch's destructors already
+        // paid their in-flight timeout, and launching another batch would stack
+        // another one on top of the bound above
+        if (deadline_ms - ggml_time_ms() <= 0) {
+            break;
+        }
+        const size_t end = std::min(begin + fanout_max, targets.size());
+        std::vector<std::future<std::optional<std::pair<std::string, json>>>> futs;
+        for (size_t i = begin; i < end; ++i) {
+            futs.push_back(std::async(std::launch::async, fetch, targets[i]));
+        }
+        // collect up to the shared deadline. ready futures are taken without
+        // spending budget (collecting costs nothing); the deadline only bounds
+        // waiting, so a slow child can never starve ready siblings behind it
+        // in the batch order.
+        std::vector<bool> done(futs.size(), false);
+        size_t left = futs.size();
+        while (left > 0) {
+            if (deadline_ms - ggml_time_ms() <= 0) {
+                break;
+            }
+            bool progress = false;
+            for (size_t k = 0; k < futs.size(); ++k) {
+                if (done[k]) {
+                    continue;
+                }
+                if (futs[k].wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+                    continue;
+                }
+                done[k] = true;
+                --left;
+                progress = true;
+                try {
+                    if (auto got = futs[k].get()) {
+                        per_model.push_back(std::move(*got));
+                    }
+                } catch (const std::exception &) {
+                    continue;
+                }
+            }
+            if (left > 0 && !progress) {
+                const int64_t remain = deadline_ms - ggml_time_ms();
+                if (remain <= 0) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(std::min<int64_t>(remain, 10)));
+            }
+        }
+    }
+    // deterministic output regardless of completion order
+    std::sort(per_model.begin(), per_model.end(),
+              [](const auto & a, const auto & b) { return a.first < b.first; });
+    return per_model;
+}
+
+json server_models::get_instances_aggregate(const std::string & only) {
+    // running children to query: just `only` when it names a live model, else
+    // every running child. resolve under the models lock via copies only.
+    std::vector<server_model_meta> targets;
+    if (!only.empty()) {
+        auto meta = get_meta(only);
+        if (!meta.has_value() || !meta->is_running()) {
+            return nullptr;  // caller maps to 404
+        }
+        targets.push_back(*meta);
+    } else {
+        for (const auto & meta : get_all_meta()) {
+            if (meta.is_running()) {
+                targets.push_back(meta);
+            }
+        }
+    }
+
+    const int64_t deadline_ms = ggml_time_ms() + instances_agg_total_ms();
+    auto per_model = instances_fanout_collect(targets, fetch_child_instances, deadline_ms);
+    return server_models_merge_instances(per_model);
+}
+
 server_http_res_ptr server_models::proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached) {
     auto meta = get_meta(name);
     if (!meta.has_value()) {
@@ -1803,9 +2026,9 @@ void server_child::notify_to_router(const std::string & state, const json & payl
 // RAII wrapper similar to server_response_reader, but doesn't use server_queue
 static std::atomic<int> sse_client_id_counter = 0;
 struct server_models_sse_client {
-    server_response & queue_results;
+    server_result_queue<server_task_result_ptr> & queue_results;
     int client_id;
-    server_models_sse_client(server_response & q)
+    server_models_sse_client(server_result_queue<server_task_result_ptr> & q)
             : queue_results(q), client_id(sse_client_id_counter.fetch_add(1, std::memory_order_relaxed)) {
         SRV_DBG("new SSE client connected, assigned client_id=%d\n", client_id);
         queue_results.add_waiting_task_id(client_id);
@@ -2320,6 +2543,26 @@ void server_models_routes::init_routes() {
         models.conv_models.forget(conv_id);
         res->status = 204;
         res->content_type = "application/json";
+        return res;
+    };
+
+    this->get_router_instances = [this](const server_http_req & req) {
+        // GET /instances[?model=<child>]: the aggregate instance envelope
+        // across children. a named child that is unknown or not running is a
+        // 404; children without instance grammar are skipped inside the
+        // aggregate, never fatal.
+        auto res = std::make_unique<server_http_res>();
+        std::string only = req.get_param("model");
+        if (!only.empty() && !models.has_model(only)) {
+            res_err(res, format_error_response("model not found: '" + only + "'", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        json envelope = models.get_instances_aggregate(only);
+        if (envelope.is_null()) {
+            res_err(res, format_error_response("model is not running: '" + only + "'", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        res_ok(res, envelope);
         return res;
     };
 }

@@ -11,10 +11,12 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
 #include <chrono>
+#include <cstdlib>
 #include <cstdarg>
 #include <cstring>
 #include <ctime>
@@ -405,6 +407,10 @@ void common_params_print_info(const common_params & params, bool print_devices) 
     const int verbosity = common_log_get_verbosity_thold();
     COM_INF("%s: verbosity = %d (adjust with the `-lv N` CLI arg)\n", __func__, verbosity);
 
+    if (!params.instances.empty()) {
+        COM_INF("%s: instances = %s\n", __func__, common_instances_to_string(params.instances).c_str());
+    }
+
     // device enumeration creates a primary context on CUDA backends, skip it when the caller does not own any device
     if (print_devices && verbosity >= LOG_LEVEL_TRACE) {
         COM_TRC("%s", "device_info:\n");
@@ -434,6 +440,252 @@ std::string common_params_get_system_info(const common_params & params) {
 #endif
 
     return os.str();
+}
+
+common_params common_instance_params(const common_params & base, const common_instance & inst) {
+    common_params params = base;
+    // the effective per-instance params never reference the pool's instance list; dropping
+    // it avoids an O(N^2) copy of the whole instances vector per instance in a large pool.
+    params.instances.clear();
+
+    if (inst.ctx_size > 0) {
+        params.n_ctx = inst.ctx_size;
+    }
+
+    // parallel defaults to 1, NEVER to the base (global --parallel) value
+    params.n_parallel = inst.parallel > 0 ? inst.parallel : 1;
+
+    // non-empty lora list replaces the base --lora set; ptrs stay null for the pool to resolve
+    if (!inst.lora.empty()) {
+        params.lora_adapters.clear();
+        for (const auto & la : inst.lora) {
+            params.lora_adapters.push_back({ la.first, la.second, "", "", nullptr });
+        }
+    }
+
+    return params;
+}
+
+void common_instance_validate(const common_instance & inst) {
+    auto check = [](const char * field, const std::string & value) {
+        if (value.empty()) {
+            throw std::invalid_argument(string_format("%s cannot be empty", field));
+        }
+        for (char c : value) {
+            const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                            c == '.' || c == '_' || c == '-';
+            if (!ok) {
+                throw std::invalid_argument(string_format(
+                    "invalid %s '%s': allowed characters are [A-Za-z0-9._-]", field, value.c_str()));
+            }
+        }
+    };
+    check("instance name", inst.name);
+    check("instance group", inst.group);
+    // a space can never survive the CLI layer (it splits argv), so an adapter
+    // path containing one is rejected here rather than failing later at load
+    for (const auto & la : inst.lora) {
+        if (la.first.find(' ') != std::string::npos) {
+            throw std::invalid_argument(string_format(
+                "invalid lora path '%s': spaces are not allowed", la.first.c_str()));
+        }
+    }
+    // 'latest' is a reserved routing token (base:latest:<name|group>), so no
+    // instance or group may claim it, otherwise the alias would be ambiguous
+    if (inst.name == "latest") {
+        throw std::invalid_argument("instance name 'latest' is reserved");
+    }
+    if (inst.group == "latest") {
+        throw std::invalid_argument("instance group 'latest' is reserved");
+    }
+}
+
+// full-consume integer parse for instance options: std::stoi accepts trailing
+// garbage ("8192xyz" parses as 8192), so numerics use this instead. every
+// failure (empty, non-numeric, trailing characters, overflow) maps to
+// std::invalid_argument naming the option. sign handling stays downstream:
+// "-5" parses here, then the non-negative check rejects it, as before.
+static int32_t parse_strict_i32(const std::string & val, const std::string & what, const std::string & part) {
+    const std::string v = string_strip(val);
+    if (v.empty()) {
+        throw std::invalid_argument(string_format("invalid %s value '' (in '%s')", what.c_str(), part.c_str()));
+    }
+    char * end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(v.c_str(), &end, 10);
+    if (end == nullptr || *end != '\0' || errno == ERANGE || parsed > INT32_MAX || parsed < INT32_MIN) {
+        throw std::invalid_argument(string_format("invalid %s value '%s' (in '%s')", what.c_str(), val.c_str(), part.c_str()));
+    }
+    return (int32_t) parsed;
+}
+
+void common_instances_validate_all(const std::vector<common_instance> & instances) {
+    // duplicate names and group/name collisions over the full list; each
+    // direction names its own colliding pair
+    for (size_t i = 0; i < instances.size(); ++i) {
+        for (size_t j = i + 1; j < instances.size(); ++j) {
+            if (instances[i].name == instances[j].name) {
+                throw std::invalid_argument(string_format("duplicate instance name '%s'", instances[i].name.c_str()));
+            }
+            if (instances[i].group == instances[j].name) {
+                throw std::invalid_argument(string_format("instance group '%s' collides with instance name '%s'",
+                    instances[i].group.c_str(), instances[j].name.c_str()));
+            }
+            if (instances[j].group == instances[i].name) {
+                throw std::invalid_argument(string_format("instance group '%s' collides with instance name '%s'",
+                    instances[j].group.c_str(), instances[i].name.c_str()));
+            }
+        }
+    }
+
+    // the name/group character class (shared with the runtime API)
+    for (const auto & inst : instances) {
+        common_instance_validate(inst);
+    }
+}
+
+std::vector<common_instance> common_instances_parse(const std::string & spec) {
+    std::vector<common_instance> instances;
+
+    for (const auto & s : string_split<std::string>(spec, ',')) {
+        const std::string part = string_strip(s);
+        if (part.empty()) {
+            continue;
+        }
+
+        const auto comps = string_split<std::string>(part, ':');
+
+        common_instance inst;
+        inst.name = string_strip(comps[0]);
+        if (inst.name.empty()) {
+            throw std::invalid_argument(string_format("instance name cannot be empty (in '%s')", part.c_str()));
+        }
+
+        for (size_t i = 1; i < comps.size(); ++i) {
+            const std::string comp = string_strip(comps[i]);
+            if (comp.empty()) {
+                throw std::invalid_argument(string_format("empty option in instance '%s'", part.c_str()));
+            }
+
+            const auto eq = comp.find('=');
+            // whitespace around '=' is leniency: the key matches stripped, so
+            // 'group =G' addresses the group instead of dying as unknown
+            const std::string key = eq == std::string::npos ? comp : string_strip(comp.substr(0, eq));
+            const std::string val = eq == std::string::npos ? "" : comp.substr(eq + 1);
+
+            if (key == "group") {
+                const std::string group = string_strip(val);
+                if (group.empty()) {
+                    throw std::invalid_argument("group value cannot be empty");
+                }
+                inst.group = group;
+            } else if (key == "ctx") {
+                inst.ctx_size = parse_strict_i32(val, "ctx", part);
+                if (inst.ctx_size < 0) {
+                    throw std::invalid_argument("ctx must be non-negative");
+                }
+            } else if (key == "parallel") {
+                inst.parallel = parse_strict_i32(val, "parallel", part);
+                if (inst.parallel < 0) {
+                    throw std::invalid_argument("parallel must be non-negative");
+                }
+            } else if (key == "pinned") {
+                if (!val.empty()) {
+                    throw std::invalid_argument("pinned takes no value");
+                }
+                inst.pinned = true;
+            } else if (key == "default") {
+                if (!val.empty()) {
+                    throw std::invalid_argument("default takes no value");
+                }
+                inst.is_default = true;
+            } else if (key == "lora") {
+                if (val.empty()) {
+                    throw std::invalid_argument("lora path cannot be empty");
+                }
+                if (val.find(':') != std::string::npos || val.find(',') != std::string::npos) {
+                    throw std::invalid_argument(string_format("lora path '%s' cannot contain ':' or ','", val.c_str()));
+                }
+                // optional scale is the next ':' component when it parses as a positive finite float
+                float scale = 1.0f;
+                if (i + 1 < comps.size()) {
+                    const std::string next = string_strip(comps[i + 1]);
+                    char * end = nullptr;
+                    const float parsed = strtof(next.c_str(), &end);
+                    if (end != nullptr && *end == '\0' && std::isfinite(parsed)) {
+                        if (parsed <= 0.0f) {
+                            throw std::invalid_argument(string_format("lora scale must be positive (in '%s')", part.c_str()));
+                        }
+                        scale = parsed;
+                        ++i; // consume the scale component
+                    } else if (end != nullptr && *end == '\0') {
+                        // fully parsed but non-finite (nan/inf): a scale was
+                        // attempted, so name the scale instead of falling
+                        // through to 'unknown option'
+                        throw std::invalid_argument(string_format("invalid lora scale '%s' (in '%s')", next.c_str(), part.c_str()));
+                    }
+                }
+                for (const auto & prev : inst.lora) {
+                    if (prev.first == val) {
+                        throw std::invalid_argument(string_format("duplicate lora path '%s' in instance '%s'", val.c_str(), part.c_str()));
+                    }
+                }
+                inst.lora.emplace_back(val, scale);
+            } else {
+                throw std::invalid_argument(string_format("unknown option '%s' in instance '%s'", comp.c_str(), part.c_str()));
+            }
+        }
+
+        if (inst.group.empty()) {
+            inst.group = inst.name;
+        }
+
+        instances.push_back(std::move(inst));
+    }
+
+    common_instances_validate_all(instances);
+
+    return instances;
+}
+
+std::string common_instances_to_string(const std::vector<common_instance> & instances) {
+    std::vector<std::string> parts;
+    for (const auto & inst : instances) {
+        std::string s = inst.name;
+
+        if (!inst.group.empty() && inst.group != inst.name) {
+            s += ":group=" + inst.group;
+        }
+        if (inst.ctx_size > 0) {
+            s += ":ctx=" + std::to_string(inst.ctx_size);
+        }
+        if (inst.parallel > 0) {
+            s += ":parallel=" + std::to_string(inst.parallel);
+        }
+        if (inst.pinned) {
+            s += ":pinned";
+        }
+        if (inst.is_default) {
+            s += ":default";
+        }
+        // the adapter list in grammar form: paths print verbatim (they never
+        // contain ':' or ','), the scale only when it differs from the default.
+        // scales print with %.9g (exact float round trip), matching the
+        // raw-bits fingerprint input.
+        for (const auto & la : inst.lora) {
+            s += ":lora=" + la.first;
+            if (la.second != 1.0f) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%.9g", (double) la.second);
+                s += ":";
+                s += buf;
+            }
+        }
+
+        parts.push_back(s);
+    }
+
+    return string_join(parts, ",");
 }
 
 //
@@ -1272,7 +1524,12 @@ static void common_init_sampler_from_model(
 
 struct common_init_result::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+        if (model_borrowed) {
+            // the model is owned by the caller, so do not free it
+            model.release();
+        }
+    }
 
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
 
@@ -1285,6 +1542,9 @@ struct common_init_result::impl {
 
     std::vector<common_sampler_ptr> samplers;
     std::vector<llama_sampler_seq_config> samplers_seq_config;
+
+    // when true, `model` is owned by the caller and must not be freed
+    bool model_borrowed = false;
 };
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
@@ -1337,10 +1597,30 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    init_from_model(params, cparams, model);
+}
+
+common_init_result::common_init_result(common_params & params, llama_model * model) :
+    pimpl(new impl{}) {
+    auto cparams = common_context_params_to_llama(params);
+
+    pimpl->model_borrowed = true;
+    pimpl->model.reset(model);
+
+    init_from_model(params, cparams, model);
+}
+
+void common_init_result::init_from_model(common_params & params, struct llama_context_params & cparams, llama_model * model) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // load and optionally apply lora adapters
     for (auto & la : params.lora_adapters) {
+        if (la.ptr != nullptr) {
+            // pool owns this adapter (registered in model->loras); reference it.
+            // do NOT llama_adapter_lora_init it again, and do NOT push to pimpl->lora.
+            common_adapter_lora_fill_meta(la);
+            continue;
+        }
         llama_adapter_lora_ptr lora;
         lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
         if (lora == nullptr) {
@@ -1348,12 +1628,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             return;
         }
 
-        char buf[1024];
         la.ptr = lora.get();
-        llama_adapter_meta_val_str(la.ptr, "adapter.lora.task_name", buf, sizeof(buf));
-        la.task_name = buf;
-        llama_adapter_meta_val_str(la.ptr, "adapter.lora.prompt_prefix", buf, sizeof(buf));
-        la.prompt_prefix = buf;
+        common_adapter_lora_fill_meta(la);
         pimpl->lora.emplace_back(std::move(lora)); // copy to list of loaded adapters
     }
 
@@ -1433,24 +1709,11 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-    common_init_result_ptr res(new common_init_result(params, model_only));
-
+// post-context-creation initialization shared by both the owned-model and the
+// borrowed-model paths: ctx_shift, control vectors, pooling checks, warmup
+static void common_init_result_init_ctx(common_params & params, common_init_result_ptr & res) {
     llama_model * model = res->model();
-    if (model == NULL) {
-        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
-        return res;
-    }
-
-    if (model_only) {
-        return res;
-    }
-
     llama_context * lctx = res->context();
-    if (lctx == NULL) {
-        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
-        return res;
-    }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -1465,7 +1728,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
         const auto cvec = common_control_vector_load(params.control_vectors);
         if (cvec.n_embd == -1) {
-            return res;
+            return;
         }
 
         int err = llama_set_adapter_cvec(
@@ -1476,7 +1739,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
                 params.control_vector_layer_start,
                 params.control_vector_layer_end);
         if (err) {
-            return res;
+            return;
         }
     }
 
@@ -1500,7 +1763,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
 
         if (!ok) {
-            return res;
+            return;
         }
     }
 
@@ -1545,6 +1808,43 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         // reset samplers to reset RNG state after warmup to the seeded state
         res->reset_samplers();
     }
+}
+
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_init_result_ptr res(new common_init_result(params, model_only));
+
+    llama_model * model = res->model();
+    if (model == NULL) {
+        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
+        return res;
+    }
+
+    if (model_only) {
+        return res;
+    }
+
+    llama_context * lctx = res->context();
+    if (lctx == NULL) {
+        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+        return res;
+    }
+
+    common_init_result_init_ctx(params, res);
+
+    return res;
+}
+
+// create a context from an externally owned model (borrowed: the result must not free it)
+common_init_result_ptr common_init_from_model_params(common_params & params, llama_model * model) {
+    common_init_result_ptr res(new common_init_result(params, model));
+
+    llama_context * lctx = res->context();
+    if (lctx == NULL) {
+        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+        return res;
+    }
+
+    common_init_result_init_ctx(params, res);
 
     return res;
 }
@@ -1664,6 +1964,14 @@ void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, lla
     }
 }
 
+void common_adapter_lora_fill_meta(common_adapter_lora_info & la) {
+    char buf[1024];
+    llama_adapter_meta_val_str(la.ptr, "adapter.lora.task_name", buf, sizeof(buf));
+    la.task_name = buf;
+    llama_adapter_meta_val_str(la.ptr, "adapter.lora.prompt_prefix", buf, sizeof(buf));
+    la.prompt_prefix = buf;
+}
+
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
     std::vector<llama_adapter_lora *> loras;
     std::vector<float> scales;
@@ -1674,6 +1982,49 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
     }
 
     llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
+}
+
+std::string common_lora_fingerprint(const std::vector<common_adapter_lora_info> & loras) {
+    if (loras.empty()) {
+        return "";
+    }
+    // sort by path so order never affects the hash; ptr is never an input.
+    // the scale-bits tiebreak keeps equal paths in a defined order.
+    std::vector<const common_adapter_lora_info *> sorted;
+    sorted.reserve(loras.size());
+    for (const auto & la : loras) {
+        sorted.push_back(&la);
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const auto * a, const auto * b) {
+        if (a->path != b->path) {
+            return a->path < b->path;
+        }
+        uint32_t ab = 0, bb = 0;
+        memcpy(&ab, &a->scale, sizeof(ab));
+        memcpy(&bb, &b->scale, sizeof(bb));
+        return ab < bb;
+    });
+
+    // FNV-1a over path bytes, ':' separator, and the raw scale bits (exactly stable)
+    uint64_t hash = 14695981039346656037ull;
+    for (const auto * la : sorted) {
+        for (char c : la->path) {
+            hash ^= (uint64_t)(unsigned char) c;
+            hash *= 1099511628211ull;
+        }
+        hash ^= (uint64_t) ':';
+        hash *= 1099511628211ull;
+        uint32_t bits = 0;
+        static_assert(sizeof(bits) == sizeof(la->scale), "float must be 32-bit");
+        memcpy(&bits, &la->scale, sizeof(bits));
+        for (int i = 0; i < 4; ++i) {
+            hash ^= (uint64_t)((bits >> (8 * i)) & 0xff);
+            hash *= 1099511628211ull;
+        }
+    }
+    char out[17];
+    snprintf(out, sizeof(out), "%016llx", (unsigned long long) hash);
+    return out;
 }
 
 struct llama_model_params common_model_params_to_llama(common_params & params) {

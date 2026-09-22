@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 
 struct server_context_impl; // private implementation
@@ -89,7 +90,9 @@ struct server_context {
 
     // load the model and initialize llama_context
     // returns true on success
-    bool load_model(common_params & params);
+    // when `shared_model` is non-null, weights are borrowed (owned externally); only this
+    // instance's context + compute buffers are created
+    bool load_model(common_params & params, llama_model * shared_model = nullptr);
 
     // this function will block main thread until termination
     void start_loop();
@@ -110,6 +113,77 @@ struct server_context {
 
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
+
+    // adjust the advertised model name / aliases after load (multi-instance mode);
+    // not thread-safe, only used by the manager during setup
+    void set_model_name(const std::string & name);
+    void set_model_aliases(const std::set<std::string> & aliases);
+
+    // race-free aggregate of this context's slot activity, published by the
+    // scheduler thread (see server_context_stats). best-effort and possibly
+    // stale; the instance's own queue is the authority and defers a request
+    // when the race is lost.
+    server_context_stats get_stats() const;
+
+    // whole-window context size, cached at load (equals llama_n_ctx then).
+    // race-free; prefer this over get_slot_n_ctx() * n_parallel, which can
+    // disagree with llama_n_ctx after rounding/recapping.
+    int32_t get_n_ctx() const;
+
+    // manager-only: be notified on the scheduler thread whenever a slot becomes idle,
+    // used to wake requests waiting for a free instance in a group
+    void set_slot_release_callback(std::function<void(int /* id_slot */)> callback);
+
+    // manager-only: two-phase snapshot switching. slot_save_copy() copies the slot KV to
+    // a host buffer on the scheduler thread (bounded GPU->host transfer, no file I/O); the
+    // manager writes that buffer to disk on its pool I/O worker. slot_restore_apply() applies
+    // a host buffer on the scheduler (bounded host->GPU transfer); the manager read the file on
+    // its pool I/O worker. a busy slot fails with a retriable ERROR_TYPE_UNAVAILABLE result, and
+    // a failed restore clears the slot to empty (never a partially-loaded KV). deadline_ms is the
+    // KV-size-scaled compose deadline (ms since epoch); -1 waits forever. returns nullptr on timeout.
+    server_task_result_ptr slot_save_copy(int id_slot, int64_t deadline_ms = -1);
+    server_task_result_ptr slot_restore_apply(int id_slot, std::vector<uint8_t> buffer, llama_tokens tokens, int64_t deadline_ms = -1);
+
+    // replace the instance's adapter set. the caller must hold the pool's
+    // instance_drain_guard (no slot processing, no interleaving save/restore) and
+    // pool ownership of every adapter in the list (each raw ptr must be a live
+    // registry entry the caller holds a ref for, so the tensor cannot be freed
+    // during the swap). runs the swap on the
+    // scheduler thread and WAITS for it with a deadline; returns the task result
+    // (null on timeout). post directly to this context's queue, never through
+    // pool dispatch (the drain guard's removing flag would reject it).
+    server_task_result_ptr set_lora_adapters(std::vector<common_adapter_lora_info> adapters,
+                                             int64_t deadline_ms);
+
+    // bounded read of the scheduler's installed adapter list, through the same
+    // choke point as the writers. nullopt on timeout (not observed, distinct
+    // from an observed empty set). no new task type: reuses GET_LORA.
+    std::optional<std::vector<common_adapter_lora_info>> get_lora_adapters(int64_t deadline_ms);
+
+    // manager-only: run `op` on this instance's scheduler thread, serialized with all
+    // other tasks (context lifetime is not thread-safe). `op` returns the JSON payload
+    // and throws with a message to signal an error; the caller gets a
+    // server_task_result_instance (or an error result). deadline_ms bounds the
+    // wait (-1 waits forever, preserving the legacy callers); null on timeout.
+    server_task_result_ptr instance_op(const std::function<json()> & op, int64_t deadline_ms = -1);
+
+    // manager-only: abort all in-flight slot tasks with an error result (used before
+    // destroy/resize so no HTTP reader is left hanging). same deadline contract
+    // as instance_op: teardown paths pass a compose budget so a stalled
+    // scheduler answers 503 with the instance intact instead of wedging the
+    // management plane (which is held across the call).
+    server_task_result_ptr abort_slots(const std::string & reason, int64_t deadline_ms = -1);
+
+    // manager-only reporting (read-only, best-effort across scheduler thread)
+    int get_slot_n_ctx() const;
+    size_t get_model_bytes() const;   // model bytes (identical for every instance; count once), 0 when not loaded
+    size_t get_context_bytes() const; // KV bytes, 0 when not loaded
+    size_t get_compute_bytes() const; // compute buffer bytes, 0 when not loaded
+
+private:
+    // single choke point for every manager->scheduler op: posts the task and waits on the
+    // result; the should_stop predicate aborts the wait (e.g. on a deadline)
+    server_task_result_ptr run_scheduler_task(server_task && task, const std::function<bool()> & should_stop);
 };
 
 
@@ -178,7 +252,7 @@ private:
     server_context_impl & ctx_server;
 
     server_queue & queue_tasks;
-    server_response & queue_results;
+    server_result_queue<server_task_result_ptr> & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
 
     // cached responses, to be used during sleep

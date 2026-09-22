@@ -17,7 +17,10 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "../../src/llama-ext.h" // llama_get_memory_breakdown for the manager memory-reporting API
+
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -35,8 +38,6 @@
 #endif
 #include <windows.h>
 #endif
-
-constexpr int HTTP_POLLING_SECONDS = 1;
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -265,6 +266,8 @@ struct server_slot {
 
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
+    // wall-clock twin of t_last_used for cross-process idle accounting; seconds, -1 = never
+    int64_t t_last_used_wall_s = -1;
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
@@ -548,6 +551,8 @@ struct server_slot {
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
             t_last_used = ggml_time_us();
+            t_last_used_wall_s = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
 
             state = SLOT_STATE_IDLE;
 
@@ -839,13 +844,18 @@ public:
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
 
+    // shared-model mode: weights owned externally (the server_instances manager).
+    // remembered so resize() can rebuild this instance's context from the same
+    // weights without reloading them from disk; not owned, never freed.
+    llama_model * model_shared = nullptr;
+
     mtmd_context * mctx = nullptr;
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
 
-    server_queue    queue_tasks;
-    server_response queue_results;
+    server_queue                                queue_tasks;
+    server_result_queue<server_task_result_ptr> queue_results;
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
@@ -931,6 +941,56 @@ private:
     std::set<std::string> model_aliases; // additional names for the model
     std::set<std::string> model_tags;    // informational tags
 
+    // set by the manager (server_instances) to wake group-waiting requests; called on
+    // the scheduler thread whenever a slot becomes idle
+    std::function<void(int /* id_slot */)> callback_on_slot_release;
+
+    // single-writer aggregates for lock-free manager reads (group routing and
+    // last-used reporting). the scheduler thread is the only writer, via
+    // publish_slot_stats() once per update_slots() iteration; the cached n_ctx
+    // values are fixed in load_model(). a mutex is the wrong tool here: it would
+    // stall the scheduler on every HTTP read.
+    std::atomic<int>     stat_processing{0};
+    std::atomic<int64_t> stat_last_used_us{-1};
+    std::atomic<int64_t> stat_last_used_wall_s{-1};
+    std::atomic<int32_t> stat_n_ctx_slot{0};
+    std::atomic<int32_t> stat_n_ctx_total{0};
+
+    // rescan the slots into the published aggregates. scheduler thread only.
+    void publish_slot_stats() {
+        int     n_proc  = 0;
+        int64_t lu      = -1;
+        int64_t lu_wall = -1;
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                ++n_proc;
+            }
+            lu      = std::max(lu,      slot.t_last_used);
+            lu_wall = std::max(lu_wall, slot.t_last_used_wall_s);
+        }
+        stat_processing.store(n_proc, std::memory_order_relaxed);
+        stat_last_used_us.store(lu, std::memory_order_relaxed);
+        stat_last_used_wall_s.store(lu_wall, std::memory_order_relaxed);
+    }
+
+    // cached memory breakdown, fixed at context creation. computed once in load_model
+    // (after ctx_tgt is set), zeroed in destroy(). read/written under mutex_mem so the
+    // HTTP reporting path never touches ctx_tgt (which the scheduler frees on destroy).
+    std::mutex mutex_mem;
+    uint64_t   mem_model = 0, mem_context = 0, mem_compute = 0;
+
+    void update_memory_breakdown() {
+        std::lock_guard<std::mutex> lock(mutex_mem);
+        mem_model = mem_context = mem_compute = 0;
+        if (ctx_tgt != nullptr) {
+            for (const auto & [buft, data] : llama_get_memory_breakdown(ctx_tgt)) {
+                mem_model   += data.model;
+                mem_context += data.context;
+                mem_compute += data.compute;
+            }
+        }
+    }
+
     bool sleeping = false;
 
     int64_t t_last_load_progress_ms = 0;
@@ -946,6 +1006,11 @@ private:
 
         ctx_tgt = nullptr;
         model_tgt = nullptr;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_mem);
+            mem_model = mem_context = mem_compute = 0;
+        }
 
         mtmd_free(mctx);
         mctx = nullptr;
@@ -1003,11 +1068,20 @@ private:
 
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
-    bool load_model(common_params & params) {
+    bool load_model(common_params & params, llama_model * shared_model = nullptr) {
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
 
+        // remember the borrowed weights so a later resize rebuilds from the same
+        // pointers instead of reloading the file
+        if (shared_model != nullptr) {
+            model_shared = shared_model;
+        }
+        // a resize passes a null pointer but reuses the remembered borrowed weights
+        const bool shared = model_shared != nullptr;
+
+        // resuming from sleep re-runs this with `sleeping` still set; init() may only run once
         const bool is_resume = sleeping;
 
         params_base = params;
@@ -1096,7 +1170,11 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        if (shared) {
+            llama_init = common_init_from_model_params(params_base, model_shared);
+        } else {
+            llama_init = common_init_from_params(params_base);
+        }
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1110,6 +1188,8 @@ private:
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
         }
+
+        update_memory_breakdown();
 
         vocab = llama_model_get_vocab(model_tgt);
 
@@ -1301,6 +1381,9 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+                if (callback_on_slot_release) {
+                    callback_on_slot_release(id_slot);
+                }
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -1312,6 +1395,13 @@ private:
 
             slot.reset();
         }
+
+        // fix the published window sizes for the life of this context; the busy
+        // and last-used aggregates start clean and are refreshed every scheduler
+        // iteration by publish_slot_stats()
+        stat_n_ctx_slot.store(n_ctx_slot(), std::memory_order_relaxed);
+        stat_n_ctx_total.store(llama_n_ctx(ctx_tgt), std::memory_order_relaxed);
+        publish_slot_stats();
 
         {
             const char * LLAMA_TRACE = getenv("LLAMA_TRACE");
@@ -1390,10 +1480,11 @@ private:
             return init();
         }
 
-        if (callback_state) {
+        // resume from sleep skips init() (queue callbacks are registered once);
+        // a resume still reports READY
+        if (is_resume && callback_state) {
             callback_state(SERVER_STATE_READY, {});
         }
-
         return true;
     }
 
@@ -2022,6 +2113,17 @@ private:
         send_error(task.id, error, type);
     }
 
+    // single construction site for apply-lora results: every SET_LORA and
+    // SET_ADAPTERS outcome answers the same success shape, only the task id
+    // varies. the two writers keep their distinct install semantics (legacy
+    // SET_LORA installs as-is for the historical endpoint; SET_ADAPTERS skips
+    // identical sets and invalidates slot KV), so only the result is shared.
+    void send_apply_lora_result(int id_task) {
+        auto res = std::make_unique<server_task_result_apply_lora>();
+        res->id = id_task;
+        queue_results.send(std::move(res));
+    }
+
     void send_error(const server_slot & slot, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
         send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx);
     }
@@ -2041,6 +2143,18 @@ private:
         res->n_ctx           = n_ctx;
 
         queue_results.send(std::move(res));
+    }
+
+    // Gate slot save/restore/erase on slot content (does it hold media),
+    // not model capability: a multimodal model may hold a pure-text slot.
+    bool check_slot_no_media(const server_slot & slot, const int id_task) {
+        if (slot.prompt.tokens.has_media()) {
+            send_error(id_task,
+                "This operation is not supported while the slot holds image/audio tokens (a pure-text prefix is supported)",
+                ERROR_TYPE_NOT_SUPPORTED);
+            return false;
+        }
+        return true;
     }
 
     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
@@ -2718,9 +2832,117 @@ private:
                     }
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
                     params_base.lora_adapters = new_loras;
-                    auto res = std::make_unique<server_task_result_apply_lora>();
-                    res->id = task.id;
+                    send_apply_lora_result(task.id);
+                } break;
+            case SERVER_TASK_TYPE_SET_ADAPTERS:
+                {
+                    // single-writer: the scheduler owns params_base.lora_adapters.
+                    // the caller holds the pool's instance_drain_guard, so no slot is
+                    // processing and no save/restore task can interleave. identity
+                    // compares path+scale+ptr: are_lora_equal ignores path, so a
+                    // freed adapter whose address is reused by another file would
+                    // wrongly skip the invalidation below.
+                    if (are_lora_sets_identical(params_base.lora_adapters, task.set_adapters)) {
+                        send_apply_lora_result(task.id);
+                        break;
+                    }
+                    // the adapter change invalidates every slot's live KV ...
+                    for (auto & slot : slots) {
+                        slot.prompt_clear();
+                        slot.prompt.clear();
+                    }
+                    params_base.lora_adapters = task.set_adapters;
+                    send_apply_lora_result(task.id);
+                } break;
+            case SERVER_TASK_TYPE_SLOT_SAVE_COPY:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (!check_slot_no_media(*slot, task.id)) {
+                        break;
+                    }
+                    // atomic in-task idle check: the scheduler is the authority. the
+                    // manager re-verified idleness before posting, but a slot that started
+                    // generating since then gets a retriable error instead of a deferred task,
+                    // so the HTTP thread does not block on a snapshot switch
+                    if (slot->is_processing()) {
+                        send_error(task, "slot is busy, retry the snapshot switch", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+
+                    // bounded GPU->host transfer only; the file write runs on the pool I/O worker
+                    const size_t n_state = llama_state_seq_get_size(ctx_tgt, slot->id);
+                    std::vector<uint8_t> buffer(n_state);
+                    llama_state_seq_get_data(ctx_tgt, buffer.data(), n_state, slot->id);
+
+                    auto res = std::make_unique<server_task_result_slot_copy>();
+                    res->id      = task.id;
+                    res->id_slot = id_slot;
+                    res->buffer  = std::move(buffer);
+                    res->tokens  = slot->prompt.tokens.get_text_tokens();
                     queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_RESTORE_APPLY:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (!check_slot_no_media(*slot, task.id)) {
+                        break;
+                    }
+                    // atomic in-task idle check: same reasoning as SLOT_SAVE_COPY
+                    if (slot->is_processing()) {
+                        send_error(task, "slot is busy, retry the snapshot switch", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+
+                    // bounded host->GPU transfer only; the file read ran on the pool I/O worker
+                    const size_t n_state = llama_state_seq_set_data(ctx_tgt, task.slot_buffer.data(), task.slot_buffer.size(), slot->id);
+                    if (n_state == 0) {
+                        // apply-failure safety: never leave a partially-loaded KV behind.
+                        // the manager drops the slot's snapshot binding when it sees this error.
+                        slot->prompt_clear();
+                        slot->prompt.clear();
+                        send_error(task, "Unable to restore slot: invalid or incompatible snapshot data", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    slot->prompt.clear();
+                    slot->prompt.tokens.insert(task.slot_tokens);
+
+                    auto res = std::make_unique<server_task_result_slot_save_load>();
+                    res->id       = task.id;
+                    res->id_slot  = id_slot;
+                    res->filename = task.slot_action.filename;
+                    res->is_save  = false;
+                    res->n_tokens = task.slot_tokens.size();
+                    res->n_bytes  = n_state;
+                    res->t_ms     = 0;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_INSTANCE_OP:
+                {
+                    // manager-invoked lifecycle op: runs on the scheduler thread, so it is
+                    // serialized with all other tasks and with update_slots(). context
+                    // lifetime changes made by the op can never race the scheduler.
+                    try {
+                        auto res = std::make_unique<server_task_result_instance>();
+                        res->id = task.id;
+                        res->data = task.instance_op();
+                        queue_results.send(std::move(res));
+                    } catch (const std::exception & e) {
+                        auto res = std::make_unique<server_task_result_error>();
+                        res->id       = task.id;
+                        res->err_type = ERROR_TYPE_SERVER;
+                        res->err_msg  = e.what();
+                        queue_results.send(std::move(res));
+                    }
                 } break;
         }
 
@@ -2820,6 +3042,7 @@ private:
 
                 metrics_flush_idle();
 
+                publish_slot_stats();
                 return; // skip further processing
 
             } else {
@@ -2840,6 +3063,7 @@ private:
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
 
             // the batch is half-built and not rendered, skip now to avoid UB
+            publish_slot_stats();
             return;
         }
 
@@ -2904,6 +3128,8 @@ private:
                 break; // stop any further processing
             }
         }
+
+        publish_slot_stats();
     }
 
     void pre_decode() {
@@ -4157,8 +4383,8 @@ private:
 server_context::server_context() : impl(new server_context_impl()) {}
 server_context::~server_context() = default;
 
-bool server_context::load_model(common_params & params) {
-    return impl->load_model(params);
+bool server_context::load_model(common_params & params, llama_model * shared_model) {
+    return impl->load_model(params, shared_model);
 }
 
 void server_context::start_loop() {
@@ -4228,7 +4454,7 @@ server_context_meta server_context::get_meta() const {
 // may have bypass_sleep = true if the task does not use ctx_server
 struct server_res_generator : server_res_spipe {
     server_response_reader rd;
-    server_res_generator(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds, bool bypass_sleep = false)
+    server_res_generator(server_queue & queue_tasks, server_result_queue<server_task_result_ptr> & queue_results, int sleep_idle_seconds, bool bypass_sleep = false)
             : rd(queue_tasks, queue_results, HTTP_POLLING_SECONDS) {
         // fast path in case sleeping is disabled
         bypass_sleep |= sleep_idle_seconds < 0;
@@ -4248,6 +4474,132 @@ struct server_res_generator : server_res_spipe {
 
 void server_context::set_state_callback(server_state_callback_t callback) {
     impl->callback_state = std::move(callback);
+}
+
+void server_context::set_model_name(const std::string & name) {
+    impl->model_name = name;
+}
+
+void server_context::set_model_aliases(const std::set<std::string> & aliases) {
+    impl->model_aliases = aliases;
+}
+
+server_context_stats server_context::get_stats() const {
+    server_context_stats stats;
+    stats.n_processing     = impl->stat_processing.load(std::memory_order_relaxed);
+    stats.last_used_us     = impl->stat_last_used_us.load(std::memory_order_relaxed);
+    stats.last_used_wall_s = impl->stat_last_used_wall_s.load(std::memory_order_relaxed);
+    stats.n_ctx_slot       = impl->stat_n_ctx_slot.load(std::memory_order_relaxed);
+    stats.n_ctx_total      = impl->stat_n_ctx_total.load(std::memory_order_relaxed);
+    return stats;
+}
+
+int32_t server_context::get_n_ctx() const {
+    return impl->stat_n_ctx_total.load(std::memory_order_relaxed);
+}
+
+void server_context::set_slot_release_callback(std::function<void(int)> callback) {
+    impl->callback_on_slot_release = std::move(callback);
+}
+
+server_task_result_ptr server_context::run_scheduler_task(server_task && task, const std::function<bool()> & should_stop) {
+    // no-op when the queue is not sleeping, which is always the case in this branch
+    impl->queue_tasks.wait_until_no_sleep();
+    server_response_reader rd = impl->get_response_reader();
+    task.id                  = rd.get_new_id();
+    rd.post_task(std::move(task));
+    auto result = rd.next(should_stop);
+    if (result == nullptr) {
+        // drop the timed-out task so it can never run late
+        rd.stop();
+    }
+    return result;
+}
+
+server_task_result_ptr server_context::slot_save_copy(int id_slot, int64_t deadline_ms) {
+    server_task task(SERVER_TASK_TYPE_SLOT_SAVE_COPY);
+    task.slot_action.id_slot = id_slot;
+    task.id_slot = id_slot; // lets pop_deferred_task match the task to the freed slot
+
+    // the compose deadline is passed by the manager; -1 waits forever
+    return run_scheduler_task(std::move(task), [deadline_ms]() {
+        return deadline_ms >= 0 && ggml_time_ms() >= deadline_ms;
+    });
+}
+
+server_task_result_ptr server_context::slot_restore_apply(int id_slot, std::vector<uint8_t> buffer, llama_tokens tokens, int64_t deadline_ms) {
+    server_task task(SERVER_TASK_TYPE_SLOT_RESTORE_APPLY);
+    task.slot_action.id_slot = id_slot;
+    task.id_slot = id_slot;
+    task.slot_buffer = std::move(buffer);
+    task.slot_tokens = std::move(tokens);
+
+    return run_scheduler_task(std::move(task), [deadline_ms]() {
+        return deadline_ms >= 0 && ggml_time_ms() >= deadline_ms;
+    });
+}
+
+server_task_result_ptr server_context::set_lora_adapters(std::vector<common_adapter_lora_info> adapters, int64_t deadline_ms) {
+    server_task task(SERVER_TASK_TYPE_SET_ADAPTERS);
+    task.set_adapters = std::move(adapters);
+
+    return run_scheduler_task(std::move(task), [deadline_ms]() {
+        return deadline_ms >= 0 && ggml_time_ms() >= deadline_ms;
+    });
+}
+
+std::optional<std::vector<common_adapter_lora_info>> server_context::get_lora_adapters(int64_t deadline_ms) {
+    server_task task(SERVER_TASK_TYPE_GET_LORA);
+
+    auto result = run_scheduler_task(std::move(task), [deadline_ms]() {
+        return deadline_ms >= 0 && ggml_time_ms() >= deadline_ms;
+    });
+    if (result == nullptr) {
+        return std::nullopt;
+    }
+    auto * loras = dynamic_cast<server_task_result_get_lora *>(result.get());
+    GGML_ASSERT(loras != nullptr);
+    std::vector<common_adapter_lora_info> out;
+    out.reserve(loras->loras.size());
+    for (auto & lora : loras->loras) {
+        out.push_back(lora.info);
+    }
+    return out;
+}
+
+server_task_result_ptr server_context::instance_op(const std::function<json()> & op, int64_t deadline_ms) {
+    server_task task(SERVER_TASK_TYPE_INSTANCE_OP);
+    task.instance_op = op;
+
+    return run_scheduler_task(std::move(task), [deadline_ms]() {
+        return deadline_ms >= 0 && ggml_time_ms() >= deadline_ms;
+    });
+}
+
+server_task_result_ptr server_context::abort_slots(const std::string & reason, int64_t deadline_ms) {
+    return instance_op([this, reason]() {
+        impl->abort_all_slots(reason);
+        return json{{ "success", true }};
+    }, deadline_ms);
+}
+
+int server_context::get_slot_n_ctx() const {
+    return impl->n_ctx_slot();
+}
+
+size_t server_context::get_model_bytes() const {
+    std::lock_guard<std::mutex> lock(impl->mutex_mem);
+    return impl->mem_model;
+}
+
+size_t server_context::get_context_bytes() const {
+    std::lock_guard<std::mutex> lock(impl->mutex_mem);
+    return impl->mem_context;
+}
+
+size_t server_context::get_compute_bytes() const {
+    std::lock_guard<std::mutex> lock(impl->mutex_mem);
+    return impl->mem_compute;
 }
 
 //
