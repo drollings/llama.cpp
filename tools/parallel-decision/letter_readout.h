@@ -33,13 +33,17 @@ struct letter_metrics {
     int    rounds         = 0;
     double prefill_ms     = 0;
     double scoring_ms     = 0;
+    bool        head_active = false; // candidates were scored against the answer rows
+    std::string head_reason;         // why a requested head was not used, empty otherwise
 };
 
 // Splits the rendered chat prompt at the user message: `first` is the cacheable
 // system/user prefix, `second` is the text after the user content (user turn end
-// plus assistant turn start, without any answer instruction).
+// plus assistant turn start, without any answer instruction). The decision readout
+// is thinking-off; `enable_thinking` stays false unless a caller explicitly opts in.
 std::pair<std::string, std::string> render_letter_prompt(const common_chat_templates * tmpls, bool use_jinja,
-                                                         const std::string & system_text);
+                                                         const std::string & system_text,
+                                                         bool enable_thinking = false);
 
 // The per-question branch text, ending just before the label is generated.
 std::string format_letter_suffix(const jev_question & q, const std::vector<label> & labels,
@@ -59,8 +63,23 @@ std::vector<size_t> permutation_order(size_t count, const std::string & question
 // turns this into a plain 400.
 struct head_capability {
     bool        available = false;
+    int         width     = 0;
+    float       softcap   = 0.0f;
     std::string reason;
 };
+
+// The selected-head fast path is only usable when the model exposes a plain, contiguous output
+// tensor whose rows can be dequantized. This probes that once for a loaded model; it never
+// changes the model and never throws.
+head_capability probe_selected_head(const llama_model * model);
+
+// Dequantizes the answer rows for `labels` into an FP32 table the scorer can dot against the
+// post-norm hidden state. Never throws: an unusable table comes back with width 0 and a reason.
+classifier_head build_classifier_head(const llama_model * model, const std::vector<label> & labels);
+
+// Throws std::invalid_argument (HTTP 400) when `requested` is "selected" and the model cannot
+// serve it. The default paths ("auto"/"full") never throw here and always fall back.
+void require_selected_head(const std::string & requested, const head_capability & cap);
 
 const head_capability & selected_head_capability();
 

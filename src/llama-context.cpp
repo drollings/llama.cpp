@@ -114,7 +114,8 @@ llama_context::llama_context(
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
     cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
-    cparams.embeddings              = params.embeddings;
+    cparams.classifier_only         = params.classifier_only;
+    cparams.embeddings              = params.embeddings || params.classifier_only;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
@@ -218,6 +219,11 @@ llama_context::llama_context(
         } else {
             cparams.pooling_type = hparams.pooling_type;
         }
+    }
+
+    if (cparams.classifier_only && ((model.arch != LLM_ARCH_GEMMA4 && model.arch != LLM_ARCH_LFM2 && model.arch != LLM_ARCH_LFM2MOE) ||
+            params.n_samplers != 0 || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
+        throw std::runtime_error("classifier_only requires Gemma4/LFM2, no sampler, and unpooled outputs");
     }
 
     if (params.attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED) {
@@ -1678,7 +1684,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : dflash_embd ? hparams.n_embd_inp_enc() : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
-    const bool output_all   = cparams.embeddings;
+    const bool output_all   = cparams.embeddings && !cparams.classifier_only;
     const bool has_samplers = !sampling.samplers.empty();
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
@@ -2063,7 +2069,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd     = hparams.n_embd;
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits     = true;
+    bool has_logits     = !cparams.classifier_only;
     bool has_embd       = cparams.embeddings;
     bool has_embd_nextn = cparams.embeddings_nextn;
 
@@ -3673,6 +3679,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.classifier_only             =*/ false,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
@@ -3835,6 +3842,10 @@ const llama_model * llama_get_model(const llama_context * ctx) {
 
 enum llama_pooling_type llama_pooling_type(const llama_context * ctx) {
     return ctx->pooling_type();
+}
+
+bool llama_context_classifier_only(const llama_context * ctx) {
+    return ctx->get_cparams().classifier_only;
 }
 
 void llama_attach_threadpool(

@@ -32,6 +32,7 @@ struct llama_cparams {
     float yarn_beta_fast;
     float yarn_beta_slow;
 
+    bool classifier_only;
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0

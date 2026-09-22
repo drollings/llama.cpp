@@ -16,6 +16,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -43,6 +44,20 @@ struct field_input {
     float                    temperature = 1.0f;  // softmax temperature for this field's score
 };
 
+// Dequantized output (classifier) rows for a small set of candidate tokens. When supplied, a
+// candidate is scored as dot(hidden, row) against the post-norm hidden state instead of a full
+// vocabulary projection. `width == 0` means the table is not usable and scoring must fall back.
+struct classifier_head {
+    std::vector<llama_token> ids;   // ids[r] owns rows[r]
+    std::vector<float>       rows;  // ids.size() * width floats
+    int                      width   = 0;
+    float                    softcap = 0.0f; // final logit softcap, 0 when the model has none
+    std::string              reason;         // why the head is unavailable, empty when usable
+
+    bool available() const { return width > 0; }
+    int  index_of(llama_token id) const; // row index for a token, or -1
+};
+
 struct options {
     std::string mode           = "auto"; // auto: tree up to tree_max values, else greedy; tree; greedy
     size_t      tree_max       = 128;
@@ -52,6 +67,8 @@ struct options {
     std::string fork           = "auto"; // auto | copy | restore: how branches fork the prefix
     bool        bypass         = true;   // skip the fork when a round has exactly one branch
     bool        audit          = false;  // also collect full-vocab diagnostics at the scored position
+    bool        optimize       = true;   // dedup identical fields and hoist a long common suffix head
+    const classifier_head * head = nullptr; // optional: score candidates against these rows
     std::function<bool()> should_stop;   // optional: checked before every decode and between waves
     std::function<void()> yield;         // optional: cooperative yield point between waves
 };
@@ -85,6 +102,13 @@ struct result {
     int    rounds         = 0;
     double prefill_ms     = 0;
     double scoring_ms     = 0;
+    bool        head_active = false; // candidates were scored against the head rows
+    std::string head_reason;         // why a requested head was not used, empty otherwise
+    // suffix token accounting: unique field suffixes after dedup, the head hoisted onto the trunk,
+    // and what each branch actually decodes
+    size_t suffix_tokens        = 0;
+    size_t common_suffix_tokens = 0;
+    size_t leaf_suffix_tokens   = 0;
 };
 
 // Several contexts decided against one schema and one cached prefix. Items carry fields,
@@ -97,6 +121,11 @@ struct batch_result {
     int    rounds        = 0;
     double prefill_ms    = 0;
     double scoring_ms    = 0;
+    bool        head_active = false;
+    std::string head_reason;
+    size_t suffix_tokens        = 0;
+    size_t common_suffix_tokens = 0;
+    size_t leaf_suffix_tokens   = 0;
 };
 
 // Scores decisions on an existing context with the sequence ids [seq_base, seq_base + n_seqs):
@@ -105,6 +134,12 @@ struct batch_result {
 class engine {
   public:
     engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs);
+
+    const llama_model * get_model() const { return model; }
+
+    // Bounded, per-engine tokenization cache: repeated prompts and candidates are encoded once.
+    size_t token_cache_size() const { return token_cache_.size(); }
+    size_t token_cache_hits() const { return token_cache_hits_; }
 
     result decide(const std::string & shared_text, const std::string & context_text,
                   const std::vector<field_input> & fields, const options & opt);
@@ -143,9 +178,16 @@ class engine {
     tokens_t            cached;
     std::string         cached_tag;
 
+    mutable std::unordered_map<std::string, tokens_t> token_cache_;
+    mutable size_t                                    token_cache_hits_ = 0;
+    static constexpr size_t                           token_cache_limit_ = 1024;
+
     std::function<bool()> stop_;
     std::function<void()> yield_;
     bool                audit_ = false;
+    const classifier_head * head_        = nullptr;
+    bool                    head_active_ = false;
+    std::string             head_reason_;
     fork_kind           probe_fork_;
     fork_kind           active_fork_ = fork_kind::copy;
     llama_pos           swa_         = 0; // sliding-window size, 0 = none
@@ -171,6 +213,9 @@ class engine {
     std::vector<branch_score> score_branches(const std::vector<branch> & branches, llama_seq_id first, int n_free,
                                              const std::vector<std::vector<uint8_t>> * parent_states,
                                              bool allow_bypass);
+
+    void gather_candidates(int out_idx, const tokens_t & cands, branch_score & out);
+    bool head_covers(const tokens_t & cands) const;
 };
 
 // ---- schema compiler (the C++ counterpart of llama-mojo's tools/prepare_decisions.py)
@@ -195,11 +240,13 @@ struct compiled_schema {
 // object with "properties" (boolean, string+enum, integer min/max, number min/max/multipleOf).
 compiled_schema compile_schema(const common_json & schema, const std::string & instructions);
 
-// Renders system + user messages with the model's chat template (thinking disabled) and splits
-// the prompt into the static prefix (cached across requests) and the per-request part: the
-// context, the generation prompt and the opening brace of the JSON answer.
+// Renders system + user messages with the model's chat template and splits the prompt into the
+// static prefix (cached across requests) and the per-request part: the context, the generation
+// prompt and the opening brace of the JSON answer. The decision readout is thinking-off, so the
+// template's thinking toggle stays false unless a caller explicitly opts in.
 std::pair<std::string, std::string> render_prompt(const common_chat_templates * tmpls, bool use_jinja,
-                                                  const std::string & system_text, const std::string & context);
+                                                  const std::string & system_text, const std::string & context,
+                                                  bool enable_thinking = false);
 
 // {"decision": {...}, "fields": {...}} from the scores, applying each numeric field's aggregate.
 common_json assemble(const compiled_schema & cs, const result & r);

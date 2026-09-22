@@ -3357,3 +3357,32 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
 
     return (uint32_t) nelements;
 }
+
+int32_t llama_model_classifier_rows(const llama_model * model, const llama_token * ids, int32_t count, float * dst, size_t dst_count, float * softcap) {
+    if (!model || !ids || !dst || !softcap || count < 2 || count > 64 ||
+            (model->arch != LLM_ARCH_GEMMA4 && model->arch != LLM_ARCH_LFM2 && model->arch != LLM_ARCH_LFM2MOE) || !model->output || model->output_s) return 0;
+    const auto * tensor = model->output;
+    const auto width = tensor->ne[0];
+    if (width != model->hparams.n_embd || dst_count != size_t(count) * size_t(width) ||
+            !ggml_is_contiguous(tensor)) return 0;
+    const auto * traits = ggml_get_type_traits(tensor->type);
+    if (tensor->type != GGML_TYPE_F32 && !traits->to_float) return 0;
+    for (int i = 0; i < count; ++i) if (ids[i] < 0 || ids[i] >= tensor->ne[1]) return 0;
+    try {
+        const size_t bytes = ggml_row_size(tensor->type, width);
+        std::vector<uint8_t> row(bytes);
+        for (int i = 0; i < count; ++i) {
+            ggml_backend_tensor_get(tensor, row.data(), size_t(ids[i]) * tensor->nb[1], bytes);
+            if (tensor->type == GGML_TYPE_F32) std::memcpy(dst + size_t(i) * width, row.data(), bytes);
+            else traits->to_float(row.data(), dst + size_t(i) * width, width);
+        }
+        if (model->arch == LLM_ARCH_GEMMA4) {
+            *softcap = model->hparams.f_final_logit_softcapping;
+        } else {
+            *softcap = 0.0f;
+        }
+        return int32_t(width);
+    } catch (...) {
+        return 0;
+    }
+}

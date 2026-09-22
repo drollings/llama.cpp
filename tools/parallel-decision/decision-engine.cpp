@@ -191,6 +191,15 @@ std::vector<float> softmax(const std::vector<float> & logits, float temperature)
     return out;
 }
 
+int classifier_head::index_of(llama_token id) const {
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] == id) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
 std::string make_prefix_tag(const std::string & system_text, const std::string & after,
                             const std::string & prompt_version) {
     uint64_t h = 1469598103934665603ull;
@@ -228,6 +237,11 @@ engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs)
 
 void engine::select_fork(const std::string & requested) {
     if (requested == "copy") {
+        // A copy fork only moves attention KV cells. Recurrent state (e.g. LFM2's short
+        // convolution) lives outside the KV cache, so copy would silently drop it.
+        if (probe_fork_ != fork_kind::copy) {
+            throw std::invalid_argument("fork \"copy\" is not supported by a recurrent model; use auto or restore");
+        }
         active_fork_ = fork_kind::copy;
     } else if (requested == "restore") {
         active_fork_ = fork_kind::restore;
@@ -286,12 +300,22 @@ void engine::check_cancel() const {
 }
 
 tokens_t engine::tokenize(const std::string & text, bool add_special) const {
+    const std::string key = (add_special ? "\x01" : "\x00") + text;
+    const auto it = token_cache_.find(key);
+    if (it != token_cache_.end()) {
+        ++token_cache_hits_;
+        return it->second;
+    }
     tokens_t toks = common_tokenize(vocab, text, add_special, /*parse_special=*/ true);
     // a chat template may already start with the BOS text; keep a single BOS
     const llama_token bos = llama_vocab_bos(vocab);
     if (toks.size() >= 2 && toks[0] == bos && toks[1] == bos) {
         toks.erase(toks.begin());
     }
+    if (token_cache_.size() >= token_cache_limit_) {
+        token_cache_.clear();
+    }
+    token_cache_.emplace(key, toks);
     return toks;
 }
 
@@ -417,15 +441,10 @@ std::vector<engine::branch_score> engine::score_branches(const std::vector<branc
             throw capacity_error(rc == 1 ? "no free KV cache space for the decision branch"
                                          : "llama_decode failed on the decision branch (" + std::to_string(rc) + ")");
         }
-        const float * logits = llama_get_logits_ith(ctx, (int) toks.size() - 1);
-        for (llama_token t : branches[0].cands) {
-            result[0].cand_logits.push_back(logits[t]);
-        }
-        if (audit_) {
-            score_audit(logits, llama_vocab_n_tokens(vocab), branches[0].cands,
-                        result[0].full_vocab_argmax, result[0].allowed_token_mass);
-        }
+        llama_synchronize(ctx); // the scored rows are on the host only after the async decode drains
+        gather_candidates((int) toks.size() - 1, branches[0].cands, result[0]);
         llama_memory_seq_rm(mem, seq, branches[0].pos0, -1); // the trunk keeps its prefix and context only
+        llama_synchronize(ctx);
         return result;
     }
 
@@ -475,20 +494,59 @@ std::vector<engine::branch_score> engine::score_branches(const std::vector<branc
             throw capacity_error(rc == 1 ? "no free KV cache space for the decision branches"
                                          : "llama_decode failed on the decision branches (" + std::to_string(rc) + ")");
         }
+        llama_synchronize(ctx); // the scored rows are on the host only after the async decode drains
         for (size_t b = start; b < end; ++b) {
-            const float * logits = llama_get_logits_ith(ctx, out_idx[b - start]);
-            for (llama_token t : branches[b].cands) {
-                result[b].cand_logits.push_back(logits[t]);
-            }
-            if (audit_) {
-                score_audit(logits, llama_vocab_n_tokens(vocab), branches[b].cands,
-                            result[b].full_vocab_argmax, result[b].allowed_token_mass);
-            }
+            gather_candidates(out_idx[b - start], branches[b].cands, result[b]);
             llama_memory_seq_rm(mem, first + (llama_seq_id) (b - start), -1, -1);
         }
         start = end;
     }
     return result;
+}
+
+bool engine::head_covers(const tokens_t & cands) const {
+    for (llama_token t : cands) {
+        if (head_->index_of(t) < 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void engine::gather_candidates(int out_idx, const tokens_t & cands, branch_score & out) {
+    if (head_active_) {
+        const float * embd = llama_get_embeddings_ith(ctx, out_idx);
+        if (embd != nullptr) {
+            // dot(hidden, answer row); softcap only when the model applies one
+            const size_t width = (size_t) head_->width;
+            for (llama_token t : cands) {
+                const int r = head_->index_of(t);
+                if (r < 0) {
+                    throw std::runtime_error("the selected answer head is missing a candidate row");
+                }
+                const float * row = head_->rows.data() + (size_t) r * width;
+                double dot = 0.0;
+                for (size_t k = 0; k < width; ++k) {
+                    dot += (double) embd[k] * (double) row[k];
+                }
+                float v = (float) dot;
+                if (head_->softcap != 0.0f) {
+                    v = head_->softcap * std::tanh(v / head_->softcap);
+                }
+                out.cand_logits.push_back(v);
+            }
+            out.full_vocab_argmax  = -1; // no full vocabulary on the fast path
+            out.allowed_token_mass = 1.0f;
+            return;
+        }
+    }
+    const float * logits = llama_get_logits_ith(ctx, out_idx);
+    for (llama_token t : cands) {
+        out.cand_logits.push_back(logits[t]);
+    }
+    if (audit_) {
+        score_audit(logits, llama_vocab_n_tokens(vocab), cands, out.full_vocab_argmax, out.allowed_token_mass);
+    }
 }
 
 result engine::decide(const std::string & shared_text, const std::string & context_text,
@@ -500,6 +558,8 @@ result engine::decide(const std::string & shared_text, const std::string & conte
     r.rounds        = b.rounds;
     r.prefill_ms    = b.prefill_ms;
     r.scoring_ms    = b.scoring_ms;
+    r.head_active   = b.head_active;
+    r.head_reason   = b.head_reason;
     return r;
 }
 
@@ -515,6 +575,7 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
     stop_  = opt.should_stop;
     yield_ = opt.yield;
     audit_ = opt.audit;
+    llama_synchronize(ctx); // drain any work left by the previous decision before reusing sequences
     check_cancel();
     const tokens_t shared = tokenize(shared_text, true);
     std::vector<tokens_t> prefixes;
@@ -596,9 +657,99 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
         field_first.push_back(canon);
     }
 
+    // Hoist a long suffix head shared by every field onto the trunk, so each branch decodes only
+    // its unique tail. Below the threshold the extra dispatch is not worth it.
+    size_t suffix_tokens = 0;
+    for (const auto & fd : fields) {
+        suffix_tokens += fd.suffix.size();
+    }
+    tokens_t plan_common;
+    if (opt.optimize && fields.size() > 1) {
+        size_t common = fields[0].suffix.size() - 1; // keep at least one token per branch
+        for (const auto & fd : fields) {
+            common = std::min(common, fd.suffix.size() - 1);
+            size_t j = 0;
+            while (j < common && fields[0].suffix[j] == fd.suffix[j]) {
+                ++j;
+            }
+            common = j;
+        }
+        if (common >= 32) {
+            plan_common.assign(fields[0].suffix.begin(), fields[0].suffix.begin() + common);
+            for (auto & fd : fields) {
+                fd.suffix.erase(fd.suffix.begin(), fd.suffix.begin() + common);
+            }
+        }
+    }
+    size_t leaf_suffix_tokens = 0;
+    for (const auto & fd : fields) {
+        leaf_suffix_tokens += fd.suffix.size();
+    }
+    total = 0;
+    for (const auto & fd : fields) {
+        size_t max_path = 0;
+        for (const auto & p : fd.paths) {
+            max_path = std::max(max_path, p.size());
+        }
+        total += fd.use_tree ? fd.tree_rows() : (int) (fd.suffix.size() + max_path);
+    }
+
+    head_        = opt.head;
+    head_active_ = false;
+    head_reason_.clear();
+    if (head_ != nullptr) {
+        if (!head_->available()) {
+            head_reason_ = head_->reason.empty() ? "the selected answer head is unavailable" : head_->reason;
+        } else if (!llama_context_classifier_only(ctx)) {
+            head_reason_ = "the decision context does not expose hidden states";
+        } else if (llama_model_n_embd_out(model) != (uint32_t) head_->width) {
+            head_reason_ = "the answer-row width does not match the hidden state width";
+        } else {
+            // Only the tokens the scorer actually reads need a row: the tree's divergence nodes,
+            // or every token a greedy walk can land on.
+            bool covers = true;
+            for (const auto & fd : fields) {
+                if (fd.use_tree) {
+                    for (const auto & opts : fd.node_options) {
+                        if (!head_covers(opts)) {
+                            covers = false;
+                            break;
+                        }
+                    }
+                } else {
+                    for (const auto & p : fd.paths) {
+                        if (!head_covers(p)) {
+                            covers = false;
+                            break;
+                        }
+                    }
+                }
+                if (!covers) {
+                    break;
+                }
+            }
+            if (covers) {
+                head_active_ = true;
+            } else {
+                head_reason_ = "the answer head does not cover every candidate token";
+            }
+        }
+    }
+
+    // every trunk decodes its context plus the hoisted suffix head; branches start after it
+    std::vector<tokens_t> tails = prefixes;
+    if (!plan_common.empty()) {
+        for (auto & t : tails) {
+            t.insert(t.end(), plan_common.begin(), plan_common.end());
+        }
+    }
+
     batch_result out;
-    out.shared_tokens = shared.size();
-    out.rows          = total * (int) contexts.size();
+    out.shared_tokens        = shared.size();
+    out.rows                 = total * (int) contexts.size();
+    out.suffix_tokens        = suffix_tokens;
+    out.common_suffix_tokens = plan_common.size();
+    out.leaf_suffix_tokens   = leaf_suffix_tokens;
     out.items.resize(contexts.size());
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -625,7 +776,7 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
             } else {
                 fork_into(seq_snap, trunk, nullptr);
             }
-            parts.push_back({ &prefixes[g0 + i], (llama_pos) shared.size(), trunk });
+            parts.push_back({ &tails[g0 + i], (llama_pos) shared.size(), trunk });
         }
         decode_parts(parts);
         llama_synchronize(ctx); // llama_decode is asynchronous: wait for the prefill so its time isn't billed to scoring
@@ -653,7 +804,7 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
             std::vector<std::pair<size_t, size_t>> owner; // (context in group, field)
             for (size_t i = 0; i < n_group; ++i) {
                 const llama_seq_id trunk = seq_pool + (llama_seq_id) i;
-                const llama_pos    pos0  = (llama_pos) (shared.size() + prefixes[g0 + i].size());
+                const llama_pos    pos0  = (llama_pos) (shared.size() + tails[g0 + i].size());
                 for (size_t f = 0; f < state[i].size(); ++f) {
                     auto & fd = state[i][f];
                     if (fd.use_tree) {
@@ -721,6 +872,11 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
             result & r = out.items[g0 + i];
             r.context_tokens = prefixes[g0 + i].size();
             r.rows           = total;
+            r.head_active        = head_active_;
+            r.head_reason        = head_reason_;
+            r.suffix_tokens        = suffix_tokens;
+            r.common_suffix_tokens = plan_common.size();
+            r.leaf_suffix_tokens   = leaf_suffix_tokens;
             std::vector<field_result> scored;
             scored.reserve(state[i].size());
             for (auto & fd : state[i]) {
@@ -735,8 +891,11 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
                 r.fields[f] = scored[field_first[f]];
             }
         }
+        llama_synchronize(ctx); // the pool sequences are clear before the next group or call reuses them
         out.scoring_ms += ms_since(ts);
     }
+    out.head_active = head_active_;
+    out.head_reason = head_reason_;
     return out;
 }
 
@@ -903,7 +1062,8 @@ compiled_schema compile_schema(const common_json & schema, const std::string & i
 }
 
 std::pair<std::string, std::string> render_prompt(const common_chat_templates * tmpls, bool use_jinja,
-                                                  const std::string & system_text, const std::string & context) {
+                                                  const std::string & system_text, const std::string & context,
+                                                  bool enable_thinking) {
     const std::string safe_ctx = safe_data(context);
     if (tmpls == nullptr) {
         return { system_text + "\nContext:\n", safe_ctx + "\nOutput:\n{\n" };
@@ -912,7 +1072,7 @@ std::pair<std::string, std::string> render_prompt(const common_chat_templates * 
     common_chat_templates_inputs in;
     in.use_jinja             = use_jinja;
     in.add_generation_prompt = true;
-    in.enable_thinking       = false;
+    in.enable_thinking       = enable_thinking;
     common_chat_msg sys;
     sys.role    = "system";
     sys.content = system_text;

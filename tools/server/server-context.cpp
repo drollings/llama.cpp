@@ -2404,10 +2404,9 @@ private:
             llama_decision::jev_request req = llama_decision::parse_jev_request(body);
             // An explicit request for an unavailable fast path is the only head case that errors;
             // the default path always falls back to full logits.
-            const auto & head_cap = llama_decision::selected_head_capability();
-            if (req.head == "selected" && !head_cap.available) {
-                throw std::invalid_argument("head \"selected\" is not available: " + head_cap.reason);
-            }
+            const llama_decision::head_capability head_cap =
+                llama_decision::probe_selected_head(llama_get_model(ctx_tgt));
+            llama_decision::require_selected_head(req.head, head_cap);
             if (!decision_engine) {
                 decision_engine = std::make_unique<llama_decision::engine>(ctx_tgt, (llama_seq_id) params_base.n_parallel,
                                                                             params_base.n_seq_decision);
@@ -2518,16 +2517,17 @@ private:
             usage["output_tokens"]   = 0;
             usage["cached_tokens"]   = (long long) (metrics.cache_hit ? metrics.shared_tokens : 0);
             usage["state_cache_hit"] = metrics.cache_hit;
-            usage["head_mode"]       = "full";
+            usage["head_mode"]       = metrics.head_active ? "selected" : "full";
 
             const std::string echo = req.model.empty() ? model_name : req.model;
             json out = llama_decision::assemble_jev_response(req, probs, echo, usage, &audit);
             // the fast path is optional; report how the answer was actually read out
+            const bool head_fallback = req.head != "full" && !metrics.head_active;
             out["head"] = json::object();
-            out["head"]["mode"]     = "full";
-            out["head"]["fallback"] = !head_cap.available;
-            if (!head_cap.available) {
-                out["head"]["reason"] = head_cap.reason;
+            out["head"]["mode"]     = metrics.head_active ? "selected" : "full";
+            out["head"]["fallback"] = head_fallback;
+            if (head_fallback) {
+                out["head"]["reason"] = metrics.head_reason.empty() ? head_cap.reason : metrics.head_reason;
             }
             // additive diagnostics: the readout contract identity this server is running
             out["diagnostics"] = json::object();

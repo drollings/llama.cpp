@@ -64,8 +64,17 @@ build_one() {
   if [ "$rev" != "$current" ]; then
     echo "Note: current HEAD $current != $branch $rev; building from current checkout but logging $branch rev"
   fi
-  cmake -B "$dir" -DCMAKE_BUILD_TYPE=Release
-  cmake --build "$dir" -j --target llama-server llama-parallel-decision test-decision-engine
+  cmake -B "$dir" -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_HIP=ON \
+    -DGPU_TARGETS="${GPU_TARGETS:-gfx1100}" \
+    -DCMAKE_HIP_ARCHITECTURES="${GPU_TARGETS:-gfx1100}" \
+    -DCMAKE_PREFIX_PATH=/opt/rocm \
+    -DCMAKE_MODULE_PATH=/opt/rocm/lib/cmake/hip \
+    -DCMAKE_EXE_LINKER_FLAGS="-Wl,--disable-new-dtags" \
+    -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--disable-new-dtags" \
+    -Dhipblas_DIR=/opt/rocm/lib/cmake/hipblas \
+    -Drocblas_DIR=/opt/rocm/lib/cmake/rocblas
+  cmake --build "$dir" -j --target llama-server llama-parallel-decision test-decision-engine bench-decision
   log_build "$dir" "$rev"
 }
 
@@ -75,23 +84,60 @@ if [ "$DRY_RUN" = "1" ]; then
     echo "missing bench-env.json" >&2
     exit 1
   fi
-  build_one "_decision" "$ROOT/build-decision"
+  # verify bench-env contains both models
+  if ! grep -q "LFM2.5-2.6B" "$ROOT/tests/decision-baseline/bench-env.json"; then
+    echo "bench-env.json missing LFM2.5-2.6B entry" >&2
+    exit 1
+  fi
+  if ! grep -q "350M" "$ROOT/tests/decision-baseline/bench-env.json"; then
+    echo "bench-env.json missing 350M entry" >&2
+    exit 1
+  fi
   build_one "_decision_synthesis" "$ROOT/build-synthesis"
   echo "dry-run ok"
   exit 0
 fi
 
-# If fixture/mode filtering requested, just ensure binaries exist and optionally run bench-decision
+# If fixture/mode filtering requested, run bench-decision matrix for both models when bin exists
 if [ -n "$FIXTURE" ] || [ -n "$MODES" ]; then
-  for d in "$ROOT/build-synthesis" "$ROOT/build-decision"; do
-    if [ ! -x "$d/bin/bench-decision" ] && [ ! -x "$d/tools/parallel-decision/bench-decision" ] && [ ! -x "$d/bin/llama-parallel-decision" ]; then
+  FIXTURE="${FIXTURE:-tests/fixtures/decision/contexts_schema.request.json}"
+  MODES="${MODES:-auto,tree,greedy}"
+  # models to cover per M0
+  MODELS=("/ai/models/gguf/liquidai/lfm2.5-2.6b-gguf/latest.gguf" "$HOME/Downloads/LFM2.5-350M-QAD-Q4_0.gguf")
+  IFS=',' read -ra MODE_ARR <<< "$MODES"
+  for d in "$ROOT/build-synthesis"; do
+    if [ ! -x "$d/bin/bench-decision" ]; then
       echo "bench binary not found in $d (expected after M2)" >&2
+      continue
     fi
+    for model in "${MODELS[@]}"; do
+      if [ ! -f "$model" ]; then
+        echo "skip missing model $model" >&2
+        continue
+      fi
+      for mode in "${MODE_ARR[@]}"; do
+        for cache in true false; do
+          echo "bench $d $model mode=$mode cache=$cache"
+          "$d/bin/bench-decision" --model "$model" --fixture "$FIXTURE" --mode "$mode" --allow_cache "$cache" --json > /dev/null 2>&1 || echo "bench failed $mode $cache $model" >&2
+        done
+      done
+    done
   done
   exit 0
 fi
 
-build_one "_decision" "$ROOT/build-decision"
 build_one "_decision_synthesis" "$ROOT/build-synthesis"
+
+# post-build matrix for both models when bench-decision exists
+if [ -x "$ROOT/build-synthesis/bin/bench-decision" ]; then
+  FIXTURE="tests/fixtures/decision/contexts_schema.request.json"
+  MODELS=("/ai/models/gguf/liquidai/lfm2.5-2.6b-gguf/latest.gguf" "$HOME/Downloads/LFM2.5-350M-QAD-Q4_0.gguf")
+  for model in "${MODELS[@]}"; do
+    if [ -f "$model" ]; then
+      echo "post-build bench check $model"
+      "$ROOT/build-synthesis/bin/bench-decision" --model "$model" --fixture "$FIXTURE" --mode auto --json > /dev/null 2>&1 || true
+    fi
+  done
+fi
 
 echo "bench matrix builds complete"

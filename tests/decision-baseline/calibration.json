@@ -65,13 +65,22 @@
       ],
       "may_not_gate": [
         "admission",
-        "correctness without a probe"
+        "caching",
+        "routing",
+        "persistence",
+        "answer validity"
       ],
       "production_gate": false,
-      "verdict": "fast path ships disabled: the capability seam exists and reports unavailable, so every answer is read from full logits; an explicit selected request errors, the default path falls back",
+      "verdict": "fast path exists but is opt-in and off by default: it runs only when the context exposes hidden states, an explicit selected request on an incompatible model errors, and every other path falls back to full logits",
       "measurements": {
-        "source_hits": 0,
-        "available": false
+        "source_hits": 3,
+        "available": false,
+        "production_gate": false,
+        "cases": 250,
+        "precision": 1.0,
+        "recall": 1.0,
+        "false_positives": 0,
+        "false_negatives": 0
       }
     },
     "tree_vs_greedy": {
@@ -140,9 +149,10 @@
         "n_ctx": 2048,
         "n_batch": 512,
         "n_ubatch": 512,
-        "n_seq_max": 10,
-        "gpu_layers": 0
-      }
+      "n_seq_max": 10,
+      "gpu_layers": -1,
+      "flash_attn": false
+    }
     },
     "values": {
       "small_tv": 0.0,

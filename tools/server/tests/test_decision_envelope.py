@@ -145,6 +145,10 @@ def run_checks(server, captured):
     check(set(answers["urgency"]["probabilities"]) == {"0", "1", "2"}, "score probability keys are index strings")
     check(set(answers["urgency"]["legend"]) == {"0", "1", "2"}, "score legend keys")
     check(body["usage"]["output_tokens"] == 0, "output_tokens is always 0")
+    # the prompt/cached split is exposed so callers can see how much of the prompt was reused
+    check("input_tokens" in body["usage"], "usage reports input_tokens")
+    check("cached_tokens" in body["usage"], "usage reports a cached_tokens split")
+    check(body["usage"]["input_tokens"] >= body["usage"]["cached_tokens"], "cached tokens are part of the input")
 
     # additive audit fields: prompt identity + per-answer tokenizer/vocabulary diagnostics
     expected_ids = {"refund": 2, "dept": 2, "urgency": 3}
@@ -168,12 +172,18 @@ def run_checks(server, captured):
     payload = json.loads(text)
     check(payload["error"]["code"] == 422, "semantic error code 422")
 
-    # 3b. head: an explicit selected request is a plain 400 (fast path not compiled in),
-    #     while auto/full serve normally and report the resolved head mode
+    # 3b. head: an explicit selected request falls back to full logits when the serving context
+    #     cannot expose hidden states (the shared chat context does not), and reports why. Only an
+    #     incompatible model is a client error; auto/full serve normally.
     selected = dict(JEV_VALID)
     selected["head"] = "selected"
     status, text = server.post("/v1/decision", json.dumps(selected))
-    check(status == 400, f"explicit selected head status {status}: {text}")
+    check(status == 200, f"explicit selected head status {status}: {text}")
+    selected_body = json.loads(text)
+    check(selected_body["head"]["mode"] in ("selected", "full"), "selected head mode reported")
+    if selected_body["head"]["mode"] == "full":
+        check(selected_body["head"]["fallback"] is True, "selected fallback is reported")
+        check(bool(selected_body["head"].get("reason")), "selected fallback reason is reported")
 
     full = dict(JEV_VALID)
     full["head"] = "full"
@@ -201,6 +211,8 @@ def run_checks(server, captured):
     check(legacy.get("object") == "decision", "legacy object marker")
     check("results" in legacy and "decision" in legacy["results"][0], "legacy results shape")
     check("answers" not in legacy, "legacy response must not use the Jev envelope")
+    check("prompt_tokens" in legacy["usage"], "legacy usage reports prompt_tokens")
+    check("cached_tokens" in legacy["usage"], "legacy usage reports a cached_tokens split")
 
 
 def supports_letter_labels(server):

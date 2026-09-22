@@ -397,6 +397,7 @@ extern "C" {
         void *              abort_callback_data;
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
+        bool classifier_only; // if true, only extract embeddings at scored positions, no logits
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
         bool no_perf;     // measure performance timings
@@ -584,6 +585,9 @@ extern "C" {
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
+
+    // True when the context was created with classifier_only (hidden states at scored positions, no logits).
+    LLAMA_API  bool                      llama_context_classifier_only(const struct llama_context * ctx);
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
@@ -1063,6 +1067,12 @@ extern "C" {
     // shape: [n_embd] (1-dimensional)
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
+
+    // Dequantize the output (classifier) rows for the given token ids into dst. Returns the row
+    // width, or zero when the model's output tensor is unsupported. On success softcap is set to
+    // the final logit softcap (0 when the model has none). dst must hold count * width floats.
+    LLAMA_API int32_t llama_model_classifier_rows(const struct llama_model * model,
+            const llama_token * ids, int32_t count, float * dst, size_t dst_count, float * softcap);
 
     // Get the embeddings for a sequence id
     // Returns NULL if pooling_type is LLAMA_POOLING_TYPE_NONE

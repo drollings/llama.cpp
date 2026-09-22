@@ -81,7 +81,7 @@ const char * letter_system_text() {
 }
 
 std::pair<std::string, std::string> render_letter_prompt(const common_chat_templates * tmpls, bool use_jinja,
-                                                         const std::string & system_text) {
+                                                         const std::string & system_text, bool enable_thinking) {
     if (tmpls == nullptr) {
         return { system_text + "\n", "\n" };
     }
@@ -89,7 +89,7 @@ std::pair<std::string, std::string> render_letter_prompt(const common_chat_templ
     common_chat_templates_inputs in;
     in.use_jinja             = use_jinja;
     in.add_generation_prompt = true;
-    in.enable_thinking       = false;
+    in.enable_thinking       = enable_thinking;
     common_chat_msg sys;
     sys.role    = "system";
     sys.content = system_text;
@@ -113,12 +113,75 @@ void validate_label_capacity(const jev_request & req, size_t label_count) {
     }
 }
 
+head_capability probe_selected_head(const llama_model * model) {
+    head_capability cap;
+    if (model == nullptr) {
+        cap.reason = "no model is loaded";
+        return cap;
+    }
+    const int width = (int) llama_model_n_embd_out(model);
+    if (width <= 0) {
+        cap.reason = "no hidden state is available";
+        return cap;
+    }
+    const std::vector<llama_token> ids = { 0, 1 };
+    std::vector<float> rows((size_t) ids.size() * (size_t) width, 0.0f);
+    float softcap = 0.0f;
+    const int w = llama_model_classifier_rows(model, ids.data(), (int32_t) ids.size(), rows.data(), rows.size(), &softcap);
+    if (w <= 0) {
+        cap.reason = "the model output tensor is not a plain contiguous answer head";
+        return cap;
+    }
+    cap.available = true;
+    cap.width     = w;
+    cap.softcap   = softcap;
+    return cap;
+}
+
+classifier_head build_classifier_head(const llama_model * model, const std::vector<label> & labels) {
+    classifier_head head;
+    if (model == nullptr) {
+        head.reason = "no model is loaded";
+        return head;
+    }
+    if (labels.empty()) {
+        head.reason = "no answer labels are available";
+        return head;
+    }
+    const int width = (int) llama_model_n_embd_out(model);
+    if (width <= 0) {
+        head.reason = "no hidden state is available";
+        return head;
+    }
+    head.ids.reserve(labels.size());
+    for (const auto & l : labels) {
+        head.ids.push_back(l.token);
+    }
+    head.rows.assign(head.ids.size() * (size_t) width, 0.0f);
+    const int w = llama_model_classifier_rows(model, head.ids.data(), (int32_t) head.ids.size(),
+                                              head.rows.data(), head.rows.size(), &head.softcap);
+    if (w <= 0) {
+        head.ids.clear();
+        head.rows.clear();
+        head.reason = "the model output tensor is not a plain contiguous answer head";
+        return head;
+    }
+    head.width = w;
+    return head;
+}
+
+void require_selected_head(const std::string & requested, const head_capability & cap) {
+    if (requested == "selected" && !cap.available) {
+        throw std::invalid_argument("head \"selected\" is not available: " + cap.reason);
+    }
+}
+
 const head_capability & selected_head_capability() {
     // Derived once (C++11 local-static initialization is thread-safe). No row table is built:
     // this build exposes no hidden-state seam to project the answer rows against, so the
     // readout always gathers from full logits. A supported build would fill `available` here.
     static const head_capability cap = {
-        false,
+        false, 0, 0.0f,
         "selected-head projection is not available in this build; full logits are used",
     };
     return cap;
@@ -206,6 +269,20 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
     readout_opt.cache_tag      = make_prefix_tag(letter_system_text(), split.second, LETTER_PROMPT_VERSION);
     readout_opt.audit          = (audit != nullptr);
 
+    // The selected head is a fallback-safe fast path: it is used when the model exposes usable
+    // answer rows and the context exposes hidden states, and the full-logits path is used
+    // otherwise. Only an explicit request for it on an incompatible model is a client error.
+    if (req.head == "selected") {
+        require_selected_head(req.head, probe_selected_head(eng.get_model()));
+    }
+    classifier_head head;
+    if (req.head != "full") {
+        head = build_classifier_head(eng.get_model(), labels);
+        if (head.available()) {
+            readout_opt.head = &head;
+        }
+    }
+
     const auto b = eng.decide_batch(split.first, { render_state(req.state) }, fields, readout_opt);
 
     if (metrics) {
@@ -216,6 +293,8 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
         metrics->rows           = b.rows;
         metrics->rounds         = b.rounds;
         metrics->context_tokens = b.items.empty() ? 0 : b.items[0].context_tokens;
+        metrics->head_active    = b.head_active;
+        metrics->head_reason    = b.head_reason;
     }
 
     std::vector<std::vector<float>> probs;
