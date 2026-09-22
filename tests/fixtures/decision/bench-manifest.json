@@ -1,0 +1,12 @@
+{
+  "cross_branch": [
+    "contexts_schema.request.json",
+    "compiled_schema.golden.json"
+  ],
+  "synthesis_only": [
+    "jev_basic.golden.json",
+    "jev_basic.shape.json",
+    "jev_letter.golden.json"
+  ],
+  "notes": "Trie fixtures are byte-identical on both branches. Jev fixtures require synthesis; ancestor skips them cleanly (exit 0 SKIP, not FAIL)."
+}

@@ -17,3 +17,7 @@ if(LLAMA_TOOLS_INSTALL)
 endif()
 target_link_libraries(${TARGET} PRIVATE llama-decision llama-common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+add_executable(bench-decision bench-decision.cpp)
+target_link_libraries(bench-decision PRIVATE llama-decision llama-common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(bench-decision PRIVATE cxx_std_17)

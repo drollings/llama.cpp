@@ -2295,6 +2295,45 @@ static void test_calibration_table(testing & t) {
     });
 }
 
+static void test_bench_env(testing & t) {
+    t.test("bench environment file carries provenance and matches calibration flags", [](testing & t) {
+        const std::string bench_path = std::string(DECISION_TEST_BASELINE_DIR) + "/bench-env.json";
+        const std::string cal_path   = std::string(DECISION_TEST_BASELINE_DIR) + "/calibration.json";
+        if (!file_exists(bench_path)) {
+            t.assert_true("bench-env.json exists", false);
+            return;
+        }
+        const common_json bench = common_json::parse(read_file(bench_path));
+        const common_json cal   = common_json::parse(read_file(cal_path));
+        // git revision must be present
+        bool has_rev = bench.contains("git_rev") || bench.contains("git_rev_synthesis");
+        t.assert_true("bench env has git_rev", has_rev);
+        if (has_rev) {
+            std::string rev = bench.contains("git_rev") ? bench.at("git_rev").get<std::string>()
+                                                        : bench.at("git_rev_synthesis").get<std::string>();
+            t.assert_true("git_rev is 40 hex", rev.size() == 40);
+        }
+        // backend flags must match calibration environment
+        const auto & cal_flags = cal.at("model_measurements").at("environment").at("backend_flags");
+        common_json bench_flags;
+        if (bench.contains("environment") && bench.at("environment").contains("backend_flags")) {
+            bench_flags = bench.at("environment").at("backend_flags");
+        } else if (bench.contains("backend_flags")) {
+            bench_flags = bench.at("backend_flags");
+        } else {
+            t.assert_true("bench env has backend_flags", false);
+            return;
+        }
+        for (const auto & e : cal_flags.items()) {
+            const std::string & k = e.key();
+            t.assert_true("bench flags contain " + k, bench_flags.contains(k));
+            if (bench_flags.contains(k)) {
+                t.assert_equal("flag " + k + " matches calibration", e.value().dump(), bench_flags.at(k).dump());
+            }
+        }
+    });
+}
+
 static void test_calibration_model(testing & t) {
     t.test("calibration: model-dependent thresholds measured on a real model", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
@@ -2477,6 +2516,7 @@ int main(int argc, char ** argv) {
         test_calibration_confidence(t);
         test_calibration_selected_head(t);
         test_calibration_table(t);
+        test_bench_env(t);
         test_calibration_model(t);
         test_engine_integration(t);
     });
