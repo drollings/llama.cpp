@@ -3,6 +3,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <atomic>
 #include <string>
 #include <unordered_set>
 #include <list>
@@ -175,6 +176,7 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_DECISION: the request body
     json decision_request;
+    std::shared_ptr<std::atomic<bool>> decision_cancel; // set when the HTTP client disconnects
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale

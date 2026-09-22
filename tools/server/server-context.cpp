@@ -2389,9 +2389,14 @@ private:
     // returns false to decline the task, it is offered again after the decode is done
     // POST /decision: answer a finite JSON schema in one batched pass on this thread.
     // Uses the sequence ids above the slots reserved by --decision-seqs (see tools/parallel-decision).
-    json handle_decision(const json & body) {
+    json handle_decision(const json & body, const std::shared_ptr<std::atomic<bool>> & cancel_flag = nullptr) {
         if (params_base.n_seq_decision < 3) {
             throw std::invalid_argument("decisions are disabled: start the server with --decision-seqs N (N >= 3)");
+        }
+        const bool has_jev = body.contains("questions") || body.contains("state");
+        const bool has_generic = body.contains("contexts") || body.contains("schema");
+        if (has_jev && has_generic) {
+            throw llama_decision::semantic_error("request must be either state+questions or contexts+schema, not both");
         }
         // Jev shape: state + typed questions, scored as one next-token choice over the
         // verified letter labels, sharing one framed state prefix across all questions.
@@ -2447,7 +2452,24 @@ private:
                                                                             llama_decision::letter_system_text());
                     llama_decision::temperature_provenance current;
                     current.model         = model_name;
-                    current.quantization  = "";
+                    {
+                        std::string quant;
+                        char qbuf[256];
+                        const llama_model * mdl = llama_get_model(ctx_tgt);
+                        if (mdl && llama_model_meta_val_str(mdl, "general.quantization_version", qbuf, sizeof(qbuf)) > 0) {
+                            quant = qbuf;
+                        } else if (mdl && llama_model_meta_val_str(mdl, "general.file_type", qbuf, sizeof(qbuf)) > 0) {
+                            quant = qbuf;
+                        } else if (mdl && llama_model_meta_val_str(mdl, "general.type", qbuf, sizeof(qbuf)) > 0) {
+                            quant = qbuf;
+                        }
+                        if (quant.empty() && !params_base.model.path.empty()) {
+                            quant = params_base.model.path;
+                            auto p = quant.find_last_of("/\\");
+                            if (p != std::string::npos) quant = quant.substr(p + 1);
+                        }
+                        current.quantization = quant;
+                    }
                     current.template_hash = llama_decision::make_prefix_tag(parts.first, parts.second,
                                                                             llama_decision::LETTER_PROMPT_VERSION);
                     char flags[256];
@@ -2476,6 +2498,9 @@ private:
             llama_decision::options jopt;
             if (const char * fork = std::getenv("LLAMA_DECISION_FORK")) {
                 jopt.fork = fork;
+            }
+            if (cancel_flag) {
+                jopt.should_stop = [cancel_flag]() { return cancel_flag->load(); };
             }
             jopt.yield = []() { std::this_thread::yield(); };
             llama_decision::letter_metrics metrics;
@@ -2508,6 +2533,36 @@ private:
             out["diagnostics"] = json::object();
             out["diagnostics"]["contract_hash"]  = decision_contract;
             out["diagnostics"]["prompt_version"] = llama_decision::LETTER_PROMPT_VERSION;
+            {
+                std::string quant;
+                char qbuf[256];
+                const llama_model * mdl = llama_get_model(ctx_tgt);
+                if (mdl && llama_model_meta_val_str(mdl, "general.quantization_version", qbuf, sizeof(qbuf)) > 0) {
+                    quant = qbuf;
+                } else if (mdl && llama_model_meta_val_str(mdl, "general.file_type", qbuf, sizeof(qbuf)) > 0) {
+                    quant = qbuf;
+                } else if (mdl && llama_model_meta_val_str(mdl, "general.type", qbuf, sizeof(qbuf)) > 0) {
+                    quant = qbuf;
+                }
+                if (quant.empty() && !params_base.model.path.empty()) {
+                    quant = params_base.model.path;
+                    auto p = quant.find_last_of("/\\");
+                    if (p != std::string::npos) quant = quant.substr(p + 1);
+                }
+                const auto p2 = llama_decision::render_letter_prompt(chat_params.tmpls.get(), chat_params.use_jinja,
+                                                                      llama_decision::letter_system_text());
+                std::string thash = llama_decision::make_prefix_tag(p2.first, p2.second,
+                                                                     llama_decision::LETTER_PROMPT_VERSION);
+                char flags2[256];
+                std::snprintf(flags2, sizeof(flags2), "fa=%d,k=%d,v=%d,unified=%d,swa=%d,ubatch=%u",
+                              (int) params_base.flash_attn_type, (int) params_base.cache_type_k,
+                              (int) params_base.cache_type_v, (int) params_base.kv_unified,
+                              (int) params_base.swa_full, params_base.n_ubatch);
+                out["diagnostics"]["model"]          = model_name;
+                out["diagnostics"]["quantization"]   = quant;
+                out["diagnostics"]["template_hash"]  = thash;
+                out["diagnostics"]["backend_flags"]  = std::string(flags2);
+            }
             return out;
         }
         // one decision per context; all contexts share the schema, the instructions and the cached prefix
@@ -2545,6 +2600,9 @@ private:
         opt.tree_max    = (size_t) body.value("tree_max", 128);
         opt.allow_cache = body.value("cache_prompt", true);
         opt.fork        = body.value("fork", std::string("auto"));
+        if (cancel_flag) {
+            opt.should_stop = [cancel_flag]() { return cancel_flag->load(); };
+        }
         opt.yield       = []() { std::this_thread::yield(); };
 
         llama_decision::batch_result b;
@@ -2716,7 +2774,7 @@ private:
                     try {
                         auto res  = std::make_unique<server_task_result_decision>();
                         res->id   = task.id;
-                        res->data = handle_decision(task.decision_request);
+                        res->data = handle_decision(task.decision_request, task.decision_cancel);
                         queue_results.send(std::move(res));
                     } catch (const llama_decision::unsupported_error & e) {
                         send_error(task, e.what(), ERROR_TYPE_NOT_SUPPORTED);
@@ -5428,12 +5486,20 @@ void server_routes::init_routes() {
             return res;
         }
 
+        auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
         server_task task(SERVER_TASK_TYPE_DECISION);
         task.id               = res->rd.get_new_id();
         task.decision_request = body;
+        task.decision_cancel  = cancel_flag;
         res->rd.post_task(std::move(task));
 
-        auto result = res->rd.next([&] { return req.should_stop(); });
+        auto result = res->rd.next([&] {
+            if (req.should_stop()) {
+                cancel_flag->store(true);
+                return true;
+            }
+            return false;
+        });
         if (!result) {
             // the client went away or the server stopped: never report a partial answer
             res->error(format_error_response("the decision was abandoned before it finished", ERROR_TYPE_CLIENT_CLOSED));

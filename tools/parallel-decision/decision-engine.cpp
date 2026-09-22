@@ -2,6 +2,7 @@
 
 #include "chat.h"
 #include "common.h"
+#include "labels.h"
 
 #include <algorithm>
 #include <chrono>
@@ -903,8 +904,9 @@ compiled_schema compile_schema(const common_json & schema, const std::string & i
 
 std::pair<std::string, std::string> render_prompt(const common_chat_templates * tmpls, bool use_jinja,
                                                   const std::string & system_text, const std::string & context) {
+    const std::string safe_ctx = safe_data(context);
     if (tmpls == nullptr) {
-        return { system_text + "\nContext:\n", context + "\nOutput:\n{\n" };
+        return { system_text + "\nContext:\n", safe_ctx + "\nOutput:\n{\n" };
     }
     static const std::string sentinel = "\x1f<<decision-context>>\x1f";
     common_chat_templates_inputs in;
@@ -923,7 +925,7 @@ std::pair<std::string, std::string> render_prompt(const common_chat_templates * 
     if (at == std::string::npos) {
         throw std::runtime_error("the chat template did not keep the user message");
     }
-    return { prompt.substr(0, at), context + prompt.substr(at + sentinel.size()) + "{\n" };
+    return { prompt.substr(0, at), safe_ctx + prompt.substr(at + sentinel.size()) + "{\n" };
 }
 
 common_json assemble(const compiled_schema & cs, const result & r) {
