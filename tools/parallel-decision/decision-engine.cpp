@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 
 namespace llama_decision {
@@ -33,6 +34,12 @@ struct decision_field {
     int   winner       = -1;
     float path_score   = 1.0f;
     int   scored_nodes = 0;
+    float temperature  = 1.0f;
+
+    bool  audit_valid         = false;
+    float allowed_token_mass  = 1.0f;
+    int   full_vocab_argmax   = -1;
+    std::vector<float> audit_logits;
 
     decision_field(tokens_t s, std::vector<tokens_t> p) : suffix(std::move(s)), paths(std::move(p)) {
         for (int i = 0; i < (int) paths.size(); ++i) {
@@ -155,29 +162,125 @@ struct decision_field {
             }
         }
         const int best = (int) (std::max_element(path_lp.begin(), path_lp.end()) - path_lp.begin());
-        double z = 0;
-        for (float x : path_lp) {
-            z += std::exp(x - path_lp[best]);
-        }
-        probs.clear();
-        for (float x : path_lp) {
-            probs.push_back((float) (std::exp(x - path_lp[best]) / z));
-        }
-        winner       = best;
-        path_score   = probs[best];
-        scored_nodes = (int) node_prefix.size();
+        probs          = softmax(path_lp, temperature);
+        winner         = best;
+        path_score     = probs[best];
+        scored_nodes   = (int) node_prefix.size();
     }
 };
 
 } // namespace
 
+std::vector<float> softmax(const std::vector<float> & logits, float temperature) {
+    std::vector<float> out(logits.size(), 0.0f);
+    if (logits.empty()) {
+        return out;
+    }
+    if (!(temperature > 0.0f)) {
+        temperature = 1.0f;
+    }
+    const float mx = *std::max_element(logits.begin(), logits.end());
+    double      z  = 0.0;
+    for (float x : logits) {
+        z += std::exp((double) ((x - mx) / temperature));
+    }
+    for (size_t i = 0; i < logits.size(); ++i) {
+        out[i] = (float) (std::exp((double) ((logits[i] - mx) / temperature)) / z);
+    }
+    return out;
+}
+
+std::string make_prefix_tag(const std::string & system_text, const std::string & after,
+                            const std::string & prompt_version) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](const std::string & s) {
+        for (unsigned char c : s) {
+            h ^= c;
+            h *= 1099511628211ull;
+        }
+        h ^= 0x1f;
+        h *= 1099511628211ull;
+    };
+    mix(prompt_version);
+    mix(system_text);
+    mix(after);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long) h);
+    return std::string("decision-prefix-v1:") + buf;
+}
+
 // ---------------------------------------------------------------- engine
 
 engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs)
-    : ctx(ctx), vocab(llama_model_get_vocab(llama_get_model(ctx))), mem(llama_get_memory(ctx)),
-      seq_snap(seq_base), seq_pool(seq_base + 1), n_pool(n_seqs - 1) {
+    : ctx(ctx), model(llama_get_model(ctx)), vocab(llama_model_get_vocab(llama_get_model(ctx))),
+      mem(llama_get_memory(ctx)), seq_snap(seq_base), seq_pool(seq_base + 1), n_pool(n_seqs - 1) {
     if (n_seqs < 3) {
         throw std::invalid_argument("a decision engine needs at least 3 sequences");
+    }
+    const int n_swa = llama_model_n_swa(model);
+    if (n_swa > 0) {
+        swa_ = (llama_pos) n_swa;
+    }
+    // Recurrent and hybrid memory cannot be copied between sequences; save and restore instead.
+    probe_fork_ = (llama_model_is_recurrent(model) || llama_model_is_hybrid(model)) ? fork_kind::restore : fork_kind::copy;
+}
+
+void engine::select_fork(const std::string & requested) {
+    if (requested == "copy") {
+        active_fork_ = fork_kind::copy;
+    } else if (requested == "restore") {
+        active_fork_ = fork_kind::restore;
+    } else if (requested == "auto") {
+        active_fork_ = probe_fork_;
+    } else {
+        throw std::invalid_argument("fork must be auto, copy or restore");
+    }
+}
+
+std::vector<uint8_t> engine::save_seq(llama_seq_id seq) const {
+    const size_t size = llama_state_seq_get_size(ctx, seq);
+    if (size == 0) {
+        return {};
+    }
+    std::vector<uint8_t> buf(size);
+    if (llama_state_seq_get_data(ctx, buf.data(), buf.size(), seq) != size) {
+        throw std::runtime_error("failed to save a decision sequence state");
+    }
+    return buf;
+}
+
+void engine::load_seq(const std::vector<uint8_t> & state, llama_seq_id seq) const {
+    if (state.empty()) {
+        return;
+    }
+    if (llama_state_seq_set_data(ctx, state.data(), state.size(), seq) == 0) {
+        throw std::runtime_error("failed to restore a decision sequence state");
+    }
+}
+
+void engine::fork_into(llama_seq_id src, llama_seq_id dst, const std::vector<uint8_t> * src_state) {
+    llama_memory_seq_rm(mem, dst, -1, -1);
+    if (active_fork_ == fork_kind::restore) {
+        if (src_state == nullptr) {
+            throw std::runtime_error("a restore fork needs a saved parent state");
+        }
+        load_seq(*src_state, dst);
+        return;
+    }
+    // A sliding-window cache no longer holds cells older than the window; copy only what survives.
+    llama_pos p0 = -1;
+    if (swa_ > 0) {
+        const llama_pos pmax = llama_memory_seq_pos_max(mem, src);
+        if (pmax >= 0 && pmax + 1 > swa_) {
+            p0 = pmax + 1 - swa_;
+        }
+    }
+    llama_memory_seq_cp(mem, src, dst, p0, -1);
+}
+
+void engine::check_cancel() const {
+    if (stop_ && stop_()) {
+        throw cancelled_error("the decision was cancelled");
     }
 }
 
@@ -196,12 +299,13 @@ void engine::decode_parts(const std::vector<prompt_part> & parts) {
     const int n_batch = (int) llama_n_batch(ctx);
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
     auto flush = [&]() {
+        check_cancel();
         const int rc = batch.n_tokens > 0 ? llama_decode(ctx, batch) : 0;
         common_batch_clear(batch);
         if (rc != 0) {
             llama_batch_free(batch);
-            throw std::runtime_error(rc == 1 ? "no free KV cache space for the decision prompt"
-                                             : "llama_decode failed on the decision prompt (" + std::to_string(rc) + ")");
+            throw capacity_error(rc == 1 ? "no free KV cache space for the decision prompt"
+                                         : "llama_decode failed on the decision prompt (" + std::to_string(rc) + ")");
         }
     };
     for (const auto & p : parts) {
@@ -218,27 +322,114 @@ void engine::decode_parts(const std::vector<prompt_part> & parts) {
 
 // Restore (or build) the cached static prefix on seq_snap. Only this engine's own sequences are
 // touched, so it can share a context with other users (e.g. server slots).
-bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache) {
-    if (allow_cache && !shared.empty() && shared == cached &&
-        llama_memory_seq_pos_max(mem, seq_snap) == (llama_pos) cached.size() - 1) {
-        return true;
+bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache, const std::string & tag) {
+    if (allow_cache && !shared.empty() && active_fork_ == fork_kind::restore && !tag.empty()) {
+        for (size_t i = 0; i < prefix_lru_.size(); ++i) {
+            if (prefix_lru_[i].tag == tag) {
+                prefix_entry entry = prefix_lru_[i];
+                prefix_lru_.erase(prefix_lru_.begin() + (long) i);
+                prefix_lru_.insert(prefix_lru_.begin(), entry);
+                for (llama_seq_id s = seq_snap; s < seq_pool + n_pool; ++s) {
+                    llama_memory_seq_rm(mem, s, -1, -1);
+                }
+                load_seq(entry.state, seq_snap);
+                prefix_state_ = std::move(entry.state);
+                cached        = shared;
+                cached_tag    = tag;
+                return true;
+            }
+        }
+    } else {
+        const bool tag_ok = tag.empty() || tag == cached_tag;
+        if (allow_cache && tag_ok && !shared.empty() && shared == cached &&
+            llama_memory_seq_pos_max(mem, seq_snap) == (llama_pos) cached.size() - 1) {
+            return true;
+        }
     }
+
     for (llama_seq_id s = seq_snap; s < seq_pool + n_pool; ++s) {
         llama_memory_seq_rm(mem, s, -1, -1);
     }
     cached.clear();
+    cached_tag.clear();
+    prefix_state_.clear();
     if (!shared.empty()) {
         decode_parts({ { &shared, 0, seq_snap } });
-        cached = shared;
+        cached     = shared;
+        cached_tag = tag;
+        if (active_fork_ == fork_kind::restore) {
+            prefix_state_ = save_seq(seq_snap);
+            if (!tag.empty()) {
+                prefix_lru_.insert(prefix_lru_.begin(), { tag, prefix_state_ });
+                while (prefix_lru_.size() > prefix_lru_capacity_) {
+                    prefix_lru_.pop_back();
+                }
+            }
+        }
     }
     return false;
 }
 
 // Score each branch as its own sequence forked from its trunk; return each branch's last-token
 // logits restricted to its candidate tokens. Groups are bounded by free sequences and batch rows.
-std::vector<std::vector<float>> engine::score_branches(const std::vector<branch> & branches, llama_seq_id first, int n_free) {
-    std::vector<std::vector<float>> result(branches.size());
-    const int max_rows = (int) llama_n_batch(ctx);
+// Full-vocab diagnostics at one scored position: share of the vocabulary mass that lands on the
+// allowed candidate tokens, and the id the unrestricted model would pick. Audit only.
+static void score_audit(const float * logits, int n_vocab, const tokens_t & cands,
+                        int & argmax_id, float & allowed_mass) {
+    int    best     = 0;
+    double lse_all  = -std::numeric_limits<double>::infinity();
+    double lse_cand = -std::numeric_limits<double>::infinity();
+    for (int t = 0; t < n_vocab; ++t) {
+        if (logits[t] > logits[best]) {
+            best = t;
+        }
+        const double x = logits[t];
+        const double m = std::max(lse_all, x);
+        lse_all = m == -std::numeric_limits<double>::infinity() ? m : m + std::log1p(std::exp(std::min(lse_all, x) - m));
+    }
+    for (llama_token t : cands) {
+        const double x = logits[t];
+        const double m = std::max(lse_cand, x);
+        lse_cand = m == -std::numeric_limits<double>::infinity() ? m : m + std::log1p(std::exp(std::min(lse_cand, x) - m));
+    }
+    argmax_id    = best;
+    allowed_mass = (float) std::exp(lse_cand - lse_all);
+}
+
+std::vector<engine::branch_score> engine::score_branches(const std::vector<branch> & branches, llama_seq_id first, int n_free,
+                                                         const std::vector<std::vector<uint8_t>> * parent_states,
+                                                         bool allow_bypass) {
+    std::vector<branch_score> result(branches.size());
+
+    // A single branch does not need its own sequence: decode it on the trunk and trim afterwards.
+    if (allow_bypass && branches.size() == 1 && active_fork_ == fork_kind::copy) {
+        const llama_seq_id seq  = branches[0].trunk;
+        const auto &       toks = branches[0].toks;
+        llama_batch batch = llama_batch_init((int) toks.size(), 0, 1);
+        for (size_t i = 0; i < toks.size(); ++i) {
+            common_batch_add(batch, toks[i], branches[0].pos0 + (llama_pos) i, { seq }, i + 1 == toks.size());
+        }
+        check_cancel();
+        const int rc = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        if (rc != 0) {
+            throw capacity_error(rc == 1 ? "no free KV cache space for the decision branch"
+                                         : "llama_decode failed on the decision branch (" + std::to_string(rc) + ")");
+        }
+        const float * logits = llama_get_logits_ith(ctx, (int) toks.size() - 1);
+        for (llama_token t : branches[0].cands) {
+            result[0].cand_logits.push_back(logits[t]);
+        }
+        if (audit_) {
+            score_audit(logits, llama_vocab_n_tokens(vocab), branches[0].cands,
+                        result[0].full_vocab_argmax, result[0].allowed_token_mass);
+        }
+        llama_memory_seq_rm(mem, seq, branches[0].pos0, -1); // the trunk keeps its prefix and context only
+        return result;
+    }
+
+    const size_t batch_cap = active_fork_ == fork_kind::restore ? 512u : (size_t) llama_n_batch(ctx);
+    const int max_rows = (int) std::min((size_t) llama_n_batch(ctx), batch_cap);
     size_t start = 0;
     while (start < branches.size()) {
         size_t end  = start;
@@ -248,14 +439,25 @@ std::vector<std::vector<float>> engine::score_branches(const std::vector<branch>
             ++end;
         }
         if (end == start) {
-            throw std::runtime_error("a decision suffix exceeds the batch size");
+            throw capacity_error("a decision suffix exceeds the batch size");
         }
         llama_batch batch = llama_batch_init(rows, 0, 1);
         std::vector<int> out_idx;
         for (size_t b = start; b < end; ++b) {
             const llama_seq_id seq = first + (llama_seq_id) (b - start);
-            llama_memory_seq_rm(mem, seq, -1, -1);
-            llama_memory_seq_cp(mem, branches[b].trunk, seq, -1, -1);
+            if (active_fork_ == fork_kind::restore) {
+                if (parent_states == nullptr) {
+                    throw capacity_error("a restore fork needs parent states");
+                }
+                const size_t idx = (size_t) (branches[b].trunk - seq_pool);
+                if (idx >= parent_states->size()) {
+                    throw capacity_error("missing parent state for a decision branch");
+                }
+                llama_memory_seq_rm(mem, seq, -1, -1);
+                load_seq((*parent_states)[idx], seq);
+            } else {
+                fork_into(branches[b].trunk, seq, nullptr);
+            }
             const auto & toks = branches[b].toks;
             for (size_t i = 0; i < toks.size(); ++i) {
                 const bool last = i + 1 == toks.size();
@@ -265,16 +467,21 @@ std::vector<std::vector<float>> engine::score_branches(const std::vector<branch>
                 common_batch_add(batch, toks[i], branches[b].pos0 + (llama_pos) i, { seq }, last);
             }
         }
+        check_cancel();
         const int rc = llama_decode(ctx, batch);
         llama_batch_free(batch);
         if (rc != 0) {
-            throw std::runtime_error(rc == 1 ? "no free KV cache space for the decision branches"
-                                             : "llama_decode failed on the decision branches (" + std::to_string(rc) + ")");
+            throw capacity_error(rc == 1 ? "no free KV cache space for the decision branches"
+                                         : "llama_decode failed on the decision branches (" + std::to_string(rc) + ")");
         }
         for (size_t b = start; b < end; ++b) {
             const float * logits = llama_get_logits_ith(ctx, out_idx[b - start]);
             for (llama_token t : branches[b].cands) {
-                result[b].push_back(logits[t]);
+                result[b].cand_logits.push_back(logits[t]);
+            }
+            if (audit_) {
+                score_audit(logits, llama_vocab_n_tokens(vocab), branches[b].cands,
+                            result[b].full_vocab_argmax, result[b].allowed_token_mass);
             }
             llama_memory_seq_rm(mem, first + (llama_seq_id) (b - start), -1, -1);
         }
@@ -303,6 +510,11 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
     if (contexts.empty()) {
         throw std::invalid_argument("a decision needs at least one context");
     }
+    select_fork(opt.fork);
+    stop_  = opt.should_stop;
+    yield_ = opt.yield;
+    audit_ = opt.audit;
+    check_cancel();
     const tokens_t shared = tokenize(shared_text, true);
     std::vector<tokens_t> prefixes;
     for (const auto & text : contexts) {
@@ -313,6 +525,7 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
     }
 
     std::vector<decision_field> fields;
+    std::vector<size_t> field_first; // input field -> scored field (identical fields share one)
     int total    = 0;
     int branches = 0; // round-1 branches of one context
     for (const auto & in : inputs) {
@@ -362,11 +575,24 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
             }
         }
         decision_field field(suffix, paths);
+        field.temperature = in.temperature;
         field.build_nodes();
         field.use_tree = opt.mode == "tree" ? true : opt.mode == "greedy" ? false : n <= opt.tree_max;
-        total    += field.use_tree ? field.tree_rows() : (int) (suffix.size() + max_path);
-        branches += field.use_tree ? (int) field.node_prefix.size() : 1;
-        fields.push_back(std::move(field));
+        // exact-token dedup: identical fields (suffix, paths, temperature, mode) score once
+        size_t canon = fields.size();
+        for (size_t u = 0; u < fields.size(); ++u) {
+            if (fields[u].temperature == field.temperature && fields[u].use_tree == field.use_tree &&
+                fields[u].suffix == field.suffix && fields[u].paths == field.paths) {
+                canon = u;
+                break;
+            }
+        }
+        if (canon == fields.size()) {
+            total    += field.use_tree ? field.tree_rows() : (int) (suffix.size() + max_path);
+            branches += field.use_tree ? (int) field.node_prefix.size() : 1;
+            fields.push_back(std::move(field));
+        }
+        field_first.push_back(canon);
     }
 
     batch_result out;
@@ -375,21 +601,28 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
     out.items.resize(contexts.size());
 
     const auto t0 = std::chrono::steady_clock::now();
-    out.cache_hit = prepare_prefix(shared, opt.allow_cache);
+    out.cache_hit = prepare_prefix(shared, opt.allow_cache, opt.cache_tag);
     out.prefill_ms += ms_since(t0);
 
     // each context in a group holds one trunk sequence; the rest of the pool scores branches
     const size_t per_group = std::clamp<size_t>(n_pool / (1 + branches), 1, contexts.size());
     for (size_t g0 = 0; g0 < contexts.size(); g0 += per_group) {
+        if (yield_) {
+            yield_();
+        }
         const size_t n_group = std::min(per_group, contexts.size() - g0);
 
         const auto tp = std::chrono::steady_clock::now();
         std::vector<prompt_part> parts;
         for (size_t i = 0; i < n_group; ++i) {
             const llama_seq_id trunk = seq_pool + (llama_seq_id) i;
-            llama_memory_seq_rm(mem, trunk, -1, -1);
-            if (!shared.empty()) {
-                llama_memory_seq_cp(mem, seq_snap, trunk, -1, -1);
+            if (active_fork_ == fork_kind::restore) {
+                llama_memory_seq_rm(mem, trunk, -1, -1);
+                if (!shared.empty()) {
+                    load_seq(prefix_state_, trunk);
+                }
+            } else {
+                fork_into(seq_snap, trunk, nullptr);
             }
             parts.push_back({ &prefixes[g0 + i], (llama_pos) shared.size(), trunk });
         }
@@ -397,12 +630,24 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
         llama_synchronize(ctx); // llama_decode is asynchronous: wait for the prefill so its time isn't billed to scoring
         out.prefill_ms += ms_since(tp);
 
+        std::vector<std::vector<uint8_t>> trunk_states;
+        if (active_fork_ == fork_kind::restore) {
+            trunk_states.reserve(n_group);
+            for (size_t i = 0; i < n_group; ++i) {
+                trunk_states.push_back(save_seq(seq_pool + (llama_seq_id) i));
+            }
+        }
+
         // round 1 carries every tree node and each greedy field's first step; later rounds only
         // continue greedy fields that are still open
         const auto ts = std::chrono::steady_clock::now();
         std::vector<std::vector<decision_field>> state(n_group, fields);
         bool first = true;
         while (true) {
+            check_cancel();
+            if (yield_) {
+                yield_(); // let the caller serve light requests between waves
+            }
             std::vector<branch> todo;
             std::vector<std::pair<size_t, size_t>> owner; // (context in group, field)
             for (size_t i = 0; i < n_group; ++i) {
@@ -433,22 +678,30 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
             if (todo.empty()) {
                 break;
             }
-            const auto scores = score_branches(todo, seq_pool + (llama_seq_id) n_group, n_pool - (int) n_group);
+            const auto scores = score_branches(todo, seq_pool + (llama_seq_id) n_group, n_pool - (int) n_group,
+                                                trunk_states.empty() ? nullptr : &trunk_states, opt.bypass && todo.size() == 1);
             out.rounds += 1;
             std::vector<std::vector<std::vector<std::vector<float>>>> tree_scores(n_group, std::vector<std::vector<std::vector<float>>>(fields.size()));
             for (size_t row = 0; row < owner.size(); ++row) {
                 const auto [i, f] = owner[row];
                 auto & fd = state[i][f];
                 if (fd.use_tree) {
-                    tree_scores[i][f].push_back(scores[row]);
-                } else {
-                    const auto & s    = scores[row];
-                    const int    best = (int) (std::max_element(s.begin(), s.end()) - s.begin());
-                    double denom = 0;
-                    for (float x : s) {
-                        denom += std::exp(x - s[best]);
+                    tree_scores[i][f].push_back(scores[row].cand_logits);
+                    if (!fd.audit_valid) {
+                        fd.allowed_token_mass = scores[row].allowed_token_mass;
+                        fd.full_vocab_argmax   = scores[row].full_vocab_argmax;
+                        fd.audit_logits        = scores[row].cand_logits;
+                        fd.audit_valid         = true;
                     }
-                    fd.select(todo[row].cands[best], (float) (1.0 / denom));
+                } else {
+                    const auto & s    = scores[row].cand_logits;
+                    const auto   p    = softmax(s, fd.temperature);
+                    const int    best = (int) (std::max_element(s.begin(), s.end()) - s.begin());
+                    fd.select(todo[row].cands[best], p[best]);
+                    fd.allowed_token_mass = scores[row].allowed_token_mass;
+                    fd.full_vocab_argmax   = scores[row].full_vocab_argmax;
+                    fd.audit_logits        = scores[row].cand_logits;
+                    fd.audit_valid         = true;
                 }
             }
             if (first) {
@@ -467,11 +720,18 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
             result & r = out.items[g0 + i];
             r.context_tokens = prefixes[g0 + i].size();
             r.rows           = total;
+            std::vector<field_result> scored;
+            scored.reserve(state[i].size());
             for (auto & fd : state[i]) {
                 if (fd.use_tree && fd.probs.empty()) {
                     fd.finish_tree({});
                 }
-                r.fields.push_back({ fd.winner, fd.path_score, fd.scored_nodes, fd.use_tree, fd.probs });
+                scored.push_back({ fd.winner, fd.path_score, fd.scored_nodes, fd.use_tree, fd.probs,
+                                   fd.allowed_token_mass, fd.full_vocab_argmax, std::move(fd.audit_logits) });
+            }
+            r.fields.resize(field_first.size());
+            for (size_t f = 0; f < field_first.size(); ++f) {
+                r.fields[f] = scored[field_first[f]];
             }
         }
         out.scoring_ms += ms_since(ts);

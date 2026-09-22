@@ -17,6 +17,9 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "decision-engine.h"
+#include "decision-protocol.h"
+#include "labels.h"
+#include "letter_readout.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -25,6 +28,7 @@
 #include <memory>
 #include <filesystem>
 #include <random>
+#include <thread>
 #include <utility>
 #include <fstream>
 
@@ -854,6 +858,12 @@ public:
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
     std::unique_ptr<llama_decision::engine> decision_engine; // created by the first /decision request
+    std::unique_ptr<llama_decision::label_vocab> decision_label_vocab; // letter readout, built once per context
+    std::vector<llama_decision::label>          decision_labels;
+    std::string                                 decision_label_error; // set when the vocabulary probe fails
+    std::string                                 decision_contract;    // identity of the decision readout contract
+    bool                                        decision_temp_loaded = false;
+    llama_decision::temperature_profile         decision_temp_profile;
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
@@ -2383,6 +2393,123 @@ private:
         if (params_base.n_seq_decision < 3) {
             throw std::invalid_argument("decisions are disabled: start the server with --decision-seqs N (N >= 3)");
         }
+        // Jev shape: state + typed questions, scored as one next-token choice over the
+        // verified letter labels, sharing one framed state prefix across all questions.
+        if (llama_decision::is_jev_request(body)) {
+            llama_decision::jev_request req = llama_decision::parse_jev_request(body);
+            // An explicit request for an unavailable fast path is the only head case that errors;
+            // the default path always falls back to full logits.
+            const auto & head_cap = llama_decision::selected_head_capability();
+            if (req.head == "selected" && !head_cap.available) {
+                throw std::invalid_argument("head \"selected\" is not available: " + head_cap.reason);
+            }
+            if (!decision_engine) {
+                decision_engine = std::make_unique<llama_decision::engine>(ctx_tgt, (llama_seq_id) params_base.n_parallel,
+                                                                            params_base.n_seq_decision);
+            }
+            if (!decision_label_vocab) {
+                decision_label_vocab = llama_decision::make_llama_label_vocab(
+                    llama_model_get_vocab(llama_get_model(ctx_tgt)));
+                try {
+                    decision_labels = llama_decision::build_label_pool(*decision_label_vocab);
+                    const auto parts = llama_decision::render_letter_prompt(
+                        chat_params.tmpls.get(), chat_params.use_jinja, llama_decision::letter_system_text());
+                    llama_decision::verify_label_pool(*decision_label_vocab, decision_labels, parts.second + "Answer:\n");
+                    const std::string template_hash = llama_decision::make_prefix_tag(
+                        parts.first, parts.second, llama_decision::LETTER_PROMPT_VERSION);
+                    decision_contract = llama_decision::decision_contract_hash(
+                        model_name, template_hash, llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt))));
+                    SRV_INF("decision contract: %s\n", decision_contract.c_str());
+                    if (!params_base.decision_contract.empty() && params_base.decision_contract != decision_contract) {
+                        decision_label_error = "decision contract mismatch: expected " + params_base.decision_contract +
+                                               ", running " + decision_contract;
+                    }
+                } catch (const std::exception & e) {
+                    decision_label_error = e.what();
+                }
+            }
+            if (!decision_label_error.empty()) {
+                throw llama_decision::unsupported_error(
+                    "this model cannot serve decision questions: " + decision_label_error);
+            }
+
+            if (!params_base.decision_temperature.empty()) {
+                if (!decision_temp_loaded) {
+                    std::ifstream in(params_base.decision_temperature);
+                    if (!in) {
+                        throw std::runtime_error("cannot read --decision-temperature file: " + params_base.decision_temperature);
+                    }
+                    std::stringstream ss;
+                    ss << in.rdbuf();
+                    decision_temp_profile = llama_decision::parse_temperature_profile(json::parse(ss.str()));
+
+                    const auto parts = llama_decision::render_letter_prompt(chat_params.tmpls.get(), chat_params.use_jinja,
+                                                                            llama_decision::letter_system_text());
+                    llama_decision::temperature_provenance current;
+                    current.model         = model_name;
+                    current.quantization  = "";
+                    current.template_hash = llama_decision::make_prefix_tag(parts.first, parts.second,
+                                                                            llama_decision::LETTER_PROMPT_VERSION);
+                    char flags[256];
+                    std::snprintf(flags, sizeof(flags), "fa=%d,k=%d,v=%d,unified=%d,swa=%d,ubatch=%u",
+                                  (int) params_base.flash_attn_type, (int) params_base.cache_type_k,
+                                  (int) params_base.cache_type_v, (int) params_base.kv_unified,
+                                  (int) params_base.swa_full, params_base.n_ubatch);
+                    current.backend_flags = flags;
+                    try {
+                        llama_decision::validate_temperature_profile(decision_temp_profile, current);
+                    } catch (const llama_decision::semantic_error & e) {
+                        // a stale profile is a server configuration problem, not a client error
+                        throw std::runtime_error(std::string("decision temperature profile: ") + e.what());
+                    }
+                    decision_temp_loaded = true;
+                }
+                if (!req.temperatures.is_object()) {
+                    json temps = json::object();
+                    for (const auto & kv : decision_temp_profile.temperatures) {
+                        temps[kv.first] = kv.second;
+                    }
+                    req.temperatures = temps;
+                }
+            }
+
+            llama_decision::options jopt;
+            if (const char * fork = std::getenv("LLAMA_DECISION_FORK")) {
+                jopt.fork = fork;
+            }
+            jopt.yield = []() { std::this_thread::yield(); };
+            llama_decision::letter_metrics metrics;
+            llama_decision::answer_audit   audit;
+            std::vector<std::vector<float>> probs;
+            // run inside a yield so metrics/slot requests are served while the decision computes
+            queue_tasks.yield_to_queue([&]() {
+                probs = llama_decision::letter_readout(*decision_engine, *decision_label_vocab,
+                                                       chat_params.tmpls.get(), chat_params.use_jinja,
+                                                       req, decision_labels, jopt, &metrics, &audit);
+            });
+
+            json usage = json::object();
+            usage["input_tokens"]    = (long long) (metrics.shared_tokens + metrics.context_tokens);
+            usage["output_tokens"]   = 0;
+            usage["cached_tokens"]   = (long long) (metrics.cache_hit ? metrics.shared_tokens : 0);
+            usage["state_cache_hit"] = metrics.cache_hit;
+            usage["head_mode"]       = "full";
+
+            const std::string echo = req.model.empty() ? model_name : req.model;
+            json out = llama_decision::assemble_jev_response(req, probs, echo, usage, &audit);
+            // the fast path is optional; report how the answer was actually read out
+            out["head"] = json::object();
+            out["head"]["mode"]     = "full";
+            out["head"]["fallback"] = !head_cap.available;
+            if (!head_cap.available) {
+                out["head"]["reason"] = head_cap.reason;
+            }
+            // additive diagnostics: the readout contract identity this server is running
+            out["diagnostics"] = json::object();
+            out["diagnostics"]["contract_hash"]  = decision_contract;
+            out["diagnostics"]["prompt_version"] = llama_decision::LETTER_PROMPT_VERSION;
+            return out;
+        }
         // one decision per context; all contexts share the schema, the instructions and the cached prefix
         if (!body.contains("contexts") || !body.at("contexts").is_array() || body.at("contexts").empty() || body.at("contexts").size() > 256) {
             throw std::invalid_argument("\"contexts\" must be an array of 1-256 strings");
@@ -2417,8 +2544,14 @@ private:
         opt.mode        = body.value("mode", std::string("auto"));
         opt.tree_max    = (size_t) body.value("tree_max", 128);
         opt.allow_cache = body.value("cache_prompt", true);
+        opt.fork        = body.value("fork", std::string("auto"));
+        opt.yield       = []() { std::this_thread::yield(); };
 
-        const auto b = decision_engine->decide_batch(shared, dynamic, cs.inputs, opt);
+        llama_decision::batch_result b;
+        // run inside a yield so metrics/slot requests are served while the decision computes
+        queue_tasks.yield_to_queue([&]() {
+            b = decision_engine->decide_batch(shared, dynamic, cs.inputs, opt);
+        });
 
         size_t context_tokens = 0;
         for (const auto & r : b.items) {
@@ -2585,6 +2718,14 @@ private:
                         res->id   = task.id;
                         res->data = handle_decision(task.decision_request);
                         queue_results.send(std::move(res));
+                    } catch (const llama_decision::unsupported_error & e) {
+                        send_error(task, e.what(), ERROR_TYPE_NOT_SUPPORTED);
+                    } catch (const llama_decision::cancelled_error & e) {
+                        send_error(task, e.what(), ERROR_TYPE_CLIENT_CLOSED);
+                    } catch (const llama_decision::capacity_error & e) {
+                        send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+                    } catch (const llama_decision::semantic_error & e) {
+                        send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
                     } catch (const std::invalid_argument & e) {
                         send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
                     } catch (const common_json_error & e) {
@@ -5241,7 +5382,51 @@ void server_routes::init_routes() {
 
     this->post_decision = [this](const server_http_req & req) {
         auto res = create_response();
-        const json body = json::parse(req.body);
+
+        size_t max_body = decision_max_body;
+        int    max_queue = decision_max_queue;
+        if (const char * e = std::getenv("LLAMA_DECISION_MAX_BODY")) {
+            const long v = std::atol(e);
+            if (v > 0) {
+                max_body = (size_t) v;
+            }
+        }
+        if (const char * e = std::getenv("LLAMA_DECISION_MAX_QUEUE")) {
+            const int v = std::atoi(e);
+            if (v > 0) {
+                max_queue = v;
+            }
+        }
+        if (req.body.size() > max_body) {
+            res->error(format_error_response("decision request body exceeds the configured cap", ERROR_TYPE_PAYLOAD_TOO_LARGE));
+            return res;
+        }
+
+        // admission: bound concurrent decision requests; unlike chat, a decision cannot be
+        // interleaved on the same context, so an unbounded burst would only queue up
+        const int inflight = ++decision_inflight;
+        struct inflight_guard {
+            std::atomic<int> & counter;
+            ~inflight_guard() { --counter; }
+        } guard{decision_inflight};
+        if (inflight > 2 * max_queue) {
+            res->headers["Retry-After"] = "1";
+            res->error(format_error_response("server overloaded", ERROR_TYPE_OVERLOADED));
+            return res;
+        }
+        if (inflight > max_queue) {
+            res->headers["Retry-After"] = "1";
+            res->error(format_error_response("decision queue is full", ERROR_TYPE_RATE_LIMIT));
+            return res;
+        }
+
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const common_json_error & e) {
+            res->error(format_error_response(std::string("invalid JSON: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
 
         server_task task(SERVER_TASK_TYPE_DECISION);
         task.id               = res->rd.get_new_id();
@@ -5250,7 +5435,9 @@ void server_routes::init_routes() {
 
         auto result = res->rd.next([&] { return req.should_stop(); });
         if (!result) {
-            return res; // the client went away
+            // the client went away or the server stopped: never report a partial answer
+            res->error(format_error_response("the decision was abandoned before it finished", ERROR_TYPE_CLIENT_CLOSED));
+            return res;
         }
         if (result->is_error()) {
             res->error(result->to_json());

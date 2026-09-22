@@ -57,6 +57,17 @@ How many sequences a model affords depends on its attention. A plain-attention m
 (12 on a 12 GB card). Hybrid models with recurrent layers work, but llama.cpp splits their batches per sequence
 length, so branches run in several passes instead of one.
 
+Set `"permutations": N` (default 1, capped at 8) to de-bias option order: pass 0 keeps the caller's
+order and each later pass presents the same options in a distinct order seeded by the question id,
+then the per-pass distributions are averaged by option key. Two passes cost about 1.1x and pull a
+position-biased model toward the balanced answer; the noul second pass is the swap. The default
+single pass is byte-identical to a request without the field.
+
+Branches fork the cached prefix two ways: `copy` uses `llama_memory_seq_cp` (fast, plain attention), `restore` saves
+and reloads a sequence state with `llama_state_seq_get/set_data` (works on recurrent and hybrid memory). The engine
+picks one automatically; set `"fork"` on a `contexts`/`schema` request, or `LLAMA_DECISION_FORK=copy|restore|auto`,
+to force it. On a sliding-window model the copy is clamped to the retained window so branch memory does not grow.
+
 ## POST /v1/decision
 
 `contexts` is a list of 1-256 strings. They share one schema, one set of instructions, and one cached prefix; results
@@ -119,6 +130,120 @@ Numeric fields take `aggregate`: `mode` (default), `median` or `mean`.
 | `mode` | `auto` | `tree` scores every divergence node and returns exact probabilities; `greedy` walks the trie; `auto` picks tree up to `tree_max` values |
 | `tree_max` | 128 | per-field switch between tree and greedy |
 | `cache_prompt` | true | reuse the cached instructions + schema prefix |
+
+## Jev decision shape (`state` + `questions`)
+
+`POST /v1/decision` also accepts the Jev shape: one `state` and 1-256 typed `questions`
+(`noul` yes/no, `choice` pick-one, `score` ordered rating). Answers come back as one closed
+distribution per question, with `output_tokens` always 0:
+
+```json
+{"state": "...",
+ "questions": {"refund": {"type": "noul", "instructions": "refund?"},
+               "dept": {"type": "choice", "instructions": "route", "criteria": {"billing": "payment", "support": "help"}},
+               "urgency": {"type": "score", "instructions": "urgency", "criteria": ["low", "medium", "high"]}}}
+```
+
+```json
+{"answers": {"refund": {"type": "noul", "noul": 0.99},
+             "dept": {"type": "choice", "choice": "billing", "probabilities": {"billing": 0.9, "support": 0.1},
+                      "confidence": 0.9, "certainty": 0.53},
+             "urgency": {"type": "score", "score": 1.6, "probabilities": {"0": 0.05, "1": 0.3, "2": 0.65},
+                         "legend": {"0": "low", "1": "medium", "2": "high"},
+                         "confidence": 0.65, "certainty": 0.31}}}
+```
+
+Both shapes are served by `POST /v1/decision`, the canonical route. `POST /decision` is a deprecated
+alias for the same handler; use `/v1/decision`.
+
+### Limits and errors
+
+| limit | value |
+|---|---|
+| questions per request | 1-256 |
+| options / levels per question | 2-64 |
+| `contexts` per legacy request | 1-256 |
+| request body | 2 MiB (override `LLAMA_DECISION_MAX_BODY`) |
+| concurrent decision requests | 4 (override `LLAMA_DECISION_MAX_QUEUE`), then 429/529 |
+
+Error responses use `{"error": {"code", "message", "type"}}` and map to HTTP status:
+
+| status | type | when |
+|---|---|---|
+| 400 | `invalid_request_error` | malformed JSON, unknown field, bad `head` value, invalid type |
+| 401 | `authentication_error` | missing or wrong API key |
+| 413 | `payload_too_large` | body over the configured cap |
+| 415 | `unsupported_media_type` | `Content-Type` is not `application/json` |
+| 422 | `invalid_request_error` | valid JSON, invalid semantics (empty state, too many options, label/tokenizer mismatch) |
+| 429 | `rate_limit_error` | decision queue full; `Retry-After: 1` |
+| 499 | `client_closed_request` | the client disconnected before the answer was ready |
+| 500 | `server_error` | unexpected internal failure |
+| 501 | `not_supported_error` | the running model cannot serve decisions (no usable labels, contract mismatch) |
+| 529 | `overloaded_error` | server overloaded; `Retry-After: 1` |
+
+The decision path never truncates: an over-limit request is rejected, never silently clipped.
+
+### Usage and audit
+
+`usage` reports `input_tokens` (state + cached prefix), `output_tokens` (always 0, nothing is
+generated), `cached_tokens`, `state_cache_hit`, and `head_mode`. Every answer also carries additive
+audit fields: `answer_token_ids`, `option_logits`, `allowed_token_mass`,
+`full_vocab_argmax_id`, `prompt_sha256`, `prompt_version`, and `probability_status`. These are for
+inspection only; they never change an answer. The response also carries `diagnostics.contract_hash`
+(see below) and a `head` object describing the readout path.
+
+### Contract hash and diagnostics
+
+At first use the server computes a contract hash over the tokenizer identity, the framed prompt
+template, the label code, and the prompt version, logs it, and returns it as
+`diagnostics.contract_hash`. Pass `--decision-contract HASH` to pin it: if the running contract
+differs, the decision path is refused with a plain 501 instead of serving stale calibration.
+
+### Frozen backend flags
+
+Every parity and calibration claim is only valid under the backend flag set recorded in
+`tests/decision-baseline/calibration.json` (flash-attention setting, K/V cache types, `kv_unified`,
+`swa_full`, `n_ubatch`, threads). Change any of them and re-run the calibration gate.
+
+## Temperature and confidence
+
+`temperature` (default 1.0) and per-type `temperatures` scale the label logits before the
+softmax. Temperature never changes the winner; it only changes how sharply the distribution
+is concentrated.
+
+`confidence` is `max(p)` and `certainty` is `1 - H/log(K)`. Both measure how concentrated the
+answer is. They are **not** calibrated correctness, and they are **not** accuracy. The
+probabilities are conditional on the options you supplied: if the right answer is not among
+them, the distribution still sums to 1 over the wrong set. Never gate admission, caching,
+routing or persistence on `confidence` or `certainty`, and never present them as probability
+of being correct.
+
+A calibrated temperature is deployment-specific. `--decision-temperature FILE` loads a JSON
+profile `{"temperatures": {"noul": ..., "choice": ..., "score": ...}, "provenance": {"model": ...,
+"quantization": ..., "template_hash": ..., "backend_flags": ...}}`. If any temperature differs
+from 1.0 and the recorded provenance does not match the running model, quantization, prompt
+template and backend flags, the server refuses the profile instead of silently applying it.
+With no file the default stays 1.0.
+
+### Two readouts, one engine
+
+The same engine serves two readouts. The `contexts`/`schema` shape scores arbitrary token paths
+(trie or greedy) and is the general-purpose form. The Jev `state`/`questions` shape scores declared
+answer labels and returns one closed distribution per typed question. Both share the prefix cache,
+the branch scorer, the softmax and the SWA clamp; the letter readout is a thin layer over the trie
+scorer, not a second implementation.
+
+## Model card snippet
+
+```yaml
+model: <base gguf>
+task: single-pass decision / classification over a supplied state
+readout: letter labels over a verified single-token pool (Jev), or token-path trie (schema)
+context: shared prefix + one state per request; branches forked on a unified KV cache
+output: probability distributions only, output_tokens always 0, closed over the supplied options
+confidence: max(p) and 1 - H/log(K); concentration, NOT calibrated accuracy
+calibration: deployment-specific; valid only under the recorded model, quantization, template hash and backend flags
+```
 
 ## CLI
 

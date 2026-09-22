@@ -2557,6 +2557,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_seq_decision = value;
             }
         ).set_env("LLAMA_ARG_DECISION_SEQS").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-temperature"}, "F",
+            "JSON file with calibrated decision temperatures and provenance; refused if the provenance does not match",
+            [](common_params & params, const std::string & value) {
+                params.decision_temperature = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_TEMPERATURE").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-contract"}, "HASH",
+            "expected decision contract hash (tokenizer + prompt template + label code); refuse the decision path when it does not match",
+            [](common_params & params, const std::string & value) {
+                params.decision_contract = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_CONTRACT").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

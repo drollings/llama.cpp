@@ -1,0 +1,167 @@
+{
+  "note": "Calibration sign-off for the decision heuristics. Values are measurements, not tunables. Every row carries production_gate:false; confidence rows may never gate admission, caching, routing or persistence. Update only with a matching code change and a re-measured gate.",
+  "rows": {
+    "prefix_hoist": {
+      "trigger": "prefix hoist length (>=32 shared tokens)",
+      "axis": "task-value",
+      "may_gate": [
+        "prefix reuse decision"
+      ],
+      "may_not_gate": [
+        "answers",
+        "admission"
+      ],
+      "production_gate": false,
+      "verdict": "hoist only on an exact shared token head of at least 32 tokens; near misses never hoist; prefix-reuse prefill delta recorded",
+      "measurements": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "false_positives": 0,
+        "false_negatives": 0,
+        "pairs": 520
+      }
+    },
+    "question_dedup": {
+      "trigger": "question dedup on byte-identical suffix",
+      "axis": "task-value",
+      "may_gate": [
+        "dedup of identical suffixes"
+      ],
+      "may_not_gate": [
+        "near-duplicate collapse",
+        "caching across states"
+      ],
+      "production_gate": false,
+      "verdict": "dedup only on exact suffix equality; near duplicates never collapse",
+      "measurements": {
+        "exact_equal": 250,
+        "near_equal": 0,
+        "pair_suite": 250
+      }
+    },
+    "confidence_diagnostics": {
+      "trigger": "allowed_token_mass / full-vocab argmax diagnostics",
+      "axis": "confidence",
+      "may_gate": [],
+      "may_not_gate": [
+        "admission",
+        "caching",
+        "routing",
+        "persistence",
+        "answer validity"
+      ],
+      "production_gate": false,
+      "verdict": "advisory-only; dashboard threshold, never a production gate",
+      "measurements": {
+        "auc": 1.0,
+        "verdict": "advisory-only"
+      }
+    },
+    "selected_head": {
+      "trigger": "selected vs full head choice",
+      "axis": "task-value",
+      "may_gate": [
+        "fast path vs full-logits path"
+      ],
+      "may_not_gate": [
+        "admission",
+        "correctness without a probe"
+      ],
+      "production_gate": false,
+      "verdict": "fast path ships disabled: the capability seam exists and reports unavailable, so every answer is read from full logits; an explicit selected request errors, the default path falls back",
+      "measurements": {
+        "source_hits": 0,
+        "available": false
+      }
+    },
+    "tree_vs_greedy": {
+      "trigger": "tree vs greedy exactness and cost",
+      "axis": "task-value",
+      "may_gate": [
+        "exact-vs-greedy mode choice"
+      ],
+      "may_not_gate": [
+        "correctness claims",
+        "caching"
+      ],
+      "production_gate": false,
+      "verdict": "measured on the test model; model_measurements carry the numbers"
+    },
+    "single_question_bypass": {
+      "trigger": "single-question fork bypass",
+      "axis": "task-value",
+      "may_gate": [
+        "which scoring path runs"
+      ],
+      "may_not_gate": [
+        "correctness",
+        "admission"
+      ],
+      "production_gate": false,
+      "verdict": "copy-fork only; bypass stays on by default and never runs on multi-question rounds or restore-fork memory; measured speedup recorded in model_measurements"
+    },
+    "auto_mode_boundary": {
+      "trigger": "tree_max auto switch",
+      "axis": "task-value",
+      "may_gate": [
+        "mode selection at the boundary"
+      ],
+      "may_not_gate": [
+        "correctness claims"
+      ],
+      "production_gate": false,
+      "verdict": "auto uses tree up to tree_max and greedy above; default pinned at 128"
+    },
+    "temperature_profile": {
+      "trigger": "calibrated temperature",
+      "axis": "confidence",
+      "may_gate": [
+        "probability/confidence values only"
+      ],
+      "may_not_gate": [
+        "admission",
+        "caching",
+        "routing",
+        "persistence",
+        "answer key"
+      ],
+      "production_gate": false,
+      "verdict": "T=1.0 default; non-default needs matching provenance; stale profile refused"
+    }
+  },
+  "model_measurements": {
+    "environment": {
+      "model": "LFM2.5-350M-QAD-Q4_0.gguf",
+      "model_bytes": 219312832,
+      "quantization": "recorded per run; see model filename",
+      "backend_flags": {
+        "kv_unified": true,
+        "swa_full": false,
+        "n_ctx": 2048,
+        "n_batch": 512,
+        "n_ubatch": 512,
+        "n_seq_max": 10,
+        "gpu_layers": 0
+      }
+    },
+    "values": {
+      "small_tv": 0.0,
+      "small_argmax_agree": true,
+      "wide_tree_is_tree": true,
+      "wide_auto_is_tree": false,
+      "wide_tree_rows": 5,
+      "wide_greedy_rows": 7,
+      "bypass_on_ms": 0.0,
+      "bypass_off_ms": 0.0,
+      "bypass_speedup": 1.0,
+      "bypass_applicable": false,
+      "prefill_cached_ms": 40.8958,
+      "prefill_cold_ms": 175.248192,
+      "auto_at_tree_max_is_tree": true,
+      "auto_above_tree_max_is_tree": false,
+      "temperature_nll_t1": 0.10462794287046091,
+      "temperature_nll_t1_3": 0.16194065398871915,
+      "temperature_nll_delta": 0.05731271111825823
+    }
+  }
+}

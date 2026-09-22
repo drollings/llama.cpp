@@ -1,0 +1,508 @@
+#include "decision-protocol.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+namespace llama_decision {
+
+std::string render_text(const common_json & v) {
+    if (v.is_string()) {
+        return v.get<std::string>();
+    }
+    if (v.is_null()) {
+        return std::string();
+    }
+    return v.dump();
+}
+
+namespace {
+
+bool is_textual(const common_json & v) {
+    return v.is_string() || v.is_object() || v.is_array();
+}
+
+// Structured criteria values keep their shape as text for the model; null is empty.
+std::string render(const common_json & v) {
+    return render_text(v);
+}
+
+void check_allowed_keys(const common_json & obj, std::initializer_list<const char *> allowed, const std::string & where) {
+    for (const auto & e : obj.items()) {
+        bool ok = false;
+        for (const char * k : allowed) {
+            if (e.key() == k) {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) {
+            throw semantic_error(where + ": unknown field \"" + e.key() + "\"");
+        }
+    }
+}
+
+std::string canonical_type(const std::string & t) {
+    if (t == "bool") {
+        return "noul";
+    }
+    if (t == "scale") {
+        return "score";
+    }
+    return t;
+}
+
+void validate_state(const common_json & s) {
+    if (s.is_string()) {
+        if (s.get<std::string>().empty()) {
+            throw semantic_error("state must not be empty");
+        }
+        return;
+    }
+    if (s.is_array() || s.is_object()) {
+        if (s.size() == 0) {
+            throw semantic_error("state must not be empty");
+        }
+        return;
+    }
+    throw semantic_error("state must be a string, object or array");
+}
+
+jev_question parse_question(const std::string & id, const common_json & spec) {
+    if (!spec.is_object()) {
+        throw semantic_error("question \"" + id + "\" must be an object");
+    }
+    check_allowed_keys(spec, { "type", "instructions", "criteria" }, "question \"" + id + "\"");
+
+    if (!spec.contains("type") || !spec.at("type").is_string()) {
+        throw semantic_error("question \"" + id + "\" needs a string \"type\"");
+    }
+    const std::string raw_type = spec.at("type").get<std::string>();
+
+    jev_question q;
+    q.id          = id;
+    q.type        = canonical_type(raw_type);
+    q.has_criteria = spec.contains("criteria") && !spec.at("criteria").is_null();
+
+    if (q.type != "noul" && q.type != "choice" && q.type != "score") {
+        throw semantic_error("question \"" + id + "\": unknown type \"" + raw_type + "\"");
+    }
+
+    if (spec.contains("instructions")) {
+        const common_json & ins = spec.at("instructions");
+        if (!ins.is_null() && !is_textual(ins)) {
+            throw semantic_error("question \"" + id + "\": instructions must be a string, object or array");
+        }
+        q.instructions = ins;
+    }
+
+    if (q.type == "noul") {
+        jev_option no;
+        jev_option yes;
+        no.key  = "false";
+        yes.key = "true";
+        if (q.has_criteria) {
+            const common_json & crit = spec.at("criteria");
+            if (!crit.is_object()) {
+                throw semantic_error("question \"" + id + "\": noul criteria must be an object");
+            }
+            for (const auto & e : crit.items()) {
+                if (e.key() != "true" && e.key() != "false") {
+                    throw semantic_error("question \"" + id + "\": noul criteria keys must be \"true\" and \"false\"");
+                }
+            }
+            if (crit.contains("false")) {
+                no.description = render(crit.at("false"));
+            }
+            if (crit.contains("true")) {
+                yes.description = render(crit.at("true"));
+            }
+        }
+        q.options = { no, yes };
+    } else if (q.type == "choice") {
+        if (!q.has_criteria || !spec.at("criteria").is_object()) {
+            throw semantic_error("question \"" + id + "\": choice needs an object \"criteria\"");
+        }
+        const common_json & crit = spec.at("criteria");
+        if (crit.size() < 2 || crit.size() > 64) {
+            throw semantic_error("question \"" + id + "\": choice needs 2-64 options");
+        }
+        for (const auto & e : crit.items()) {
+            if (e.key().empty()) {
+                throw semantic_error("question \"" + id + "\": option keys must not be empty");
+            }
+            jev_option o;
+            o.key         = e.key();
+            o.description = render(e.value());
+            o.original    = e.value();
+            q.options.push_back(o);
+        }
+    } else { // score
+        if (!q.has_criteria) {
+            throw semantic_error("question \"" + id + "\": score needs \"criteria\"");
+        }
+        const common_json & crit = spec.at("criteria");
+        if (crit.is_array()) {
+            if (crit.size() < 2 || crit.size() > 64) {
+                throw semantic_error("question \"" + id + "\": score needs 2-64 levels");
+            }
+            for (size_t i = 0; i < crit.size(); ++i) {
+                jev_option o;
+                o.key         = std::to_string(i);
+                o.description = render(crit.at(i));
+                o.original    = crit.at(i);
+                q.options.push_back(o);
+            }
+        } else if (crit.is_object()) {
+            if (crit.size() < 2 || crit.size() > 64) {
+                throw semantic_error("question \"" + id + "\": score needs 2-64 levels");
+            }
+            size_t i = 0;
+            for (const auto & e : crit.items()) {
+                if (e.key() != std::to_string(i)) {
+                    throw semantic_error("question \"" + id + "\": score legend keys must be \"0\"..\"K-1\" in order");
+                }
+                jev_option o;
+                o.key         = std::to_string(i);
+                o.description = render(e.value());
+                o.original    = e.value();
+                q.options.push_back(o);
+                ++i;
+            }
+        } else {
+            throw semantic_error("question \"" + id + "\": score criteria must be an array or a legend object");
+        }
+    }
+
+    if (!q.has_criteria && (!spec.contains("instructions") || spec.at("instructions").is_null())) {
+        throw semantic_error("question \"" + id + "\": needs instructions or criteria");
+    }
+    return q;
+}
+
+double entropy_certainty(const std::vector<float> & p) {
+    const double k = (double) p.size();
+    if (k <= 1.0) {
+        return 1.0;
+    }
+    double h = 0.0;
+    for (float x : p) {
+        if (x > 0.0f) {
+            h -= (double) x * std::log((double) x);
+        }
+    }
+    const double v = 1.0 - h / std::log(k);
+    return std::min(1.0, std::max(0.0, v));
+}
+
+} // namespace
+
+bool temperature_provenance::operator==(const temperature_provenance & other) const {
+    return model == other.model && quantization == other.quantization &&
+           template_hash == other.template_hash && backend_flags == other.backend_flags;
+}
+
+temperature_profile parse_temperature_profile(const common_json & doc) {
+    if (!doc.is_object()) {
+        throw semantic_error("temperature profile must be an object");
+    }
+    temperature_profile profile;
+    if (doc.contains("provenance")) {
+        const common_json & prov = doc.at("provenance");
+        if (!prov.is_object()) {
+            throw semantic_error("provenance must be an object");
+        }
+        auto read = [&prov](const char * key, std::string & out) {
+            if (prov.contains(key)) {
+                if (!prov.at(key).is_string()) {
+                    throw semantic_error(std::string("provenance.") + key + " must be a string");
+                }
+                out = prov.at(key).get<std::string>();
+            }
+        };
+        read("model", profile.provenance.model);
+        read("quantization", profile.provenance.quantization);
+        read("template_hash", profile.provenance.template_hash);
+        read("backend_flags", profile.provenance.backend_flags);
+    }
+    if (doc.contains("temperatures")) {
+        const common_json & temps = doc.at("temperatures");
+        if (!temps.is_object()) {
+            throw semantic_error("temperatures must be an object");
+        }
+        for (const auto & e : temps.items()) {
+            if (e.key() != "noul" && e.key() != "choice" && e.key() != "score") {
+                throw semantic_error("temperatures: unknown field \"" + e.key() + "\"");
+            }
+            if (!e.value().is_number() || !(e.value().get<double>() > 0.0)) {
+                throw semantic_error("temperatures." + e.key() + " must be a number > 0");
+            }
+            profile.temperatures[e.key()] = e.value().get<double>();
+        }
+    }
+    return profile;
+}
+
+void validate_temperature_profile(const temperature_profile & profile, const temperature_provenance & current) {
+    bool any_non_default = false;
+    for (const auto & kv : profile.temperatures) {
+        if (kv.second != 1.0) {
+            any_non_default = true;
+        }
+    }
+    if (!any_non_default) {
+        return;
+    }
+    if (profile.provenance != current) {
+        throw semantic_error("temperature profile provenance does not match the running configuration");
+    }
+}
+
+double question_temperature(const jev_request & req, const jev_question & q) {
+    if (req.temperatures.is_object() && req.temperatures.contains(q.type)) {
+        const common_json & v = req.temperatures.at(q.type);
+        if (v.is_number()) {
+            return v.get<double>();
+        }
+    }
+    return req.temperature;
+}
+
+bool is_jev_request(const common_json & body) {
+    return body.is_object() && (body.contains("questions") || body.contains("state"));
+}
+
+jev_request parse_jev_request(const common_json & body) {
+    if (!body.is_object()) {
+        throw semantic_error("request must be an object");
+    }
+    check_allowed_keys(body, { "model", "state", "questions", "temperature", "temperatures", "permutations", "head" }, "request");
+
+    jev_request req;
+
+    if (body.contains("model") && !body.at("model").is_null()) {
+        if (!body.at("model").is_string()) {
+            throw semantic_error("model must be a string");
+        }
+        req.model = body.at("model").get<std::string>();
+    }
+
+    if (!body.contains("state")) {
+        throw semantic_error("state is required");
+    }
+    req.state = body.at("state");
+    validate_state(req.state);
+
+    if (!body.contains("questions") || !body.at("questions").is_object()) {
+        throw semantic_error("questions must be an object");
+    }
+    const common_json & qs = body.at("questions");
+    if (qs.size() < 1 || qs.size() > 256) {
+        throw semantic_error("questions must hold 1-256 entries");
+    }
+    for (const auto & e : qs.items()) {
+        req.questions.push_back(parse_question(e.key(), e.value()));
+    }
+
+    if (body.contains("temperature") && !body.at("temperature").is_null()) {
+        if (!body.at("temperature").is_number()) {
+            throw semantic_error("temperature must be a number");
+        }
+        req.temperature = body.at("temperature").get<double>();
+        if (!(req.temperature > 0.0)) {
+            throw semantic_error("temperature must be > 0");
+        }
+    }
+
+    if (body.contains("temperatures") && !body.at("temperatures").is_null()) {
+        const common_json & temps = body.at("temperatures");
+        if (!temps.is_object()) {
+            throw semantic_error("temperatures must be an object");
+        }
+        for (const auto & e : temps.items()) {
+            if (e.key() != "noul" && e.key() != "choice" && e.key() != "score") {
+                throw semantic_error("temperatures: unknown field \"" + e.key() + "\"");
+            }
+            if (!e.value().is_number() || !(e.value().get<double>() > 0.0)) {
+                throw semantic_error("temperatures." + e.key() + " must be a number > 0");
+            }
+        }
+        req.temperatures = temps;
+    }
+
+    if (body.contains("permutations") && !body.at("permutations").is_null()) {
+        const common_json & v = body.at("permutations");
+        if (!v.is_number_integer()) {
+            throw semantic_error("permutations must be an integer");
+        }
+        req.permutations = (int) v.get<long long>();
+        if (req.permutations < 1) {
+            throw semantic_error("permutations must be >= 1");
+        }
+        if (req.permutations > 8) {
+            req.permutations = 8; // accepted but capped: more passes only add cost
+        }
+    }
+
+    if (body.contains("head") && !body.at("head").is_null()) {
+        if (!body.at("head").is_string()) {
+            throw semantic_error("head must be a string");
+        }
+        req.head = body.at("head").get<std::string>();
+        if (req.head != "auto" && req.head != "selected" && req.head != "full") {
+            throw semantic_error("head must be auto, selected or full");
+        }
+    }
+
+    return req;
+}
+
+std::vector<std::vector<float>> uniform_probs(const jev_request & req) {
+    std::vector<std::vector<float>> out;
+    out.reserve(req.questions.size());
+    for (const auto & q : req.questions) {
+        const float p = q.options.empty() ? 0.0f : 1.0f / (float) q.options.size();
+        out.emplace_back(q.options.size(), p);
+    }
+    return out;
+}
+
+std::string sha256_hex(const std::string & text) {
+    static const uint32_t k[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    };
+    auto rotr = [](uint32_t x, int n) { return (x >> n) | (x << (32 - n)); };
+
+    std::vector<uint8_t> msg(text.begin(), text.end());
+    const uint64_t bit_len = (uint64_t) msg.size() * 8;
+    msg.push_back(0x80);
+    while (msg.size() % 64 != 56) {
+        msg.push_back(0);
+    }
+    for (int i = 7; i >= 0; --i) {
+        msg.push_back((uint8_t) ((bit_len >> (8 * i)) & 0xff));
+    }
+
+    uint32_t h[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
+    for (size_t off = 0; off < msg.size(); off += 64) {
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i) {
+            w[i] = ((uint32_t) msg[off + 4 * i] << 24) | ((uint32_t) msg[off + 4 * i + 1] << 16) |
+                   ((uint32_t) msg[off + 4 * i + 2] << 8) | (uint32_t) msg[off + 4 * i + 3];
+        }
+        for (int i = 16; i < 64; ++i) {
+            const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+        for (int i = 0; i < 64; ++i) {
+            const uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            const uint32_t ch = (e & f) ^ (~e & g);
+            const uint32_t t1 = hh + S1 + ch + k[i] + w[i];
+            const uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            const uint32_t t2 = S0 + maj;
+            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    }
+    char buf[65];
+    for (int i = 0; i < 8; ++i) {
+        std::snprintf(buf + 8 * i, 9, "%08x", h[i]);
+    }
+    return std::string(buf);
+}
+
+common_json assemble_jev_response(const jev_request & req,
+                                  const std::vector<std::vector<float>> & probs,
+                                  const std::string & model,
+                                  const common_json & usage,
+                                  const answer_audit * audit) {
+    const auto uniform = uniform_probs(req);
+
+    common_json answers = common_json::object();
+    for (size_t qi = 0; qi < req.questions.size(); ++qi) {
+        const jev_question & q = req.questions[qi];
+        std::vector<float> p = (qi < probs.size() && !probs[qi].empty()) ? probs[qi] : uniform[qi];
+        if (p.size() != q.options.size()) {
+            p = uniform[qi];
+        }
+
+        common_json a = common_json::object();
+        a["type"] = q.type;
+
+        if (q.type == "noul") {
+            float p_true = 0.0f;
+            for (size_t i = 0; i < q.options.size(); ++i) {
+                if (q.options[i].key == "true") {
+                    p_true = p[i];
+                }
+            }
+            a["noul"] = (double) p_true;
+        } else {
+            size_t best = 0;
+            common_json probs_obj = common_json::object();
+            for (size_t i = 0; i < q.options.size(); ++i) {
+                probs_obj[q.options[i].key] = (double) p[i];
+                if (p[i] > p[best]) {
+                    best = i;
+                }
+            }
+            a["confidence"] = (double) p[best];
+            a["certainty"]  = entropy_certainty(p);
+
+            if (q.type == "choice") {
+                a["choice"]        = q.options[best].key;
+                a["probabilities"] = probs_obj;
+            } else { // score
+                double expected = 0.0;
+                common_json legend = common_json::object();
+                for (size_t i = 0; i < q.options.size(); ++i) {
+                    expected += (double) i * (double) p[i];
+                    legend[q.options[i].key] = q.options[i].original;
+                }
+                a["score"]         = expected;
+                a["probabilities"] = probs_obj;
+                a["legend"]        = legend;
+            }
+        }
+        if (audit != nullptr) {
+            a["probability_status"] = audit->probability_status;
+            a["prompt_sha256"]      = audit->prompt_sha256;
+            a["prompt_version"]     = audit->prompt_version;
+            if (qi < audit->answer_token_ids.size()) {
+                a["answer_token_ids"] = audit->answer_token_ids[qi];
+            }
+            if (qi < audit->allowed_token_mass.size()) {
+                a["allowed_token_mass"] = (double) audit->allowed_token_mass[qi];
+            }
+            if (qi < audit->full_vocab_argmax_id.size()) {
+                a["full_vocab_argmax_id"] = audit->full_vocab_argmax_id[qi];
+            }
+            if (qi < audit->option_logits.size()) {
+                a["option_logits"] = audit->option_logits[qi];
+            }
+        }
+        answers[q.id] = a;
+    }
+
+    common_json out = common_json::object();
+    out["model"]   = model;
+    out["answers"] = answers;
+    out["usage"]   = usage;
+    return out;
+}
+
+} // namespace llama_decision

@@ -1,0 +1,45 @@
+{
+  "model": "m",
+  "answers": {
+    "refund": {
+      "type": "noul",
+      "noul": 0.9988104701042175
+    },
+    "dept": {
+      "type": "choice",
+      "confidence": 0.867805004119873,
+      "certainty": 0.6307175412844837,
+      "choice": "cancellation",
+      "probabilities": {
+        "billing": 0.003224792191758752,
+        "technical": 0.12897023558616638,
+        "cancellation": 0.867805004119873
+      }
+    },
+    "urgency": {
+      "type": "score",
+      "confidence": 0.842901349067688,
+      "certainty": 0.5596711214742205,
+      "score": 1.8281533122062683,
+      "probabilities": {
+        "0": 0.014748034067451954,
+        "1": 0.14235061407089233,
+        "2": 0.842901349067688
+      },
+      "legend": {
+        "0": {
+          "level": 1,
+          "label": "calm"
+        },
+        "1": "upset",
+        "2": "furious"
+      }
+    }
+  },
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cached_tokens": 0,
+    "state_cache_hit": false
+  }
+}

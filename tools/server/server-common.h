@@ -64,6 +64,11 @@ enum error_type {
     ERROR_TYPE_UNAVAILABLE, // custom error
     ERROR_TYPE_NOT_SUPPORTED, // custom error
     ERROR_TYPE_EXCEED_CONTEXT_SIZE, // custom error
+    ERROR_TYPE_INVALID_REQUEST_SEMANTIC, // custom error: valid syntax, invalid semantics (422)
+    ERROR_TYPE_PAYLOAD_TOO_LARGE, // custom error: request body over the configured cap (413)
+    ERROR_TYPE_RATE_LIMIT,        // custom error: decision queue full (429)
+    ERROR_TYPE_CLIENT_CLOSED,     // custom error: client disconnected mid-evaluation (499)
+    ERROR_TYPE_OVERLOADED,        // custom error: server overloaded (529)
 };
 
 // thin wrapper around common_grammar_trigger with (de)serialization functions

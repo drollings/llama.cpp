@@ -6,6 +6,7 @@
 
 #include "json.h"
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -181,6 +182,11 @@ private:
     server_queue & queue_tasks;
     server_response & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
+
+    // decision admission: bound concurrent decision requests so a burst cannot pile up work
+    std::atomic<int> decision_inflight{0};
+    size_t           decision_max_body  = 2u * 1024u * 1024u; // 2 MiB, matching openjev-sglang
+    int              decision_max_queue = 4;                  // concurrent requests before rate limiting
 
     // cached responses, to be used during sleep
     std::mutex     mutex_cache;

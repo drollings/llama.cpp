@@ -98,6 +98,11 @@ static void quiet_log(ggml_log_level level, const char * text, void * /*user*/) 
 }
 
 int main(int argc, char ** argv) {
+    if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
+        std::printf("usage: %s MODEL N_CPU_MOE --worker N_CTX N_BATCH [STREAM_MIN [GEMM_MIN [THREADS]]]\n"
+                    "       %s MODEL N_CPU_MOE @shared|@fresh STATIC CONTEXT FIELD...\n", argv[0], argv[0]);
+        return 0;
+    }
     if (argc < 5) {
         std::fprintf(stderr, "usage: %s MODEL N_CPU_MOE --worker N_CTX N_BATCH [STREAM_MIN [GEMM_MIN [THREADS]]]\n"
                              "       %s MODEL N_CPU_MOE @shared|@fresh STATIC CONTEXT FIELD...\n", argv[0], argv[0]);

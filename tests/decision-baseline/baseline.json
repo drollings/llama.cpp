@@ -1,0 +1,29 @@
+{
+  "note": "Frozen baseline facts for the decision endpoint. Values here are contracts, not tunables. Update only with a matching code change and a re-measured gate.",
+  "partition": {
+    "slots_first": 0,
+    "slots_last_exclusive": 2,
+    "decision_first": 2,
+    "decision_count": 8,
+    "n_seq_max": 10,
+    "rule": "n_seq_max = n_parallel + n_seq_decision; decisions never share sequence ids with slots"
+  },
+  "routes": {
+    "canonical": "/v1/decision",
+    "deprecated_alias": "/decision",
+    "sizing_flag": "--decision-seqs",
+    "env_flag": "LLAMA_ARG_DECISION_SEQS"
+  },
+  "backend_flags": {
+    "kv_unified": true,
+    "swa_full_default": true,
+    "flash_attn": "on (production preset)",
+    "cache_type_k": "q8_0 (production preset)",
+    "cache_type_v": "q8_0 (production preset)"
+  },
+  "fixtures": [
+    "contexts_schema.request.json",
+    "compiled_schema.golden.json",
+    "jev_basic.shape.json"
+  ]
+}

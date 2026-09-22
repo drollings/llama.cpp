@@ -1,5 +1,9 @@
 # shared engine: used by llama-parallel-decision and by llama-server's /decision endpoint
-add_library(llama-decision STATIC decision-engine.cpp decision-engine.h)
+add_library(llama-decision STATIC
+    decision-engine.cpp decision-engine.h
+    decision-protocol.cpp decision-protocol.h
+    labels.cpp labels.h
+    letter_readout.cpp letter_readout.h)
 target_include_directories(llama-decision PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(llama-decision PUBLIC llama-common llama)
 target_compile_features(llama-decision PUBLIC cxx_std_17)

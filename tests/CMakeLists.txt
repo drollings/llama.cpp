@@ -259,6 +259,33 @@ llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-json-schema.cpp)
+# decision engine: pure schema/assemble tests plus an env-gated scoring harness.
+# the engine source is compiled here because tests/ is configured before tools/.
+llama_build(test-decision-engine.cpp)
+target_include_directories(test-decision-engine PRIVATE ${PROJECT_SOURCE_DIR}/tools/parallel-decision)
+target_sources(test-decision-engine PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/decision-engine.cpp
+    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/decision-protocol.cpp
+    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/labels.cpp
+    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/letter_readout.cpp)
+target_compile_definitions(test-decision-engine PRIVATE
+    DECISION_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/decision"
+    DECISION_TEST_BASELINE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/decision-baseline"
+    DECISION_TEST_SOURCE_DIR="${PROJECT_SOURCE_DIR}/tools/parallel-decision")
+llama_test(test-decision-engine LABEL decision)
+# label/boundary subset is gate-addressable by name and by label
+add_test(NAME test-decision-labels COMMAND $<TARGET_FILE:test-decision-engine>)
+set_tests_properties(test-decision-labels PROPERTIES LABELS "labels")
+add_test(NAME test-decision-temperature COMMAND $<TARGET_FILE:test-decision-engine>)
+set_tests_properties(test-decision-temperature PROPERTIES LABELS "temperature")
+add_test(NAME test-decision-fork COMMAND $<TARGET_FILE:test-decision-engine>)
+set_tests_properties(test-decision-fork PROPERTIES LABELS "fork")
+add_test(NAME test-decision-calibration COMMAND $<TARGET_FILE:test-decision-engine> "decision engine harness(\\..*calibration.*)?")
+set_tests_properties(test-decision-calibration PROPERTIES LABELS "calibration")
+add_test(NAME test-decision-head COMMAND $<TARGET_FILE:test-decision-engine> "decision engine harness(\\..*head.*)?")
+set_tests_properties(test-decision-head PROPERTIES LABELS "head")
+add_test(NAME test-decision-permut COMMAND $<TARGET_FILE:test-decision-engine> "decision engine harness(\\..*permut.*)?")
+set_tests_properties(test-decision-permut PROPERTIES LABELS "permut")
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
 # debug tool for chat template differential analysis (not registered as a test, run it manually)
