@@ -295,6 +295,9 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
         metrics->context_tokens = b.items.empty() ? 0 : b.items[0].context_tokens;
         metrics->head_active    = b.head_active;
         metrics->head_reason    = b.head_reason;
+        metrics->suffix_tokens        = b.suffix_tokens;
+        metrics->common_suffix_tokens = b.common_suffix_tokens;
+        metrics->leaf_suffix_tokens   = b.leaf_suffix_tokens;
     }
 
     std::vector<std::vector<float>> probs;

@@ -221,9 +221,9 @@ llama_context::llama_context(
         }
     }
 
-    if (cparams.classifier_only && ((model.arch != LLM_ARCH_GEMMA4 && model.arch != LLM_ARCH_LFM2 && model.arch != LLM_ARCH_LFM2MOE) ||
+    if (cparams.classifier_only && (!llm_arch_supports_classifier(model.arch) ||
             params.n_samplers != 0 || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
-        throw std::runtime_error("classifier_only requires Gemma4/LFM2, no sampler, and unpooled outputs");
+        throw std::runtime_error("classifier_only requires a supported arch (Gemma4/LFM2/Qwen), no sampler, and unpooled outputs");
     }
 
     if (params.attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED) {

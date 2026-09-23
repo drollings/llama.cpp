@@ -541,6 +541,11 @@ void engine::gather_candidates(int out_idx, const tokens_t & cands, branch_score
         }
     }
     const float * logits = llama_get_logits_ith(ctx, out_idx);
+    if (logits == nullptr) {
+        // A classifier-only context produces hidden states, not logits, so the answer head must
+        // cover the candidates; reaching here means a caller paired the wrong context and head.
+        throw std::runtime_error("no logits for the scored position: a classifier-only context needs an answer head that covers every candidate");
+    }
     for (llama_token t : cands) {
         out.cand_logits.push_back(logits[t]);
     }
@@ -657,8 +662,11 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
         field_first.push_back(canon);
     }
 
-    // Hoist a long suffix head shared by every field onto the trunk, so each branch decodes only
-    // its unique tail. Below the threshold the extra dispatch is not worth it.
+    // Hoist a suffix head shared by every field onto the trunk, so each branch decodes only its
+    // unique tail. The saving is `common` tokens on every branch but the trunk, so a short head
+    // still pays off once many questions share it.
+    constexpr size_t HOIST_MIN_TOKENS = 4;  // below this the extra trunk decode is not worth it
+    constexpr size_t HOIST_BUDGET    = 32;  // tokens saved across all branches before hoisting
     size_t suffix_tokens = 0;
     for (const auto & fd : fields) {
         suffix_tokens += fd.suffix.size();
@@ -674,7 +682,7 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
             }
             common = j;
         }
-        if (common >= 32) {
+        if (common >= HOIST_MIN_TOKENS && common * (fields.size() - 1) >= HOIST_BUDGET) {
             plan_common.assign(fields[0].suffix.begin(), fields[0].suffix.begin() + common);
             for (auto & fd : fields) {
                 fd.suffix.erase(fd.suffix.begin(), fd.suffix.begin() + common);

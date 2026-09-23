@@ -41,5 +41,6 @@
     "output_tokens": 0,
     "cached_tokens": 0,
     "state_cache_hit": false
-  }
+  },
+  "golden_model": "lfm2.5-2.6b-gguf/latest.gguf"
 }

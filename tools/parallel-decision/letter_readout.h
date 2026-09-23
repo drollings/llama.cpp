@@ -35,6 +35,9 @@ struct letter_metrics {
     double scoring_ms     = 0;
     bool        head_active = false; // candidates were scored against the answer rows
     std::string head_reason;         // why a requested head was not used, empty otherwise
+    size_t suffix_tokens        = 0; // unique question suffixes after dedup
+    size_t common_suffix_tokens = 0; // suffix head hoisted onto the shared trunk
+    size_t leaf_suffix_tokens   = 0; // what each branch actually decodes
 };
 
 // Splits the rendered chat prompt at the user message: `first` is the cacheable

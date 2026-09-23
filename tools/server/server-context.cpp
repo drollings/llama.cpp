@@ -858,9 +858,18 @@ public:
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
     std::unique_ptr<llama_decision::engine> decision_engine; // created by the first /decision request
+    // Separate engine for the letter readout: it runs on the classifier-only context when that
+    // context is available, so its prefix cache does not thrash against the trie engine.
+    std::unique_ptr<llama_decision::engine> decision_letter_engine;
+    llama_context *                             decision_letter_engine_ctx = nullptr;
     std::unique_ptr<llama_decision::label_vocab> decision_label_vocab; // letter readout, built once per context
     std::vector<llama_decision::label>          decision_labels;
     std::string                                 decision_label_error; // set when the vocabulary probe fails
+    // Classifier-only context for the letter readout: shares the model weights, produces hidden
+    // states instead of logits, and is created on first use. Null means the letter path keeps
+    // reading full logits from the shared context.
+    llama_context *                             ctx_decision = nullptr;
+    std::string                                 ctx_decision_error;
     std::string                                 decision_contract;    // identity of the decision readout contract
     bool                                        decision_temp_loaded = false;
     llama_decision::temperature_profile         decision_temp_profile;
@@ -956,6 +965,14 @@ private:
 
         ctx_dft   = nullptr;
         model_dft = nullptr;
+
+        if (ctx_decision) {
+            llama_free(ctx_decision);
+            ctx_decision = nullptr;
+        }
+        decision_engine.reset();
+        decision_letter_engine.reset();
+        decision_letter_engine_ctx = nullptr;
 
         llama_init.reset();
 
@@ -2386,6 +2403,25 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
+    // The letter readout scores a handful of answer rows against the post-norm hidden state
+    // instead of projecting the whole vocabulary. That needs a classifier-only context, which
+    // shares the model weights and is created on first use. On failure the letter path keeps the
+    // shared context and reports why the fast path is off.
+    llama_context * decision_hidden_ctx() {
+        if (ctx_decision == nullptr && ctx_decision_error.empty()) {
+            llama_context_params cp = common_context_params_to_llama(params_base);
+            cp.classifier_only = true;
+            ctx_decision = llama_init_from_model(model_tgt, cp);
+            if (ctx_decision == nullptr) {
+                ctx_decision_error = "the classifier-only decision context could not be created";
+                SRV_WRN("%s; the letter readout falls back to full logits\n", ctx_decision_error.c_str());
+            } else {
+                SRV_INF("%s", "decision classifier-only context created: hidden-state readout enabled\n");
+            }
+        }
+        return ctx_decision;
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     // POST /decision: answer a finite JSON schema in one batched pass on this thread.
     // Uses the sequence ids above the slots reserved by --decision-seqs (see tools/parallel-decision).
@@ -2407,9 +2443,18 @@ private:
             const llama_decision::head_capability head_cap =
                 llama_decision::probe_selected_head(llama_get_model(ctx_tgt));
             llama_decision::require_selected_head(req.head, head_cap);
-            if (!decision_engine) {
-                decision_engine = std::make_unique<llama_decision::engine>(ctx_tgt, (llama_seq_id) params_base.n_parallel,
-                                                                            params_base.n_seq_decision);
+            // Prefer the classifier-only context: it turns the readout into a handful of answer-row
+            // dots instead of a full-vocabulary projection. A request that forces "full" needs
+            // logits, so it stays on the shared context. Fall back to the shared context when the
+            // classifier context is not available, which keeps the logits path correct.
+            llama_context * ctx_readout = req.head == "full" ? ctx_tgt : decision_hidden_ctx();
+            if (ctx_readout == nullptr) {
+                ctx_readout = ctx_tgt;
+            }
+            if (decision_letter_engine_ctx != ctx_readout) {
+                decision_letter_engine = std::make_unique<llama_decision::engine>(
+                    ctx_readout, (llama_seq_id) params_base.n_parallel, params_base.n_seq_decision);
+                decision_letter_engine_ctx = ctx_readout;
             }
             if (!decision_label_vocab) {
                 decision_label_vocab = llama_decision::make_llama_label_vocab(
@@ -2498,6 +2543,9 @@ private:
             if (const char * fork = std::getenv("LLAMA_DECISION_FORK")) {
                 jopt.fork = fork;
             }
+            if (const char * optimize = std::getenv("LLAMA_DECISION_OPTIMIZE")) {
+                jopt.optimize = std::string(optimize) != "0" && std::string(optimize) != "false";
+            }
             if (cancel_flag) {
                 jopt.should_stop = [cancel_flag]() { return cancel_flag->load(); };
             }
@@ -2507,7 +2555,7 @@ private:
             std::vector<std::vector<float>> probs;
             // run inside a yield so metrics/slot requests are served while the decision computes
             queue_tasks.yield_to_queue([&]() {
-                probs = llama_decision::letter_readout(*decision_engine, *decision_label_vocab,
+                probs = llama_decision::letter_readout(*decision_letter_engine, *decision_label_vocab,
                                                        chat_params.tmpls.get(), chat_params.use_jinja,
                                                        req, decision_labels, jopt, &metrics, &audit);
             });
@@ -2527,12 +2575,19 @@ private:
             out["head"]["mode"]     = metrics.head_active ? "selected" : "full";
             out["head"]["fallback"] = head_fallback;
             if (head_fallback) {
-                out["head"]["reason"] = metrics.head_reason.empty() ? head_cap.reason : metrics.head_reason;
+                const std::string & reason = !metrics.head_reason.empty() ? metrics.head_reason
+                                          : !ctx_decision_error.empty()   ? ctx_decision_error
+                                                                          : head_cap.reason;
+                out["head"]["reason"] = reason;
             }
             // additive diagnostics: the readout contract identity this server is running
             out["diagnostics"] = json::object();
             out["diagnostics"]["contract_hash"]  = decision_contract;
             out["diagnostics"]["prompt_version"] = llama_decision::LETTER_PROMPT_VERSION;
+            out["diagnostics"]["prefill_ms"]     = metrics.prefill_ms;
+            out["diagnostics"]["scoring_ms"]     = metrics.scoring_ms;
+            out["diagnostics"]["suffix_tokens"]        = (long long) metrics.suffix_tokens;
+            out["diagnostics"]["common_suffix_tokens"] = (long long) metrics.common_suffix_tokens;
             {
                 std::string quant;
                 char qbuf[256];

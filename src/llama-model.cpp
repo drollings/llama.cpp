@@ -3360,7 +3360,7 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
 
 int32_t llama_model_classifier_rows(const llama_model * model, const llama_token * ids, int32_t count, float * dst, size_t dst_count, float * softcap) {
     if (!model || !ids || !dst || !softcap || count < 2 || count > 64 ||
-            (model->arch != LLM_ARCH_GEMMA4 && model->arch != LLM_ARCH_LFM2 && model->arch != LLM_ARCH_LFM2MOE) || !model->output || model->output_s) return 0;
+            !llm_arch_supports_classifier(model->arch) || !model->output || model->output_s || model->output_b) return 0;
     const auto * tensor = model->output;
     const auto width = tensor->ne[0];
     if (width != model->hparams.n_embd || dst_count != size_t(count) * size_t(width) ||

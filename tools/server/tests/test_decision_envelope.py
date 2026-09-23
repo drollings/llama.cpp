@@ -151,10 +151,15 @@ def run_checks(server, captured):
     check(body["usage"]["input_tokens"] >= body["usage"]["cached_tokens"], "cached tokens are part of the input")
 
     # additive audit fields: prompt identity + per-answer tokenizer/vocabulary diagnostics
+    head_mode = body.get("head", {}).get("mode", "full")
     expected_ids = {"refund": 2, "dept": 2, "urgency": 3}
     for qid, ans in answers.items():
         check(0.0 < ans["allowed_token_mass"] <= 1.0 + 1e-6, f"{qid} allowed_token_mass in range")
-        check(isinstance(ans["full_vocab_argmax_id"], int) and ans["full_vocab_argmax_id"] >= 0, f"{qid} argmax id")
+        if head_mode == "selected":
+            # the selected head reads only the answer rows, so there is no full-vocabulary argmax
+            check(ans["full_vocab_argmax_id"] == -1, f"{qid} argmax id is unavailable on the selected head")
+        else:
+            check(isinstance(ans["full_vocab_argmax_id"], int) and ans["full_vocab_argmax_id"] >= 0, f"{qid} argmax id")
         check(len(ans["answer_token_ids"]) == expected_ids[qid], f"{qid} answer token ids")
         check(len(ans["prompt_sha256"]) == 64, f"{qid} prompt sha256")
         check(bool(ans["prompt_version"]), f"{qid} prompt version")
