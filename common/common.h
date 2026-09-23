@@ -454,6 +454,7 @@ struct common_params {
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
     int32_t n_seq_decision        =     0; // sequences reserved for llama-server's /decision endpoint (0 = disabled)
+    int32_t n_ctx_decision        =     0; // context size for the classifier-only decision context (0 = the model's n_ctx)
     std::string decision_temperature;      // optional calibrated per-type decision temperatures with provenance
     std::string decision_contract;         // optional expected contract hash; the decision path refuses a mismatch
     int32_t n_sequences           =     1; // number of sequences to decode

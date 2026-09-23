@@ -5,6 +5,7 @@
 #include "labels.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -200,6 +201,38 @@ int classifier_head::index_of(llama_token id) const {
     return -1;
 }
 
+std::vector<float> score_answer_rows(const float * hidden, const classifier_head & head, const tokens_t & cands) {
+    if (hidden == nullptr) {
+        throw std::invalid_argument("scoring answer rows needs a hidden state");
+    }
+    if (!head.available()) {
+        throw std::invalid_argument("scoring answer rows needs an available answer head");
+    }
+    const size_t width = (size_t) head.width;
+    std::vector<float> out;
+    out.reserve(cands.size());
+    for (llama_token t : cands) {
+        const int r = head.index_of(t);
+        if (r < 0) {
+            throw std::runtime_error("the selected answer head is missing a candidate row");
+        }
+        const float * row = head.rows.data() + (size_t) r * width;
+        double dot = 0.0;
+        for (size_t k = 0; k < width; ++k) {
+            dot += (double) hidden[k] * (double) row[k];
+        }
+        float v = (float) dot;
+        if (!head.bias.empty()) {
+            v += head.bias[(size_t) r];
+        }
+        if (head.softcap != 0.0f) {
+            v = head.softcap * std::tanh(v / head.softcap);
+        }
+        out.push_back(v);
+    }
+    return out;
+}
+
 std::string make_prefix_tag(const std::string & system_text, const std::string & after,
                             const std::string & prompt_version) {
     uint64_t h = 1469598103934665603ull;
@@ -252,18 +285,24 @@ void engine::select_fork(const std::string & requested) {
     }
 }
 
-std::vector<uint8_t> engine::save_seq(llama_seq_id seq) const {
-    // the on-device path stages the state in GPU staging buffers and returns only the small
-    // metadata header on the host; fall back to a full host round-trip when it is not usable
-    if (restore_on_device_) {
+llama_state_seq_flags engine::state_load_flags(bool on_device) {
+    return on_device ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : LLAMA_STATE_SEQ_FLAGS_NONE;
+}
+
+engine::saved_state engine::save_seq(llama_seq_id seq, bool prefer_device) const {
+    // The device path stages the tensor bytes in the context staging buffer and returns only a
+    // small metadata header on the host, so a saved device state is not self-contained. Prefer it
+    // only where the state is consumed before the next save; otherwise use the self-contained host
+    // format. A failed device save retires the device path for the process lifetime.
+    if (prefer_device && device_capable_) {
         const size_t size = llama_state_seq_get_size_ext(ctx, seq, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
         if (size != 0) {
             std::vector<uint8_t> buf(size);
             if (llama_state_seq_get_data_ext(ctx, buf.data(), buf.size(), seq, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == size) {
-                return buf;
+                return { std::move(buf), true };
             }
         }
-        restore_on_device_ = false;
+        device_capable_ = false;
     }
     const size_t size = llama_state_seq_get_size(ctx, seq);
     if (size == 0) {
@@ -273,23 +312,24 @@ std::vector<uint8_t> engine::save_seq(llama_seq_id seq) const {
     if (llama_state_seq_get_data(ctx, buf.data(), buf.size(), seq) != size) {
         throw std::runtime_error("failed to save a decision sequence state");
     }
-    return buf;
+    return { std::move(buf), false };
 }
 
-void engine::load_seq(const std::vector<uint8_t> & state, llama_seq_id seq) const {
-    if (state.empty()) {
+void engine::load_seq(const saved_state & state, llama_seq_id seq) const {
+    if (state.bytes.empty()) {
         return;
     }
-    if (restore_on_device_ &&
-            llama_state_seq_set_data_ext(ctx, state.data(), state.size(), seq, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0) {
-        return;
-    }
-    if (llama_state_seq_set_data(ctx, state.data(), state.size(), seq) == 0) {
-        throw std::runtime_error("failed to restore a decision sequence state");
+    // The format belongs to the value: the device flag is never substituted for the host flag or
+    // the other way around, so a stale engine flag cannot misread the bytes.
+    const size_t n = llama_state_seq_set_data_ext(ctx, state.bytes.data(), state.bytes.size(), seq,
+                                                  state_load_flags(state.on_device));
+    if (n == 0) {
+        throw std::runtime_error(state.on_device ? "failed to restore a device decision sequence state"
+                                                 : "failed to restore a decision sequence state");
     }
 }
 
-void engine::fork_into(llama_seq_id src, llama_seq_id dst, const std::vector<uint8_t> * src_state) {
+void engine::fork_into(llama_seq_id src, llama_seq_id dst, const saved_state * src_state) {
     llama_memory_seq_rm(mem, dst, -1, -1);
     if (active_fork_ == fork_kind::restore) {
         if (src_state == nullptr) {
@@ -373,8 +413,9 @@ bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache, const std
                 for (llama_seq_id s = seq_snap; s < seq_pool + n_pool; ++s) {
                     llama_memory_seq_rm(mem, s, -1, -1);
                 }
+                // the LRU entry is host format; refresh the device copy for the current request only
                 load_seq(entry.state, seq_snap);
-                prefix_state_ = std::move(entry.state);
+                prefix_state_ = save_seq(seq_snap, true);
                 cached        = shared;
                 cached_tag    = tag;
                 return true;
@@ -393,15 +434,18 @@ bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache, const std
     }
     cached.clear();
     cached_tag.clear();
-    prefix_state_.clear();
+    prefix_state_ = saved_state{};
     if (!shared.empty()) {
         decode_parts({ { &shared, 0, seq_snap } });
         cached     = shared;
         cached_tag = tag;
         if (active_fork_ == fork_kind::restore) {
-            prefix_state_ = save_seq(seq_snap);
+            prefix_state_ = save_seq(seq_snap, true);
             if (!tag.empty()) {
-                prefix_lru_.insert(prefix_lru_.begin(), { tag, prefix_state_ });
+                // the LRU entry must outlive the request, so it uses the self-contained host format
+                saved_state host_state = save_seq(seq_snap, false);
+                assert(!host_state.on_device);
+                prefix_lru_.insert(prefix_lru_.begin(), { tag, std::move(host_state) });
                 while (prefix_lru_.size() > prefix_lru_capacity_) {
                     prefix_lru_.pop_back();
                 }
@@ -438,12 +482,15 @@ static void score_audit(const float * logits, int n_vocab, const tokens_t & cand
 }
 
 std::vector<engine::branch_score> engine::score_branches(const std::vector<branch> & branches, llama_seq_id first, int n_free,
-                                                         const std::vector<std::vector<uint8_t>> * parent_states,
+                                                         const std::vector<saved_state> * parent_states,
                                                          bool allow_bypass) {
     std::vector<branch_score> result(branches.size());
 
     // A single branch does not need its own sequence: decode it on the trunk and trim afterwards.
-    if (allow_bypass && branches.size() == 1 && active_fork_ == fork_kind::copy) {
+    // Only bypass when the branch fits one batch; an oversize branch falls through to the chunked
+    // path, which rejects it as a capacity error instead of overflowing llama_decode.
+    if (allow_bypass && branches.size() == 1 && active_fork_ == fork_kind::copy &&
+        (int) branches[0].toks.size() <= llama_n_batch(ctx)) {
         const llama_seq_id seq  = branches[0].trunk;
         const auto &       toks = branches[0].toks;
         llama_batch batch = llama_batch_init((int) toks.size(), 0, 1);
@@ -534,27 +581,7 @@ void engine::gather_candidates(int out_idx, const tokens_t & cands, branch_score
     if (head_active_) {
         const float * embd = llama_get_embeddings_ith(ctx, out_idx);
         if (embd != nullptr) {
-            // dot(hidden, answer row) plus any per-id output bias; softcap only when the model applies one
-            const size_t width = (size_t) head_->width;
-            for (llama_token t : cands) {
-                const int r = head_->index_of(t);
-                if (r < 0) {
-                    throw std::runtime_error("the selected answer head is missing a candidate row");
-                }
-                const float * row = head_->rows.data() + (size_t) r * width;
-                double dot = 0.0;
-                for (size_t k = 0; k < width; ++k) {
-                    dot += (double) embd[k] * (double) row[k];
-                }
-                float v = (float) dot;
-                if (!head_->bias.empty()) {
-                    v += head_->bias[(size_t) r];
-                }
-                if (head_->softcap != 0.0f) {
-                    v = head_->softcap * std::tanh(v / head_->softcap);
-                }
-                out.cand_logits.push_back(v);
-            }
+            out.cand_logits = score_answer_rows(embd, *head_, cands);
             out.full_vocab_argmax  = -1; // no full vocabulary on the fast path
             out.allowed_token_mass = 1.0f;
             return;
@@ -780,12 +807,47 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
     out.leaf_suffix_tokens   = leaf_suffix_tokens;
     out.items.resize(contexts.size());
 
+    // Bounded decision context: reject a request whose peak KV use cannot fit before touching the
+    // cache, so the failure is a clean client error and never a partial restore. A unified cache
+    // bounds all live sequences together, so the check uses the engine's peak live set: the
+    // snapshot plus the whole sequence pool, each at the longest this request builds. Never
+    // truncate.
+    size_t max_tail = 0;
+    for (const auto & t : tails) {
+        max_tail = std::max(max_tail, t.size());
+    }
+    size_t max_branch = 0;
+    for (const auto & fd : fields) {
+        for (const auto & p : fd.paths) {
+            max_branch = std::max(max_branch, p.size());
+        }
+    }
+
+    // Bounded decision context: reject a request whose peak KV use cannot fit before touching the
+    // cache, so the failure is a clean client error and never a partial restore. A unified cache
+    // bounds all live sequences together, so the check uses the engine's peak live set: the
+    // snapshot, the group's trunks, and one wave of branch sequences, each at the longest this
+    // request builds. Never truncate.
+    const size_t per_group = std::clamp<size_t>(n_pool / (1 + branches), 1, contexts.size());
+    const size_t group     = std::min(per_group, contexts.size());
+    const size_t n_free    = (size_t) std::max(0, n_pool - (int) group);
+    const size_t branch_wave = std::min(n_free, (size_t) branches * group);
+    const size_t trunk_len   = shared.size() + max_tail;
+    const size_t peak        = shared.size()
+                             + group * trunk_len
+                             + branch_wave * (trunk_len + max_branch);
+    const size_t budget      = (size_t) llama_n_ctx(ctx);
+    if (peak > budget) {
+        throw capacity_error("decision context budget exceeded: the request needs up to " + std::to_string(peak) +
+                             " tokens but the context holds " + std::to_string(budget) +
+                             " (raise --decision-ctx-size)");
+    }
+
     const auto t0 = std::chrono::steady_clock::now();
     out.cache_hit = prepare_prefix(shared, opt.allow_cache, opt.cache_tag);
     out.prefill_ms += ms_since(t0);
 
     // each context in a group holds one trunk sequence; the rest of the pool scores branches
-    const size_t per_group = std::clamp<size_t>(n_pool / (1 + branches), 1, contexts.size());
     for (size_t g0 = 0; g0 < contexts.size(); g0 += per_group) {
         if (yield_) {
             yield_();
@@ -810,11 +872,11 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
         llama_synchronize(ctx); // llama_decode is asynchronous: wait for the prefill so its time isn't billed to scoring
         out.prefill_ms += ms_since(tp);
 
-        std::vector<std::vector<uint8_t>> trunk_states;
+        std::vector<saved_state> trunk_states;
         if (active_fork_ == fork_kind::restore) {
             trunk_states.reserve(n_group);
             for (size_t i = 0; i < n_group; ++i) {
-                trunk_states.push_back(save_seq(seq_pool + (llama_seq_id) i));
+                trunk_states.push_back(save_seq(seq_pool + (llama_seq_id) i, true));
             }
         }
 

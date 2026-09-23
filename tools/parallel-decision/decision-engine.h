@@ -59,6 +59,11 @@ struct classifier_head {
     int  index_of(llama_token id) const; // row index for a token, or -1
 };
 
+// Scores candidate tokens against a post-norm hidden state and an answer-row table:
+// dot(hidden, row) plus the row's output bias, then the model's logit softcap when it has one.
+// Pure: it takes no context, so it is unit-testable with synthetic hidden states and rows.
+std::vector<float> score_answer_rows(const float * hidden, const classifier_head & head, const tokens_t & cands);
+
 struct options {
     std::string mode           = "auto"; // auto: tree up to tree_max values, else greedy; tree; greedy
     size_t      tree_max       = 128;
@@ -136,6 +141,10 @@ class engine {
   public:
     engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs);
 
+    // The flags a load must use for a saved format. Pure: it reads only the value, never the
+    // engine capability, so a capability downgrade can only change how a state is saved.
+    static llama_state_seq_flags state_load_flags(bool on_device);
+
     const llama_model * get_model() const { return model; }
 
     // Bounded, per-engine tokenization cache: repeated prompts and candidates are encoded once.
@@ -170,6 +179,15 @@ class engine {
 
     enum class fork_kind { copy, restore };
 
+    // A saved sequence state carries its own storage format, so a load never has to guess: the
+    // bytes and the flag travel together. The device format stages the tensor bytes in the context
+    // staging buffer and returns only metadata, so it is valid only while nothing saves over that
+    // buffer; any state that must outlive the current request uses the host format.
+    struct saved_state {
+        std::vector<uint8_t> bytes;
+        bool                 on_device = false;
+    };
+
     llama_context     * ctx;
     const llama_model * model;
     const llama_vocab * vocab;
@@ -192,18 +210,20 @@ class engine {
     fork_kind           probe_fork_;
     fork_kind           active_fork_ = fork_kind::copy;
     llama_pos           swa_         = 0; // sliding-window size, 0 = none
-    std::vector<uint8_t> prefix_state_;
 
-    // restore forks keep the saved state on device when the memory layout allows it, so the
-    // per-branch restore is a device-to-device copy instead of a host round-trip; falls back to
-    // host when the state cannot be staged on device
-    mutable bool restore_on_device_ = true;
+    // prefix_state_ is the only device-format state and is valid only for the current request;
+    // LRU entries are host format so they outlive the saves that reuse the device staging buffer
+    saved_state         prefix_state_;
+
+    // one-way capability: device staging is used while it works and is abandoned for the process
+    // lifetime when a save or load fails; it selects the save format, never a content check
+    mutable bool device_capable_ = true;
 
     struct prefix_entry {
-        std::string          tag;
-        std::vector<uint8_t> state;
+        std::string tag;
+        saved_state state;
     };
-    std::vector<prefix_entry> prefix_lru_; // restore mode, most-recent first
+    std::vector<prefix_entry> prefix_lru_; // restore mode, most-recent first; entries are host format
     size_t                    prefix_lru_capacity_ = 4;
 
     tokens_t tokenize(const std::string & text, bool add_special) const;
@@ -211,13 +231,13 @@ class engine {
     void     decode_parts(const std::vector<prompt_part> & parts);
     bool     prepare_prefix(const tokens_t & shared, bool allow_cache, const std::string & tag);
 
-    std::vector<uint8_t> save_seq(llama_seq_id seq) const;
-    void                 load_seq(const std::vector<uint8_t> & state, llama_seq_id seq) const;
-    void                 fork_into(llama_seq_id src, llama_seq_id dst, const std::vector<uint8_t> * src_state);
-    void                 select_fork(const std::string & requested);
+    saved_state save_seq(llama_seq_id seq, bool prefer_device) const;
+    void        load_seq(const saved_state & state, llama_seq_id seq) const;
+    void        fork_into(llama_seq_id src, llama_seq_id dst, const saved_state * src_state);
+    void        select_fork(const std::string & requested);
 
     std::vector<branch_score> score_branches(const std::vector<branch> & branches, llama_seq_id first, int n_free,
-                                             const std::vector<std::vector<uint8_t>> * parent_states,
+                                             const std::vector<saved_state> * parent_states,
                                              bool allow_bypass);
 
     void gather_candidates(int out_idx, const tokens_t & cands, branch_score & out);

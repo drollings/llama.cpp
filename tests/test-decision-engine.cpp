@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <set>
@@ -31,6 +32,14 @@
 
 #ifndef DECISION_TEST_BASELINE_DIR
 #error "DECISION_TEST_BASELINE_DIR must be defined by the build"
+#endif
+
+#ifndef DECISION_TEST_GENERATED_MODEL_DIR
+#define DECISION_TEST_GENERATED_MODEL_DIR ""
+#endif
+
+#ifndef DECISION_TEST_SPM_MODEL
+#define DECISION_TEST_SPM_MODEL ""
 #endif
 
 static std::string read_file(const std::string & path) {
@@ -389,6 +398,98 @@ static void test_softmax(testing & t) {
     });
 }
 
+// The answer-row scoring math takes no context, so it is covered with synthetic hidden states,
+// rows, bias and softcap instead of a model.
+static llama_decision::classifier_head fake_answer_head() {
+    llama_decision::classifier_head head;
+    head.ids   = { 10, 11, 12 };
+    head.width = 3;
+    head.rows  = {
+         1.0f, 2.0f, 3.0f, // id 10
+         0.0f, 1.0f, 0.0f, // id 11
+        -1.0f, 0.0f, 1.0f, // id 12
+    };
+    return head;
+}
+
+static void test_score_answer_rows(testing & t) {
+    const std::vector<float> hidden = { 1.0f, 0.0f, 1.0f };
+    const llama_decision::tokens_t cands = { 10, 11, 12 };
+
+    t.test("answer rows score dot products plus the output bias", [&](testing & t) {
+        auto head = fake_answer_head();
+        head.bias = { 0.5f, 0.0f, 2.0f };
+        const auto v = llama_decision::score_answer_rows(hidden.data(), head, cands);
+        t.assert_equal("one score per candidate", (size_t) 3, v.size());
+        assert_close(t, "row 10 plus bias", 4.5, v[0], 1e-5);
+        assert_close(t, "row 11 plus bias", 0.0, v[1], 1e-5);
+        assert_close(t, "row 12 plus bias", 2.0, v[2], 1e-5);
+    });
+
+    t.test("an empty bias adds nothing", [&](testing & t) {
+        auto head = fake_answer_head();
+        head.softcap = 0.0f;
+        const auto v = llama_decision::score_answer_rows(hidden.data(), head, cands);
+        assert_close(t, "row 10 unchanged", 4.0, v[0], 1e-5);
+        assert_close(t, "row 11 unchanged", 0.0, v[1], 1e-5);
+        assert_close(t, "row 12 unchanged", 0.0, v[2], 1e-5);
+    });
+
+    t.test("a nonzero softcap bounds every score", [&](testing & t) {
+        auto head = fake_answer_head();
+        head.bias    = { 0.5f, 0.0f, 2.0f };
+        head.softcap = 2.0f;
+        const auto v = llama_decision::score_answer_rows(hidden.data(), head, cands);
+        assert_close(t, "softcapped row 10", 2.0 * std::tanh(4.5 / 2.0), v[0], 1e-5);
+        assert_close(t, "softcapped row 11", 0.0, v[1], 1e-5);
+        assert_close(t, "softcapped row 12", 2.0 * std::tanh(2.0 / 2.0), v[2], 1e-5);
+    });
+
+    t.test("a zero softcap leaves the score alone", [&](testing & t) {
+        auto head = fake_answer_head();
+        head.bias    = { 0.5f, 0.0f, 2.0f };
+        head.softcap = 0.0f;
+        const auto v = llama_decision::score_answer_rows(hidden.data(), head, cands);
+        assert_close(t, "row 10 unbounded", 4.5, v[0], 1e-5);
+        assert_close(t, "row 12 unbounded", 2.0, v[2], 1e-5);
+    });
+
+    t.test("a candidate without a row is rejected", [&](testing & t) {
+        const auto head = fake_answer_head();
+        bool threw = false;
+        try {
+            llama_decision::score_answer_rows(hidden.data(), head, { 10, 99 });
+        } catch (const std::exception &) {
+            threw = true;
+        }
+        t.assert_true("a missing row throws instead of scoring", threw);
+    });
+
+    t.test("an unavailable head is rejected", [&](testing & t) {
+        llama_decision::classifier_head head;
+        bool threw = false;
+        try {
+            llama_decision::score_answer_rows(hidden.data(), head, cands);
+        } catch (const std::exception &) {
+            threw = true;
+        }
+        t.assert_true("an unavailable head throws", threw);
+    });
+}
+
+// The load flag is a property of the saved format, so a capability downgrade can never route a
+// device state through the host reader or the other way around.
+static void test_saved_state_format_dispatch(testing & t) {
+    t.test("a saved state is loaded with its own format", [&](testing & t) {
+        t.assert_equal("a device state selects the device flag",
+                       (unsigned) LLAMA_STATE_SEQ_FLAGS_ON_DEVICE,
+                       (unsigned) llama_decision::engine::state_load_flags(true));
+        t.assert_equal("a host state selects no flag",
+                       (unsigned) LLAMA_STATE_SEQ_FLAGS_NONE,
+                       (unsigned) llama_decision::engine::state_load_flags(false));
+    });
+}
+
 static void test_question_temperature(testing & t) {
     t.test("effective temperature follows per-type override then global", [](testing & t) {
         const auto base = common_json::parse(R"({"state":"s","questions":{
@@ -629,6 +730,24 @@ static shared_test_model & shared_model() {
     return shared;
 }
 
+// A model test needs a GGUF and a GPU backend. On a CPU-only build it skips, so the CPU suite
+// stays green instead of reporting a load failure.
+static bool gpu_model_ready(testing & t, const char * path) {
+    if (path == nullptr || path[0] == '\0' || !file_exists(path)) {
+        t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        return false;
+    }
+    if (!decision_gpu_available()) {
+        t.skip("this build has no GPU backend; the model tests need one");
+        return false;
+    }
+    if (!shared_model().load(path)) {
+        t.assert_true("model loads", false);
+        return false;
+    }
+    return true;
+}
+
 static void test_thinking_off_model(testing & t) {
     t.test("the loaded model's decision prefix stays thinking off", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
@@ -703,6 +822,76 @@ struct test_engine {
         }
         model = shared_model().model;
         return make_ctx(false);
+    }
+};
+
+// CPU-runnable decision scaffold: it does not require a GPU, so the state/fork mechanics run in
+// CI. It loads the dummy model from the generate-models fixture with no GPU layers.
+static std::string decision_cpu_model_path() {
+    const std::string generated = std::string(DECISION_TEST_GENERATED_MODEL_DIR) + "/qwen35-dense.gguf";
+    if (file_exists(generated)) {
+        return generated;
+    }
+    const char * env = std::getenv("LLAMA_DECISION_TEST_MODEL");
+    if (env != nullptr && env[0] != '\0' && file_exists(env)) {
+        return env;
+    }
+    return std::string();
+}
+
+// The SentencePiece model is the fixture for boundary-resolved labels: its isolated token is the
+// space-prefixed form, so the isolated rule cannot see the label the model emits after the answer
+// tail. Env override wins, then the downloaded fixture, then empty so the test skips network-free.
+static std::string spm_labels_model_path() {
+    const char * env = std::getenv("LLAMA_DECISION_TEST_MODEL");
+    if (env != nullptr && env[0] != '\0' && file_exists(env)) {
+        return env;
+    }
+    const std::string spm = DECISION_TEST_SPM_MODEL;
+    if (file_exists(spm)) {
+        return spm;
+    }
+    return std::string();
+}
+
+struct cpu_test_engine {
+    llama_model   * model = nullptr;
+    llama_context * ctx   = nullptr;
+
+    ~cpu_test_engine() {
+        if (ctx) {
+            llama_free(ctx);
+        }
+        if (model) {
+            llama_model_free(model);
+        }
+    }
+
+    bool load(const std::string & path, int n_ctx = 256, bool classifier_only = false, bool embeddings = false) {
+        if (path.empty()) {
+            return false;
+        }
+        llama_backend_init();
+        llama_model_params mp = llama_model_default_params();
+        mp.n_gpu_layers = 0;
+        model = llama_model_load_from_file(path.c_str(), mp);
+        if (model == nullptr) {
+            return false;
+        }
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx                 = n_ctx;
+        cp.n_batch               = 128;
+        cp.n_ubatch              = 128;
+        cp.n_seq_max             = 10;
+        cp.n_outputs_max         = 10;
+        cp.n_outputs_max_per_seq = 1;
+        cp.kv_unified            = true;
+        cp.swa_full              = false;
+        cp.flash_attn_type       = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        cp.classifier_only       = classifier_only;
+        cp.embeddings            = embeddings || classifier_only;
+        ctx = llama_init_from_model(model, cp);
+        return ctx != nullptr;
     }
 };
 
@@ -870,6 +1059,7 @@ struct fake_vocab : llama_decision::label_vocab {
     std::vector<std::string>       pieces;
     std::map<int32_t, std::string> piece_override;
     std::set<int32_t>              specials;
+    bool                           drop_unknown = false; // skip text no piece matches, like a vocab without it
 
     int32_t id_of(const std::string & p) const {
         for (size_t i = 0; i < pieces.size(); ++i) {
@@ -894,7 +1084,9 @@ struct fake_vocab : llama_decision::label_vocab {
                 }
             }
             if (best < 0) {
-                out.push_back(100000 + (int32_t) (unsigned char) text[i]);
+                if (!drop_unknown) {
+                    out.push_back(100000 + (int32_t) (unsigned char) text[i]);
+                }
                 ++i;
                 continue;
             }
@@ -940,11 +1132,17 @@ static fake_vocab make_fake_vocab(bool with_double_letters) {
     return v;
 }
 
+// The synthetic answer tail the letter tests frame before a label: with no chat template the
+// framer returns "\n" as the post-user text, so the tail is "\nAnswer:\n".
+static std::string test_letter_tail() {
+    return llama_decision::render_letter_prompt(nullptr, false, llama_decision::letter_system_text()).second + "Answer:\n";
+}
+
 static void test_letter_suffix(testing & t) {
     t.test("question suffix lists options and ends at the answer boundary", [](testing & t) {
         const auto req = llama_decision::parse_jev_request(common_json::parse(jev_valid_body()));
         const fake_vocab v = make_fake_vocab(true);
-        const auto pool = llama_decision::build_label_pool(v, 8);
+        const auto pool = llama_decision::build_label_pool(v, "", 8);
         const std::string after = "<turn|>\n<turn>model\n";
 
         const std::string s = llama_decision::format_letter_suffix(req.questions[1], pool, after);
@@ -952,8 +1150,9 @@ static void test_letter_suffix(testing & t) {
         t.assert_true("second option listed", s.find("B: bug") != std::string::npos);
         t.assert_true("question text listed", s.find("What is the issue?") != std::string::npos);
 
-        const std::string tail = after + "Answer:\n";
-        t.assert_true("ends exactly at the answer boundary",
+        const std::string tail = llama_decision::letter_answer_tail(after);
+        t.assert_equal("the answer tail is the after text plus the fixed marker", after + "Answer:\n", tail);
+        t.assert_true("the suffix ends exactly at the answer boundary",
                       s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0);
     });
 
@@ -971,10 +1170,10 @@ static void test_letter_suffix(testing & t) {
 }
 
 static void test_label_pool(testing & t) {
-    t.test("label pool keeps single-token round-tripping labels in order", [](testing & t) {
+    t.test("label pool keeps boundary-resolved labels in order", [](testing & t) {
         const fake_vocab v = make_fake_vocab(true);
 
-        const auto pool = llama_decision::build_label_pool(v, 64);
+        const auto pool = llama_decision::build_label_pool(v, "", 64);
         t.assert_equal("cap respected", (size_t) 64, pool.size());
         t.assert_equal("first label is A", std::string("A"), pool[0].text);
         t.assert_equal("26th label is Z", std::string("Z"), pool[25].text);
@@ -988,29 +1187,49 @@ static void test_label_pool(testing & t) {
         }
         t.assert_true("no numeric or symbol labels", all_alpha);
 
-        t.assert_equal("AA is a single token", v.id_of("AA"), llama_decision::single_token(v, "AA"));
-        t.assert_equal("AAA is not a single label", -1, llama_decision::single_token(v, "AAA"));
+        t.assert_equal("AA resolves at the boundary", v.id_of("AA"), llama_decision::answer_label_token(v, "", "AA"));
+        t.assert_equal("AAA is not a single label", -1, llama_decision::answer_label_token(v, "", "AAA"));
     });
 
-    t.test("label pool rejects special and non-round-tripping tokens", [](testing & t) {
+    t.test("label pool rejects special and merged tokens", [](testing & t) {
+        // The removed piece check was a producer-confidence proxy ("the token looks like the
+        // text"); it is intentionally gone. A label is accepted when the boundary produces it as a
+        // single non-special token, whatever its surface form.
         fake_vocab special = make_fake_vocab(false);
         special.specials.insert(special.id_of("B"));
-        t.assert_equal("special token rejected", -1, llama_decision::single_token(special, "B"));
-        t.assert_equal("normal token accepted", special.id_of("A"), llama_decision::single_token(special, "A"));
+        t.assert_equal("special token rejected", -1, llama_decision::answer_label_token(special, "", "B"));
+        t.assert_equal("normal token accepted", special.id_of("A"), llama_decision::answer_label_token(special, "", "A"));
 
         fake_vocab renamed = make_fake_vocab(false);
         renamed.piece_override[renamed.id_of("C")] = "c";
-        t.assert_equal("round-trip failure rejected", -1, llama_decision::single_token(renamed, "C"));
+        t.assert_equal("a renamed piece is still accepted", renamed.id_of("C"),
+                       llama_decision::answer_label_token(renamed, "", "C"));
+
+        fake_vocab merged = make_fake_vocab(false);
+        merged.pieces.push_back("\nA");
+        t.assert_equal("a genuine merge is rejected", -1, llama_decision::answer_label_token(merged, "x\n", "A"));
 
         fake_vocab tiny;
         tiny.pieces.push_back("A");
+        tiny.drop_unknown = true;
         bool threw = false;
         try {
-            (void) llama_decision::build_label_pool(tiny, 64);
+            (void) llama_decision::build_label_pool(tiny, "", 64);
         } catch (const std::runtime_error &) {
             threw = true;
         }
         t.assert_true("fewer than two labels is an error", threw);
+    });
+
+    t.test("isolated and boundary pools agree without a space prefix", [](testing & t) {
+        const fake_vocab v = make_fake_vocab(true);
+        const auto isolated = llama_decision::build_label_pool(v, "", 64);
+        const auto boundary = llama_decision::build_label_pool(v, "Answer:\n", 64);
+        bool same = isolated.size() == boundary.size();
+        for (size_t i = 0; same && i < isolated.size(); ++i) {
+            same = isolated[i].text == boundary[i].text && isolated[i].token == boundary[i].token;
+        }
+        t.assert_true("the pool is byte-identical when isolated equals boundary", same);
     });
 }
 
@@ -1024,6 +1243,24 @@ static void test_boundary(testing & t) {
         fake_vocab merged = make_fake_vocab(false);
         merged.pieces.push_back("\nA");
         t.assert_true("merged token fails loudly", !llama_decision::check_boundary(merged, "x\n", "A", merged.id_of("A")));
+    });
+}
+
+static void test_answer_label_token(testing & t) {
+    t.test("answer label token resolves at the boundary", [](testing & t) {
+        const fake_vocab v = make_fake_vocab(false);
+        t.assert_equal("a clean token is accepted", v.id_of("A"),
+                       llama_decision::answer_label_token(v, "", "A"));
+
+        fake_vocab merged = make_fake_vocab(false);
+        merged.pieces.push_back("\nA");
+        t.assert_equal("a genuine merge is rejected", -1,
+                       llama_decision::answer_label_token(merged, "x\n", "A"));
+
+        fake_vocab special = make_fake_vocab(false);
+        special.specials.insert(special.id_of("B"));
+        t.assert_equal("a special token is rejected", -1,
+                       llama_decision::answer_label_token(special, "", "B"));
     });
 }
 
@@ -1053,29 +1290,220 @@ static void test_label_pool_real(testing & t) {
 
         try {
             auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(model));
-            const auto pool = llama_decision::build_label_pool(*vocab, 64);
+            const std::string tail = "Answer:\n";
+            const auto pool = llama_decision::build_label_pool(*vocab, tail, 64);
             t.assert_true("pool has 2-64 labels", pool.size() >= 2 && pool.size() <= 64);
 
-            bool single = true;
-            bool alpha  = true;
+            bool boundary = true;
+            bool alpha    = true;
             for (const auto & l : pool) {
-                single = single && (llama_decision::single_token(*vocab, l.text) == l.token) && (vocab->piece(l.token) == l.text);
+                boundary = boundary && (llama_decision::answer_label_token(*vocab, tail, l.text) == l.token);
                 for (char c : l.text) {
                     alpha = alpha && (std::isalpha((unsigned char) c) != 0);
                 }
             }
-            t.assert_true("every label is single-token and round-trips", single);
+            t.assert_true("every label resolves at the boundary", boundary);
             t.assert_true("no numeric labels", alpha);
 
-            const std::string prompt = "Answer:\n";
-            const auto base = vocab->tokenize(prompt, true);
-            const auto full = vocab->tokenize(prompt + pool[0].text, true);
+            const auto base = vocab->tokenize(tail, true);
+            const auto full = vocab->tokenize(tail + pool[0].text, true);
             t.assert_equal("exact boundary length", base.size() + 1, full.size());
             t.assert_true("exact boundary tail is the label token", !full.empty() && full.back() == pool[0].token);
-            t.assert_true("boundary accepts the label", llama_decision::check_boundary(*vocab, prompt, pool[0].text, pool[0].token));
+            t.assert_true("boundary accepts the label", llama_decision::check_boundary(*vocab, tail, pool[0].text, pool[0].token));
         } catch (const std::exception & e) {
             t.assert_true(std::string("label pool runs: ") + e.what(), false);
         }
+    });
+}
+
+// The pool is built at the real answer boundary, so an add_space_prefix vocabulary resolves "A" to
+// the bare token the model emits after the tail instead of the space-prefixed isolated form. This
+// is the SPM family that the isolated rule refused.
+static void test_letter_labels_spm(testing & t) {
+    t.test("letter labels resolve at the answer boundary on an SPM model", [](testing & t) {
+        const std::string path = spm_labels_model_path();
+        if (path.empty()) {
+            t.skip("no SPM model available");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path, 512)) {
+            t.assert_true("the SPM model loads on CPU", false);
+            return;
+        }
+        try {
+            auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
+            const std::string tail = test_letter_tail();
+            const auto pool = llama_decision::build_label_pool(*vocab, tail, 64);
+            t.assert_true("the pool has at least two labels", pool.size() >= 2);
+            for (const auto & l : pool) {
+                t.assert_equal("label " + l.text + " resolves at the answer boundary", l.token,
+                               llama_decision::answer_label_token(*vocab, tail, l.text));
+            }
+
+            // The bug: the isolated token is the space-prefixed form, while the model emits the
+            // bare token after the tail. Skip when the tokenizer does not prefix a space.
+            bool space_prefixed = false;
+            for (const auto & l : pool) {
+                const std::vector<int32_t> iso = vocab->tokenize(l.text, false);
+                if (iso.size() == 1 && vocab->piece(iso[0]) == " " + l.text) {
+                    space_prefixed = true;
+                    break;
+                }
+            }
+            if (space_prefixed) {
+                bool isolated_differs = false;
+                for (const auto & l : pool) {
+                    const std::vector<int32_t> iso = vocab->tokenize(l.text, false);
+                    if (iso.size() == 1 && iso[0] != l.token) {
+                        isolated_differs = true;
+                        break;
+                    }
+                }
+                t.assert_true("the isolated token differs from the boundary token", isolated_differs);
+            }
+
+            // End to end: a previously-refused family now serves a closed distribution per question.
+            llama_decision::engine eng(te.ctx, 2, 8);
+            llama_decision::answer_head_cache head_cache;
+            const auto req = llama_decision::parse_jev_request(common_json::parse(jev_valid_body()));
+            llama_decision::letter_metrics metrics;
+            const auto probs = llama_decision::letter_readout(eng, head_cache, *vocab, nullptr, false, req, pool,
+                                                              llama_decision::options{}, &metrics);
+            t.assert_equal("one distribution per question", req.questions.size(), probs.size());
+            bool valid = probs.size() == req.questions.size();
+            for (size_t i = 0; valid && i < probs.size(); ++i) {
+                valid = probs[i].size() == req.questions[i].options.size();
+                double sum = 0.0;
+                for (float p : probs[i]) {
+                    valid = valid && p >= 0.0f && p <= 1.0f;
+                    sum += p;
+                }
+                valid = valid && std::fabs(sum - 1.0) < 1e-3;
+                valid = valid && !probs[i].empty() && std::max_element(probs[i].begin(), probs[i].end()) != probs[i].end();
+            }
+            t.assert_true("every distribution is closed and valid", valid);
+            t.assert_true("the SPM readout does not use a classifier head", !metrics.head_active);
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the SPM label pool runs: ") + e.what(), false);
+        }
+    });
+}
+
+// Calibration of the label accept/reject gate. The gate is task-correctness - the next token at
+// the answer boundary is exactly this label - not a confidence score; the removed piece check was
+// a producer-confidence proxy. There is no numeric threshold, so precision/recall become exact
+// accept/reject counts over a control, a positive, and a negative group.
+static void test_label_boundary_calibration(testing & t) {
+    t.test("boundary gate calibration: control, positive and negative groups", [](testing & t) {
+        int control_false_rejects  = 0;
+        int positive_false_rejects = 0;
+        int negative_false_accepts = 0;
+        int positive_labels        = 0;
+
+        // Control: a vocabulary whose isolated token is the boundary token must not change.
+        {
+            const fake_vocab v  = make_fake_vocab(true);
+            const auto isolated = llama_decision::build_label_pool(v, "", 64);
+            const auto boundary = llama_decision::build_label_pool(v, "Answer:\n", 64);
+            bool same = isolated.size() == boundary.size();
+            for (size_t i = 0; same && i < isolated.size(); ++i) {
+                same = isolated[i].text == boundary[i].text && isolated[i].token == boundary[i].token;
+            }
+            if (!same) {
+                ++control_false_rejects;
+            }
+
+            // A real BPE model is a control only when its isolated token equals its boundary token.
+            const char * env = std::getenv("LLAMA_DECISION_TEST_MODEL");
+            if (env != nullptr && env[0] != '\0' && file_exists(env)) {
+                cpu_test_engine te;
+                if (te.load(env)) {
+                    auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
+                    const std::string tail = test_letter_tail();
+                    const auto pool = llama_decision::build_label_pool(*vocab, tail, 64);
+                    bool space_prefixed = false;
+                    for (const auto & l : pool) {
+                        const std::vector<int32_t> iso = vocab->tokenize(l.text, false);
+                        if (iso.size() == 1 && vocab->piece(iso[0]) == " " + l.text) {
+                            space_prefixed = true;
+                            break;
+                        }
+                    }
+                    if (!space_prefixed) {
+                        const auto real_isolated = llama_decision::build_label_pool(*vocab, "", 64);
+                        bool real_same = real_isolated.size() == pool.size();
+                        for (size_t i = 0; real_same && i < pool.size(); ++i) {
+                            real_same = real_isolated[i].text == pool[i].text && real_isolated[i].token == pool[i].token;
+                        }
+                        if (!real_same) {
+                            ++control_false_rejects;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Positive: the SPM model must be accepted at the boundary.
+        {
+            const std::string path = spm_labels_model_path();
+            if (!path.empty()) {
+                cpu_test_engine te;
+                if (te.load(path)) {
+                    auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
+                    const std::string tail = test_letter_tail();
+                    const auto pool = llama_decision::build_label_pool(*vocab, tail, 64);
+                    positive_labels = (int) pool.size();
+                    if (pool.size() < 2) {
+                        ++positive_false_rejects;
+                    }
+                    for (const auto & l : pool) {
+                        if (llama_decision::answer_label_token(*vocab, tail, l.text) != l.token) {
+                            ++positive_false_rejects;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Negative: a vocabulary with no letter tokens, a special token, and a genuine merge must
+        // still be rejected. The generated dummy model is not a usable negative here: its "test"
+        // tokenizer hashes fixed 5-character chunks into 128 ids, so some candidates land on a
+        // single boundary token by hash collision. That is a fixture artifact, not a gate defect,
+        // and the gate still refuses any vocabulary with fewer than two boundary-resolvable labels.
+        {
+            fake_vocab no_letters;
+            no_letters.pieces.push_back("tok_0");
+            no_letters.pieces.push_back("tok_1");
+            no_letters.drop_unknown = true;
+            bool no_letters_rejected = false;
+            try {
+                (void) llama_decision::build_label_pool(no_letters, "", 64);
+            } catch (const std::runtime_error &) {
+                no_letters_rejected = true;
+            }
+            if (!no_letters_rejected) {
+                ++negative_false_accepts;
+            }
+
+            fake_vocab special = make_fake_vocab(false);
+            special.specials.insert(special.id_of("B"));
+            if (llama_decision::answer_label_token(special, "", "B") >= 0) {
+                ++negative_false_accepts;
+            }
+
+            fake_vocab merged = make_fake_vocab(false);
+            merged.pieces.push_back("\nA");
+            if (llama_decision::answer_label_token(merged, "x\n", "A") >= 0) {
+                ++negative_false_accepts;
+            }
+        }
+
+        fprintf(stderr, "label boundary calibration: control_false_rejects=%d positive_false_rejects=%d positive_labels=%d negative_false_accepts=%d\n",
+                control_false_rejects, positive_false_rejects, positive_labels, negative_false_accepts);
+        t.assert_equal("control group: zero false rejects", 0, control_false_rejects);
+        t.assert_equal("positive group: zero false rejects", 0, positive_false_rejects);
+        t.assert_equal("negative group: zero false accepts", 0, negative_false_accepts);
     });
 }
 
@@ -1118,6 +1546,13 @@ static void test_engine_integration(testing & t) {
     });
 }
 
+// The model tests below run against the one shared model, so they share one caller-owned head
+// cache. The dedicated cache tests construct their own.
+static llama_decision::answer_head_cache & test_head_cache() {
+    static llama_decision::answer_head_cache cache;
+    return cache;
+}
+
 static void test_letter_readout_real(testing & t) {
     t.test("letter readout scores a Jev request on a real model", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
@@ -1133,12 +1568,12 @@ static void test_letter_readout_real(testing & t) {
 
         try {
             auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, 64);
+            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
             llama_decision::engine eng(te.ctx, 2, 8);
             const auto req = llama_decision::parse_jev_request(common_json::parse(jev_valid_body()));
 
             llama_decision::letter_metrics metrics;
-            const auto probs = llama_decision::letter_readout(eng, *vocab, nullptr, false, req, pool,
+            const auto probs = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool,
                                                               llama_decision::options{}, &metrics);
             t.assert_equal("one distribution per question", req.questions.size(), probs.size());
             bool valid = true;
@@ -1174,7 +1609,7 @@ static void test_letter_readout_real(testing & t) {
             // order stability: reversing the questions must not change the answers
             llama_decision::jev_request reversed = req;
             std::reverse(reversed.questions.begin(), reversed.questions.end());
-            const auto probs_rev = llama_decision::letter_readout(eng, *vocab, nullptr, false, reversed, pool,
+            const auto probs_rev = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, reversed, pool,
                                                                   llama_decision::options{}, nullptr);
             bool stable = probs_rev.size() == probs.size();
             for (size_t i = 0; stable && i < req.questions.size(); ++i) {
@@ -1199,10 +1634,10 @@ static void test_letter_readout_real(testing & t) {
                 body["temperatures"] = common_json::parse(temps);
                 return llama_decision::parse_jev_request(body);
             };
-            const auto sharp = llama_decision::letter_readout(eng, *vocab, nullptr, false,
+            const auto sharp = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
                                                               with_temps(R"({"noul":0.5,"choice":0.5,"score":0.5})"),
                                                               pool, llama_decision::options{}, nullptr);
-            const auto flat = llama_decision::letter_readout(eng, *vocab, nullptr, false,
+            const auto flat = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
                                                              with_temps(R"({"noul":2.5,"choice":2.5,"score":2.5})"),
                                                              pool, llama_decision::options{}, nullptr);
             auto top = [](const std::vector<float> & p) {
@@ -1364,6 +1799,308 @@ static void test_fork_real(testing & t) {
         } catch (const std::exception & e) {
             t.assert_true(std::string("fork runs: ") + e.what(), false);
         }
+    });
+}
+
+
+// Returning to a cached prefix must restore that prefix's own bytes. The LRU stores host-format
+// states, so a later save on the snapshot sequence cannot corrupt an earlier entry: the return
+// scores and the snapshot KV must match the first run of the same prefix.
+static void test_prefix_lru_restores_own_state(testing & t) {
+    t.test("returning to a cached prefix restores that prefix", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            const llama_seq_id snap = 2; // the engine's prefix sequence
+            llama_decision::engine eng(te.ctx, snap, 8);
+            const std::vector<llama_decision::field_input> fields = {
+                { "  \"a\": ", { "1", "2" } },
+                { "  \"b\": ", { "x", "y" } },
+            };
+            const auto seq_dump = [&]() {
+                std::vector<uint8_t> buf(llama_state_seq_get_size(te.ctx, snap));
+                const size_t n = llama_state_seq_get_data(te.ctx, buf.data(), buf.size(), snap);
+                buf.resize(n);
+                return buf;
+            };
+
+            llama_decision::options opt;
+            opt.fork      = "restore";
+            opt.cache_tag = "A";
+            const auto a1 = eng.decide_batch("system alpha", { "context" }, fields, opt);
+            const std::vector<uint8_t> kv_a = seq_dump();
+            opt.cache_tag = "B";
+            const auto b1 = eng.decide_batch("system beta", { "context" }, fields, opt);
+            const std::vector<uint8_t> kv_b = seq_dump();
+            opt.cache_tag = "A";
+            const auto a2 = eng.decide_batch("system alpha", { "context" }, fields, opt);
+            const std::vector<uint8_t> kv_a2 = seq_dump();
+
+            t.assert_true("the first A request misses", !a1.cache_hit);
+            t.assert_true("the B request misses", !b1.cache_hit);
+            t.assert_true("returning to A hits the bounded cache", a2.cache_hit);
+            if (kv_a == kv_b) {
+                t.skip("the two prefixes produce the same prefix KV on this model");
+                return;
+            }
+            t.assert_true("the cached A prefix is restored from A's own saved bytes", kv_a == kv_a2);
+
+            const auto & p1 = a1.items[0].fields[0].probs;
+            const auto & p2 = a2.items[0].fields[0].probs;
+            bool same = p1.size() == p2.size();
+            for (size_t k = 0; same && k < p1.size(); ++k) {
+                same = std::fabs(p1[k] - p2[k]) < 1e-6f;
+            }
+            t.assert_true("the cached A probabilities equal the first A probabilities", same);
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the prefix cache run: ") + e.what(), false);
+        }
+    });
+}
+
+// Baseline for the state-format work: a device-format sequence state must round-trip on the CPU
+// backend. The host dump is the reference because it is serialized in sequence cell order.
+static void test_device_state_round_trip(testing & t) {
+    t.test("a device sequence state round-trips on the CPU backend", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            const llama_vocab * vocab = llama_model_get_vocab(te.model);
+            const std::vector<llama_token> toks = common_tokenize(vocab, "the decision state", false, true);
+            if (toks.empty()) {
+                t.skip("the model has no usable tokens");
+                return;
+            }
+            llama_batch batch = llama_batch_init((int) toks.size(), 0, 1);
+            for (size_t i = 0; i < toks.size(); ++i) {
+                common_batch_add(batch, toks[i], (llama_pos) i, { 0 }, i + 1 == toks.size());
+            }
+            const int rc = llama_decode(te.ctx, batch);
+            llama_batch_free(batch);
+            if (rc != 0) {
+                t.assert_true("the prefix decodes on the CPU backend", false);
+                return;
+            }
+            llama_synchronize(te.ctx);
+
+            const auto host_dump = [&]() {
+                std::vector<uint8_t> buf(llama_state_seq_get_size(te.ctx, 0));
+                const size_t n = llama_state_seq_get_data(te.ctx, buf.data(), buf.size(), 0);
+                buf.resize(n);
+                return buf;
+            };
+            const std::vector<uint8_t> before = host_dump();
+            t.assert_true("the host state is non-empty", !before.empty());
+
+            const size_t dev_size = llama_state_seq_get_size_ext(te.ctx, 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+            t.assert_true("the device state has a size on the CPU backend", dev_size > 0);
+            std::vector<uint8_t> dev(dev_size);
+            const size_t ncopy = llama_state_seq_get_data_ext(te.ctx, dev.data(), dev.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+            t.assert_equal("the full device state is written", dev_size, ncopy);
+
+            llama_memory_clear(llama_get_memory(te.ctx), true);
+            const size_t nset = llama_state_seq_set_data_ext(te.ctx, dev.data(), dev.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+            t.assert_equal("the device state is restored in full", dev_size, nset);
+
+            const std::vector<uint8_t> after = host_dump();
+            t.assert_true("the restored state equals the saved state", before == after);
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the device round trip: ") + e.what(), false);
+        }
+    });
+}
+
+
+// The cache split adds one host save per miss and one device save per hit. On the generated model
+// cold prefill is about 3 ms and warm prefill about 0.5 ms; the hit must stay clearly cheaper than
+// a miss so the added refresh does not erase the cache win.
+static void test_prefix_cache_cost(testing & t) {
+    t.test("a cache hit prefills faster than a miss", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            llama_decision::engine eng(te.ctx, 2, 8);
+            const std::vector<llama_decision::field_input> fields = {
+                { "  \"a\": ", { "1", "2" } },
+                { "  \"b\": ", { "x", "y" } },
+            };
+            const auto time_prefill = [&](const std::string & tag) {
+                llama_decision::options opt;
+                opt.fork      = "restore";
+                opt.cache_tag = tag;
+                return eng.decide_batch("system cost", { "context" }, fields, opt).prefill_ms;
+            };
+            double miss_ms = std::numeric_limits<double>::max();
+            for (int i = 0; i < 3; ++i) {
+                miss_ms = std::min(miss_ms, time_prefill("cost-miss-" + std::to_string(i)));
+            }
+            double hit_ms = std::numeric_limits<double>::max();
+            for (int i = 0; i < 3; ++i) {
+                hit_ms = std::min(hit_ms, time_prefill("cost-hit"));
+            }
+            t.assert_true("the cache hit prefills faster than a miss (miss " + std::to_string(miss_ms) +
+                          " ms, hit " + std::to_string(hit_ms) + " ms)", hit_ms < miss_ms * 0.9);
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the prefix cache cost run: ") + e.what(), false);
+        }
+    });
+}
+
+
+// An arch whose output table has no per-id bias must still build a usable head: the kept zero
+// bias adds nothing, and the probe must not tighten into a failure.
+static void test_classifier_head_unbiased(testing & t) {
+    t.test("an unbiased output table still builds a usable answer head", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        std::vector<llama_decision::label> labels;
+        labels.push_back({ "A", 0 });
+        labels.push_back({ "B", 1 });
+        const auto head = llama_decision::build_classifier_head(te.model, labels);
+        if (!head.available()) {
+            t.skip("the generated model has no classifier output table: " + head.reason);
+            return;
+        }
+        t.assert_equal("the head covers both labels", (size_t) 2, head.ids.size());
+        t.assert_equal("the head width is the hidden width",
+                       (int) llama_model_n_embd_out(te.model), head.width);
+        t.assert_equal("an unbiased model keeps a bias vector", head.ids.size(), head.bias.size());
+        bool zeros = head.bias.size() == head.ids.size();
+        for (float v : head.bias) {
+            zeros = zeros && v == 0.0f;
+        }
+        t.assert_true("an unbiased model adds a zero bias", zeros);
+    });
+}
+
+
+// A bounded decision context rejects a request that cannot fit before decoding, with a clear
+// budget message, and keeps serving afterwards (no truncation, no KV residue).
+static void test_bounded_decision_context(testing & t) {
+    t.test("a request beyond the decision context budget is rejected, not truncated", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path, 256)) { // the smallest context the backend keeps (n_ctx is padded to 256)
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            llama_decision::engine eng(te.ctx, 2, 8);
+            const std::vector<llama_decision::field_input> fields = { { "  \"a\": ", { "1", "2" } } };
+            const auto ok = eng.decide_batch("sys", { "ctx" }, fields, llama_decision::options{});
+            t.assert_equal("a fitting request returns a decision", (size_t) 1, ok.items.size());
+
+            std::string big;
+            for (int i = 0; i < 64; ++i) {
+                big += "filler ";
+            }
+            bool threw = false;
+            std::string what;
+            try {
+                eng.decide_batch(big, { "ctx" }, fields, llama_decision::options{});
+            } catch (const llama_decision::capacity_error & e) {
+                threw = true;
+                what = e.what();
+            }
+            t.assert_true("an oversize request throws capacity_error", threw);
+            t.assert_true("the error names the context budget", what.find("context holds") != std::string::npos);
+
+            const auto again = eng.decide_batch("sys", { "ctx" }, fields, llama_decision::options{});
+            t.assert_equal("the context keeps serving after a rejected request", (size_t) 1, again.items.size());
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the bounded context run: ") + e.what(), false);
+        }
+    });
+}
+
+
+// A classifier-only context stops after the post-norm hidden state. That state must be identical
+// to the full context's hidden state for the same input, so the shared graph stop cannot change
+// what the answer rows are scored against.
+static void test_classifier_only_hidden_state(testing & t) {
+    t.test("a classifier-only context exposes the same hidden state as a full context", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te_full;
+        cpu_test_engine te_cls;
+        if (!te_full.load(path, 256, false, true) || !te_cls.load(path, 256, true, false)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        const auto decode_hidden = [](cpu_test_engine & te) {
+            const llama_vocab * vocab = llama_model_get_vocab(te.model);
+            const std::vector<llama_token> toks = common_tokenize(vocab, "the decision state", false, true);
+            if (toks.empty()) {
+                return std::vector<float>();
+            }
+            llama_batch batch = llama_batch_init((int) toks.size(), 0, 1);
+            for (size_t i = 0; i < toks.size(); ++i) {
+                common_batch_add(batch, toks[i], (llama_pos) i, { 0 }, i + 1 == toks.size());
+            }
+            const int rc = llama_decode(te.ctx, batch);
+            llama_batch_free(batch);
+            if (rc != 0) {
+                return std::vector<float>();
+            }
+            llama_synchronize(te.ctx);
+            const float * e = llama_get_embeddings_ith(te.ctx, (int) toks.size() - 1);
+            const uint32_t w = llama_model_n_embd_out(te.model);
+            if (e == nullptr) {
+                return std::vector<float>();
+            }
+            return std::vector<float>(e, e + w);
+        };
+        const auto h_full = decode_hidden(te_full);
+        const auto h_cls  = decode_hidden(te_cls);
+        if (h_full.empty() || h_cls.empty()) {
+            t.skip("the generated model does not expose both hidden-state paths");
+            return;
+        }
+        t.assert_equal("both hidden states have the output width", h_full.size(), h_cls.size());
+        bool same = h_full.size() == h_cls.size();
+        for (size_t i = 0; same && i < h_full.size(); ++i) {
+            same = std::fabs(h_full[i] - h_cls[i]) < 1e-5f;
+        }
+        t.assert_true("the classifier-only hidden state equals the full context's", same);
     });
 }
 
@@ -1744,7 +2481,7 @@ static void test_prefix_hoist_cache(testing & t) {
         }
         try {
             auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, 64);
+            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
             llama_decision::engine eng(te.ctx, 2, 8);
 
             common_json body1 = common_json::parse(jev_valid_body());
@@ -1755,8 +2492,8 @@ static void test_prefix_hoist_cache(testing & t) {
 
             llama_decision::letter_metrics m1;
             llama_decision::letter_metrics m2;
-            (void) llama_decision::letter_readout(eng, *vocab, nullptr, false, req1, pool, llama_decision::options{}, &m1);
-            (void) llama_decision::letter_readout(eng, *vocab, nullptr, false, req2, pool, llama_decision::options{}, &m2);
+            (void) llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req1, pool, llama_decision::options{}, &m1);
+            (void) llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req2, pool, llama_decision::options{}, &m2);
 
             t.assert_true("the shared head is at least 32 tokens", m1.shared_tokens >= 32);
             t.assert_true("the first request prefills", !m1.cache_hit);
@@ -1882,11 +2619,12 @@ static void test_policy_confidence(testing & t) {
 }
 
 static void test_head_capability(testing & t) {
-    t.test("head capability is resolved once and stays stable", [](testing & t) {
-        const auto & a = llama_decision::selected_head_capability();
-        const auto & b = llama_decision::selected_head_capability();
-        t.assert_true("capability is a single shared object", &a == &b);
-        t.assert_true("selected head is unavailable in this build", !a.available);
+    t.test("the head cache probes once per model and never throws", [](testing & t) {
+        llama_decision::answer_head_cache cache;
+        const auto & a = cache.probe(nullptr);
+        const auto & b = cache.probe(nullptr);
+        t.assert_true("the capability is a single cached object per model", &a == &b);
+        t.assert_true("no model means no head", !a.available);
         t.assert_true("a fallback reason is given", !a.reason.empty());
     });
 }
@@ -1931,12 +2669,7 @@ static void test_classifier_rows_lfm(testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
         const char * default_path = "/ai/models/gguf/liquidai/lfm2.5-2.6b-gguf/latest.gguf";
         if (path == nullptr || path[0] == '\0') path = default_path;
-        if (!file_exists(path)) {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
-            return;
-        }
-        if (!shared_model().load(path)) {
-            t.assert_true("model loads", false);
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         llama_model * model = shared_model().model;
@@ -1986,7 +2719,7 @@ static void test_head_fallback_equivalence(testing & t) {
         }
         try {
             auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, 64);
+            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
             llama_decision::engine eng(te.ctx, 2, 8);
             const auto req = llama_decision::parse_jev_request(common_json::parse(jev_valid_body()));
 
@@ -1994,13 +2727,13 @@ static void test_head_fallback_equivalence(testing & t) {
             oa.cache_tag = "head-auto";
             llama_decision::letter_metrics ma;
             llama_decision::answer_audit   aa;
-            const auto pa = llama_decision::letter_readout(eng, *vocab, nullptr, false, req, pool, oa, &ma, &aa);
+            const auto pa = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, oa, &ma, &aa);
 
             llama_decision::options of;
             of.cache_tag = "head-full";
             llama_decision::letter_metrics mf;
             llama_decision::answer_audit   af;
-            const auto pf = llama_decision::letter_readout(eng, *vocab, nullptr, false, req, pool, of, &mf, &af);
+            const auto pf = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf, &af);
 
             // Both runs read full logits here (the context exposes no hidden states), but they use
             // separate prefix caches, so a backend may reorder a reduction. The decisions, not the
@@ -2075,12 +2808,7 @@ static double total_variation(const std::vector<std::vector<float>> & a, const s
 static void test_selected_equivalence_lfm(testing & t) {
     t.test("selected answer head agrees with full logits on LFM2.5", [](testing & t) {
         const char * path = selected_test_model_path();
-        if (!file_exists(path)) {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
-            return;
-        }
-        if (!shared_model().load(path)) {
-            t.assert_true("model loads", false);
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te_full;
@@ -2093,7 +2821,7 @@ static void test_selected_equivalence_lfm(testing & t) {
         }
         try {
             auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te_full.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, 64);
+            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
             llama_decision::jev_request req = llama_decision::parse_jev_request(common_json::parse(jev_valid_body()));
 
             llama_decision::engine e_full(te_full.ctx, 2, 8);
@@ -2103,13 +2831,13 @@ static void test_selected_equivalence_lfm(testing & t) {
             llama_decision::options of;
             of.cache_tag = "sel-full";
             llama_decision::letter_metrics mf;
-            const auto pf = llama_decision::letter_readout(e_full, *vocab, nullptr, false, req, pool, of, &mf, nullptr);
+            const auto pf = llama_decision::letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf, nullptr);
 
             req.head = "selected";
             llama_decision::options oh;
             oh.cache_tag = "sel-head";
             llama_decision::letter_metrics mh;
-            const auto ph = llama_decision::letter_readout(e_head, *vocab, nullptr, false, req, pool, oh, &mh, nullptr);
+            const auto ph = llama_decision::letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh, nullptr);
 
             t.assert_true("the selected head was used", mh.head_active);
 
@@ -2136,15 +2864,123 @@ static void test_selected_equivalence_lfm(testing & t) {
     });
 }
 
+// Qwen2 is the supported arch that carries a real per-id output bias, so this is the model that
+// exercises the bias fidelity of the selected head against the full logits.
+static void test_selected_equivalence_qwen2(testing & t) {
+    t.test("selected head matches full logits with a Qwen2 output bias", [](testing & t) {
+        const char * path = selected_test_model_path();
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        char arch[64] = { 0 };
+        llama_model_meta_val_str(shared_model().model, "general.architecture", arch, sizeof(arch));
+        if (std::string(arch).rfind("qwen2", 0) != 0) {
+            t.skip("needs a Qwen2 model in LLAMA_DECISION_TEST_MODEL");
+            return;
+        }
+        test_engine te_full;
+        te_full.model = shared_model().model;
+        test_engine te_head;
+        te_head.model = shared_model().model;
+        if (!te_full.make_ctx(false) || !te_head.make_ctx(true)) {
+            t.assert_true("both contexts load", false);
+            return;
+        }
+        try {
+            auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te_full.model));
+            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
+            const auto head = llama_decision::build_classifier_head(te_full.model, pool);
+            t.assert_true("the Qwen2 head builds", head.available());
+            bool nonzero = false;
+            for (float v : head.bias) {
+                nonzero = nonzero || v != 0.0f;
+            }
+            t.assert_true("the head carries the model's output bias", nonzero);
+
+            llama_decision::jev_request req = llama_decision::parse_jev_request(common_json::parse(jev_valid_body()));
+            llama_decision::engine e_full(te_full.ctx, 2, 8);
+            llama_decision::engine e_head(te_head.ctx, 2, 8);
+
+            req.head = "full";
+            llama_decision::options of;
+            of.cache_tag = "q2-full";
+            llama_decision::letter_metrics mf;
+            const auto pf = llama_decision::letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf, nullptr);
+
+            req.head = "selected";
+            llama_decision::options oh;
+            oh.cache_tag = "q2-head";
+            llama_decision::letter_metrics mh;
+            const auto ph = llama_decision::letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh, nullptr);
+
+            t.assert_true("the selected head was used", mh.head_active);
+            bool winners = pf.size() == ph.size();
+            for (size_t qi = 0; winners && qi < pf.size(); ++qi) {
+                winners = pf[qi].size() == ph[qi].size() &&
+                          std::distance(pf[qi].begin(), std::max_element(pf[qi].begin(), pf[qi].end())) ==
+                          std::distance(ph[qi].begin(), std::max_element(ph[qi].begin(), ph[qi].end()));
+            }
+            t.assert_true("bias-corrected selected and full pick the same winner", winners);
+            const double tv = total_variation(pf, ph);
+            t.assert_true("bias-corrected scores agree within 5e-2 total variation (TV=" + std::to_string(tv) + ")", tv <= 5e-2);
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("Qwen2 selected equivalence: ") + e.what(), false);
+        }
+    });
+}
+
+// The answer-head cache is owned by the caller: the same (model, labels) must reuse one table, and
+// a rebuilt cache must reproduce the same decisions.
+static void test_answer_head_cache(testing & t) {
+    t.test("the answer-head cache builds once and rebuilds deterministically", [](testing & t) {
+        const char * path = selected_test_model_path();
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        te.model = shared_model().model;
+        if (!te.make_ctx(false)) {
+            t.assert_true("the context loads", false);
+            return;
+        }
+        try {
+            auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
+            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
+            const auto req = llama_decision::parse_jev_request(common_json::parse(jev_valid_body()));
+
+            llama_decision::answer_head_cache cache;
+            const auto & a = cache.for_labels(te.model, pool);
+            const auto & b = cache.for_labels(te.model, pool);
+            t.assert_true("the same model and labels reuse one table", &a == &b && a.rows.data() == b.rows.data());
+            t.assert_true("the capability probe is cached too",
+                          &cache.probe(te.model) == &cache.probe(te.model));
+
+            llama_decision::engine eng(te.ctx, 2, 8);
+            llama_decision::options opt;
+            opt.cache_tag = "head-cache";
+            const auto first = llama_decision::letter_readout(eng, cache, *vocab, nullptr, false, req, pool, opt, nullptr);
+
+            // a rebuilt cache must not change the decisions
+            llama_decision::answer_head_cache rebuilt;
+            const auto second = llama_decision::letter_readout(eng, rebuilt, *vocab, nullptr, false, req, pool, opt, nullptr);
+            bool equal = first.size() == second.size();
+            for (size_t qi = 0; equal && qi < first.size(); ++qi) {
+                equal = first[qi].size() == second[qi].size();
+                for (size_t k = 0; equal && k < first[qi].size(); ++k) {
+                    equal = std::fabs(first[qi][k] - second[qi][k]) < 1e-6f;
+                }
+            }
+            t.assert_true("a rebuilt cache gives identical decisions", equal);
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the head cache run: ") + e.what(), false);
+        }
+    });
+}
+
 static void test_classifier_only_readout(testing & t) {
     t.test("a classifier-only context uses the selected head and never silently reads logits", [](testing & t) {
         const char * path = selected_test_model_path();
-        if (!file_exists(path)) {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
-            return;
-        }
-        if (!shared_model().load(path)) {
-            t.assert_true("model loads", false);
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te;
@@ -2155,14 +2991,14 @@ static void test_classifier_only_readout(testing & t) {
         }
         try {
             auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, 64);
+            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
             llama_decision::engine eng(te.ctx, 2, 8);
             const auto req = llama_decision::parse_jev_request(common_json::parse(jev_valid_body()));
 
             llama_decision::options opt;
             opt.cache_tag = "co-readout";
             llama_decision::letter_metrics m;
-            const auto p = llama_decision::letter_readout(eng, *vocab, nullptr, false, req, pool, opt, &m, nullptr);
+            const auto p = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, opt, &m, nullptr);
             t.assert_true("the classifier context activates the selected head", m.head_active);
             t.assert_true("the readout reports its suffix accounting", m.suffix_tokens > 0);
             t.assert_equal("one probability vector per question", (size_t) req.questions.size(), p.size());
@@ -2191,8 +3027,7 @@ static void test_classifier_only_readout(testing & t) {
 static void test_selected_fallback_lfm(testing & t) {
     t.test("a requested head without hidden states falls back to full logits on LFM2.5", [](testing & t) {
         const char * path = selected_test_model_path();
-        if (!file_exists(path)) {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te;
@@ -2202,7 +3037,7 @@ static void test_selected_fallback_lfm(testing & t) {
         }
         try {
             auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, 64);
+            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
             llama_decision::jev_request req = llama_decision::parse_jev_request(common_json::parse(jev_valid_body()));
             llama_decision::engine eng(te.ctx, 2, 8);
 
@@ -2210,14 +3045,14 @@ static void test_selected_fallback_lfm(testing & t) {
             llama_decision::options of;
             of.cache_tag = "fb-full";
             llama_decision::letter_metrics mf;
-            const auto pf = llama_decision::letter_readout(eng, *vocab, nullptr, false, req, pool, of, &mf, nullptr);
+            const auto pf = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf, nullptr);
 
             // the model can serve selected rows, but this context exposes no hidden states
             req.head = "selected";
             llama_decision::options oh;
             oh.cache_tag = "fb-selected";
             llama_decision::letter_metrics mh;
-            const auto ph = llama_decision::letter_readout(eng, *vocab, nullptr, false, req, pool, oh, &mh, nullptr);
+            const auto ph = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh, nullptr);
 
             t.assert_true("the head did not activate", !mh.head_active);
             t.assert_true("a fallback reason is reported", !mh.head_reason.empty());
@@ -2263,8 +3098,7 @@ static void test_selected_explicit_error(testing & t) {
 
         // the next auto request on a real model is unaffected by the rejected one
         const char * path = selected_test_model_path();
-        if (!file_exists(path)) {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te;
@@ -2274,12 +3108,12 @@ static void test_selected_explicit_error(testing & t) {
         }
         try {
             auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, 64);
+            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
             llama_decision::jev_request req = llama_decision::parse_jev_request(common_json::parse(jev_valid_body()));
             llama_decision::engine eng(te.ctx, 2, 8);
             llama_decision::options o;
             o.cache_tag = "after-error";
-            const auto p = llama_decision::letter_readout(eng, *vocab, nullptr, false, req, pool, o, nullptr, nullptr);
+            const auto p = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, o, nullptr, nullptr);
             t.assert_equal("auto still answers every question", req.questions.size(), p.size());
         } catch (const std::exception & e) {
             t.assert_true(std::string("auto after error: ") + e.what(), false);
@@ -2301,7 +3135,7 @@ static void test_permutations_real(testing & t) {
         }
         try {
             auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, 64);
+            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
             llama_decision::engine eng(te.ctx, 2, 8);
 
             common_json one = common_json::parse(jev_valid_body());
@@ -2312,11 +3146,11 @@ static void test_permutations_real(testing & t) {
 
             llama_decision::options o;
             o.cache_tag = "perm";
-            const auto p1  = llama_decision::letter_readout(eng, *vocab, nullptr, false,
+            const auto p1  = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
                                                             llama_decision::parse_jev_request(one), pool, o, nullptr, nullptr);
-            const auto p2  = llama_decision::letter_readout(eng, *vocab, nullptr, false,
+            const auto p2  = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
                                                             llama_decision::parse_jev_request(two), pool, o, nullptr, nullptr);
-            const auto p2b = llama_decision::letter_readout(eng, *vocab, nullptr, false,
+            const auto p2b = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
                                                             llama_decision::parse_jev_request(two), pool, o, nullptr, nullptr);
 
             bool det = p2.size() == p2b.size();
@@ -2351,9 +3185,9 @@ static void test_permutations_real(testing & t) {
                 body["permutations"] = 2;
                 return body;
             };
-            const auto p_ab = llama_decision::letter_readout(eng, *vocab, nullptr, false,
+            const auto p_ab = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
                                                              llama_decision::parse_jev_request(make_pair(false)), pool, o, nullptr, nullptr);
-            const auto p_ba = llama_decision::letter_readout(eng, *vocab, nullptr, false,
+            const auto p_ba = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
                                                              llama_decision::parse_jev_request(make_pair(true)), pool, o, nullptr, nullptr);
             const double bill_a = p_ab[0][0]; // billing first
             const double bill_b = p_ba[0][1]; // billing second
@@ -2436,7 +3270,7 @@ static void test_verify_letter_request(testing & t) {
     t.test("the tokenizer gate rejects a merged answer label and names the question", [](testing & t) {
         const auto req = llama_decision::parse_jev_request(common_json::parse(jev_valid_body()));
         const fake_vocab good = make_fake_vocab(true);
-        const auto pool = llama_decision::build_label_pool(good, 8);
+        const auto pool = llama_decision::build_label_pool(good, "", 8);
 
         llama_decision::verify_letter_request(good, "", req, pool); // must not throw
         t.assert_true("clean vocabulary passes", true);
@@ -2460,7 +3294,7 @@ static void test_verify_letter_request(testing & t) {
     t.test("the vocabulary probe refuses a pool that cannot sit on the boundary", [](testing & t) {
         fake_vocab merged = make_fake_vocab(true);
         merged.pieces.push_back("\nA");
-        const auto pool = llama_decision::build_label_pool(merged, 8);
+        const auto pool = llama_decision::build_label_pool(merged, "", 8);
         bool threw = false;
         try {
             llama_decision::verify_label_pool(merged, pool, "Answer:\n");
@@ -2485,13 +3319,13 @@ static void test_letter_audit_real(testing & t) {
         }
         try {
             auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, 64);
+            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
             llama_decision::engine eng(te.ctx, 2, 8);
             const auto req = llama_decision::parse_jev_request(common_json::parse(jev_valid_body()));
 
             llama_decision::letter_metrics metrics;
             llama_decision::answer_audit   audit;
-            const auto probs = llama_decision::letter_readout(eng, *vocab, nullptr, false, req, pool,
+            const auto probs = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool,
                                                               llama_decision::options{}, &metrics, &audit);
 
             t.assert_equal("prompt hash is a sha256", (size_t) 64, audit.prompt_sha256.size());
@@ -2602,7 +3436,7 @@ static llama_decision::jev_question calibration_choice_question(const std::strin
 
 static common_json calibration_dedup_measurement() {
     const fake_vocab v  = make_fake_vocab(true);
-    const auto       pool = llama_decision::build_label_pool(v, 64);
+    const auto       pool = llama_decision::build_label_pool(v, "", 64);
     const std::string after = "\n";
     const int        n = 250;
 
@@ -2733,7 +3567,8 @@ static common_json calibration_selected_head_measurement() {
 
     common_json out = common_json::object();
     out["source_hits"]     = count_tokens_in_decision_sources({ "classifier_rows", "llama_get_embeddings" });
-    out["available"]       = llama_decision::selected_head_capability().available;
+    llama_decision::answer_head_cache cache;
+    out["available"]       = cache.probe(nullptr).available; // no model loaded: the head path stays off
     out["production_gate"] = false;
     out["cases"]           = (int) cases.size();
     out["precision"]       = (tp + fp) ? (double) tp / (tp + fp) : 1.0;
@@ -2867,14 +3702,14 @@ static common_json calibration_model_measurement(const char * path) {
 
     // temperature changes the distribution shape but keeps the winner; NLL(winner) is recorded
     auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-    const auto pool = llama_decision::build_label_pool(*vocab, 64);
+    const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
     auto readout = [&](double temp) {
         common_json body = common_json::parse(jev_valid_body());
         body["temperature"] = temp;
         body.erase("temperatures");
         llama_decision::options ro;
         ro.cache_tag = "cal-temp";
-        return llama_decision::letter_readout(eng, *vocab, nullptr, false, llama_decision::parse_jev_request(body), pool, ro, nullptr);
+        return llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, llama_decision::parse_jev_request(body), pool, ro, nullptr);
     };
     const auto p10 = readout(1.0);
     const auto p13 = readout(1.3);
@@ -2936,12 +3771,7 @@ static void test_calibration_selected_head(testing & t) {
 static void test_calibration_selected_head_lfm(testing & t) {
     t.test("calibration: selected head fires on LFM2 and agrees with full logits", [](testing & t) {
         const char * path = selected_test_model_path();
-        if (!file_exists(path)) {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
-            return;
-        }
-        if (!shared_model().load(path)) {
-            t.assert_true("model loads", false);
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te_full;
@@ -2955,17 +3785,16 @@ static void test_calibration_selected_head_lfm(testing & t) {
 
         try {
             auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te_full.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, 64);
+            const std::string tail = "\nAnswer:\n";
+            const auto pool = llama_decision::build_label_pool(*vocab, tail, 64);
             t.assert_equal("the label pool holds 64 labels", 64, (int) pool.size());
 
-            const std::string tail = "\nAnswer:\n";
             bool clean = true;
             for (const auto & l : pool) {
-                clean = clean && llama_decision::single_token(*vocab, l.text) == l.token &&
-                        vocab->piece(l.token) == l.text &&
+                clean = clean && llama_decision::answer_label_token(*vocab, tail, l.text) == l.token &&
                         llama_decision::check_boundary(*vocab, tail, l.text, l.token);
             }
-            t.assert_true("every label is single-token and round-trips", clean);
+            t.assert_true("every label resolves at the boundary", clean);
 
             const auto head = llama_decision::build_classifier_head(shared_model().model, pool);
             t.assert_true("the head table builds on LFM2", head.available());
@@ -2988,7 +3817,8 @@ static void test_calibration_selected_head_lfm(testing & t) {
             t.assert_equal("an out-of-range id is rejected",
                            0, llama_model_classifier_rows(shared_model().model, bad.data(), 2, bad_rows.data(),
                                                          bad_rows.size(), &bad_softcap, nullptr));
-            t.assert_true("no model means no head", !llama_decision::probe_selected_head(nullptr).available);
+            llama_decision::answer_head_cache probe_cache;
+            t.assert_true("no model means no head", !probe_cache.probe(nullptr).available);
 
             // 250 scored pairs: one 64-option question plus 31 six-option questions
             common_json body = common_json::object();
@@ -3027,7 +3857,7 @@ static void test_calibration_selected_head_lfm(testing & t) {
             of.cache_tag = "cal-full";
             of.optimize  = false; // isolate the projection: the suffix hoist changes batch numerics
             llama_decision::letter_metrics mf;
-            const auto pf = llama_decision::letter_readout(e_full, *vocab, nullptr, false, rfull, pool, of, &mf, nullptr);
+            const auto pf = llama_decision::letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, rfull, pool, of, &mf, nullptr);
 
             llama_decision::jev_request rhead = req;
             rhead.head = "selected";
@@ -3035,7 +3865,7 @@ static void test_calibration_selected_head_lfm(testing & t) {
             oh.cache_tag = "cal-head";
             oh.optimize  = false;
             llama_decision::letter_metrics mh;
-            const auto ph = llama_decision::letter_readout(e_head, *vocab, nullptr, false, rhead, pool, oh, &mh, nullptr);
+            const auto ph = llama_decision::letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, rhead, pool, oh, &mh, nullptr);
 
             t.assert_true("the head fires on LFM2", mh.head_active);
 
@@ -3207,83 +4037,40 @@ static void test_calibration_table(testing & t) {
     });
 }
 
-static void test_bench_env(testing & t) {
-    t.test("bench environment file carries provenance and matches calibration flags", [](testing & t) {
-        const std::string bench_path = std::string(DECISION_TEST_BASELINE_DIR) + "/bench-env.json";
-        const std::string cal_path   = std::string(DECISION_TEST_BASELINE_DIR) + "/calibration.json";
-        if (!file_exists(bench_path)) {
-            t.assert_true("bench-env.json exists", false);
+// The provenance of the readout must be identical at both call sites (temperature validation and
+// response diagnostics), so it is one function of the live params and model.
+static void test_decision_provenance(testing & t) {
+    t.test("decision provenance is one function of the live params and model", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
             return;
         }
-        const common_json bench = common_json::parse(read_file(bench_path));
-        const common_json cal   = common_json::parse(read_file(cal_path));
-        // git revision must be present
-        bool has_rev = bench.contains("git_rev") || bench.contains("git_rev_synthesis");
-        t.assert_true("bench env has git_rev", has_rev);
-        if (has_rev) {
-            std::string rev = bench.contains("git_rev") ? bench.at("git_rev").get<std::string>()
-                                                        : bench.at("git_rev_synthesis").get<std::string>();
-            t.assert_true("git_rev is 40 hex", rev.size() == 40);
-        }
-        // backend flags must match calibration environment
-        const auto & cal_flags = cal.at("model_measurements").at("environment").at("backend_flags");
-        common_json bench_flags;
-        if (bench.contains("environment") && bench.at("environment").contains("backend_flags")) {
-            bench_flags = bench.at("environment").at("backend_flags");
-        } else if (bench.contains("backend_flags")) {
-            bench_flags = bench.at("backend_flags");
-        } else {
-            t.assert_true("bench env has backend_flags", false);
+        cpu_test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
             return;
         }
-        for (const auto & e : cal_flags.items()) {
-            const std::string & k = e.key();
-            t.assert_true("bench flags contain " + k, bench_flags.contains(k));
-            if (bench_flags.contains(k)) {
-                t.assert_equal("flag " + k + " matches calibration", e.value().dump(), bench_flags.at(k).dump());
-            }
-        }
-    });
-}
+        common_params params;
+        params.model.path   = path;
+        params.n_ubatch     = 128;
+        params.cache_type_k = GGML_TYPE_F16;
+        params.cache_type_v = GGML_TYPE_F16;
+        params.kv_unified   = true;
 
-static void test_bench_env_lfm(testing & t) {
-    t.test("bench environment covers LFM2.5 2.6B and 350M with model hash", [](testing & t) {
-        const std::string bench_path = std::string(DECISION_TEST_BASELINE_DIR) + "/bench-env.json";
-        if (!file_exists(bench_path)) {
-            t.assert_true("bench-env.json exists", false);
-            return;
-        }
-        const common_json bench = common_json::parse(read_file(bench_path));
-        t.assert_true("bench has git_rev", bench.contains("git_rev") || bench.contains("git_rev_synthesis"));
-        if (bench.contains("models")) {
-            const auto & models = bench.at("models");
-            bool has_350 = false, has_26 = false;
-            for (const auto & e : models.items()) {
-                const std::string key = e.key();
-                if (key.find("350M") != std::string::npos) has_350 = true;
-                if (key.find("2.6B") != std::string::npos) has_26 = true;
-                const auto & entry = e.value();
-                t.assert_true("model " + key + " has hash", entry.contains("hash") || entry.contains("model_hash") || entry.contains("gguf_hash"));
-                std::string h;
-                if (entry.contains("hash")) h = entry.at("hash").get<std::string>();
-                else if (entry.contains("model_hash")) h = entry.at("model_hash").get<std::string>();
-                else if (entry.contains("gguf_hash")) h = entry.at("gguf_hash").get<std::string>();
-                t.assert_true("hash looks like SHA256 " + key, h.rfind("SHA256=", 0) == 0 && h.size() >= 64);
-                t.assert_true("model " + key + " has bytes", entry.contains("bytes") || entry.contains("model_bytes"));
-                t.assert_true("model " + key + " has quant", entry.contains("quant") || entry.contains("quantization"));
-            }
-            t.assert_true("bench models covers 350M", has_350);
-            t.assert_true("bench models covers 2.6B", has_26);
-        } else {
-            bool has_hash = bench.contains("model_hash") || bench.contains("model_2_6b_hash") || bench.contains("hash");
-            t.assert_true("bench has model hash for 2.6B path", has_hash);
-            // fallback check for explicit 2.6B keys
-            bool has_26 = bench.contains("model_2_6b_hash") || bench.contains("gguf_2_6b_hash") || (bench.contains("environment") && bench.at("environment").contains("model_2_6b"));
-            if (!bench.contains("models")) {
-                // require models object
-                t.assert_true("bench has models object for LFM 2.6B", false);
-            }
-        }
+        const auto a = llama_decision::decision_provenance_current("m", params, te.model, nullptr, false);
+        const auto b = llama_decision::decision_provenance_current("m", params, te.model, nullptr, false);
+        t.assert_equal("model is stable", a.model, b.model);
+        t.assert_equal("quantization is stable", a.quantization, b.quantization);
+        t.assert_equal("template hash is stable", a.template_hash, b.template_hash);
+        t.assert_equal("backend flags are stable", a.backend_flags, b.backend_flags);
+        t.assert_true("the quantization is non-empty", !a.quantization.empty());
+
+        // the backend flags follow the params, so both call sites see the same backend identity
+        common_params other = params;
+        other.n_ubatch = 256;
+        const auto c = llama_decision::decision_provenance_current("m", other, te.model, nullptr, false);
+        t.assert_true("backend flags follow the params", a.backend_flags != c.backend_flags);
     });
 }
 
@@ -3389,10 +4176,10 @@ static int write_jev_golden(const char * model_path) {
         return 2;
     }
     auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-    const auto pool = llama_decision::build_label_pool(*vocab, 64);
+    const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
     llama_decision::engine eng(te.ctx, 2, 8);
     const auto req = llama_decision::parse_jev_request(common_json::parse(jev_valid_body()));
-    const auto probs = llama_decision::letter_readout(eng, *vocab, nullptr, false, req, pool, llama_decision::options{}, nullptr);
+    const auto probs = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, llama_decision::options{}, nullptr);
     common_json usage = common_json::object();
     usage["input_tokens"]    = 0;
     usage["output_tokens"]   = 0;
@@ -3437,6 +4224,8 @@ int main(int argc, char ** argv) {
         test_jev_assemble(t);
         test_jev_values_golden(t);
         test_softmax(t);
+        test_score_answer_rows(t);
+        test_saved_state_format_dispatch(t);
         test_prefix_tag(t);
         test_question_temperature(t);
         test_temperature_effect(t);
@@ -3445,10 +4234,19 @@ int main(int argc, char ** argv) {
         test_letter_suffix(t);
         test_label_pool(t);
         test_boundary(t);
+        test_answer_label_token(t);
         test_safe_data(t);
         test_label_pool_real(t);
+        test_letter_labels_spm(t);
+        test_label_boundary_calibration(t);
         test_letter_readout_real(t);
         test_fork_real(t);
+        test_prefix_lru_restores_own_state(t);
+        test_device_state_round_trip(t);
+        test_prefix_cache_cost(t);
+        test_classifier_head_unbiased(t);
+        test_bounded_decision_context(t);
+        test_classifier_only_hidden_state(t);
         test_prefix_cache_coherence(t);
         test_token_cache(t);
         test_prefix_reuse(t);
@@ -3470,6 +4268,8 @@ int main(int argc, char ** argv) {
         test_classifier_rows_lfm(t);
         test_head_fallback_equivalence(t);
         test_selected_equivalence_lfm(t);
+        test_selected_equivalence_qwen2(t);
+        test_answer_head_cache(t);
         test_classifier_only_readout(t);
         test_selected_fallback_lfm(t);
         test_selected_explicit_error(t);
@@ -3484,8 +4284,7 @@ int main(int argc, char ** argv) {
         test_calibration_selected_head(t);
         test_calibration_selected_head_lfm(t);
         test_calibration_table(t);
-        test_bench_env(t);
-        test_bench_env_lfm(t);
+        test_decision_provenance(t);
         test_calibration_model(t);
         test_engine_integration(t);
     });

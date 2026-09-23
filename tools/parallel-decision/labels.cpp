@@ -50,19 +50,25 @@ std::unique_ptr<label_vocab> make_llama_label_vocab(const llama_vocab * vocab) {
     return std::make_unique<llama_label_vocab>(vocab);
 }
 
-int32_t single_token(const label_vocab & vocab, const std::string & text) {
-    const std::vector<int32_t> ids = vocab.tokenize(text, false);
-    if (ids.size() != 1) {
+int32_t answer_label_token(const label_vocab & vocab, const std::string & tail, const std::string & text) {
+    const std::vector<int32_t> with_text = vocab.tokenize(tail + text, true);
+    const std::vector<int32_t> tail_only = vocab.tokenize(tail, true);
+    if (with_text.size() != tail_only.size() + 1) {
         return -1;
     }
-    const int32_t id = ids[0];
-    if (vocab.is_special(id) || vocab.piece(id) != text) {
+    for (size_t i = 0; i < tail_only.size(); ++i) {
+        if (with_text[i] != tail_only[i]) {
+            return -1;
+        }
+    }
+    const int32_t token = with_text.back();
+    if (vocab.is_special(token)) {
         return -1;
     }
-    return id;
+    return token;
 }
 
-std::vector<label> build_label_pool(const label_vocab & vocab, size_t cap) {
+std::vector<label> build_label_pool(const label_vocab & vocab, const std::string & tail, size_t cap) {
     std::vector<std::string> candidates;
     for (char a = 'A'; a <= 'Z'; ++a) {
         candidates.push_back(std::string(1, a));
@@ -75,7 +81,7 @@ std::vector<label> build_label_pool(const label_vocab & vocab, size_t cap) {
 
     std::vector<label> pool;
     for (const std::string & text : candidates) {
-        const int32_t token = single_token(vocab, text);
+        const int32_t token = answer_label_token(vocab, tail, text);
         if (token < 0) {
             continue;
         }
@@ -105,17 +111,7 @@ bool check_boundary(const label_vocab & vocab,
                     const std::string & prompt,
                     const std::string & label,
                     int32_t label_token) {
-    const std::vector<int32_t> with_label    = vocab.tokenize(prompt + label, true);
-    const std::vector<int32_t> without_label = vocab.tokenize(prompt, true);
-    if (with_label.size() != without_label.size() + 1) {
-        return false;
-    }
-    for (size_t i = 0; i < without_label.size(); ++i) {
-        if (with_label[i] != without_label[i]) {
-            return false;
-        }
-    }
-    return with_label.back() == label_token;
+    return answer_label_token(vocab, prompt, label) == label_token;
 }
 
 std::string safe_data(const std::string & text) {

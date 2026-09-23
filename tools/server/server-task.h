@@ -495,7 +495,7 @@ struct server_task_result_error : server_task_result {
     virtual json to_json() override;
 };
 
-// used by /metrics API
+// the /v1/decision response payload
 struct server_task_result_decision : server_task_result {
     json data;
 
@@ -504,6 +504,7 @@ struct server_task_result_decision : server_task_result {
     }
 };
 
+// used by /metrics API
 struct server_task_result_metrics : server_task_result {
     // these are immediate stats, not accumulated (server_metrics is cumulative)
     int n_processing_slots = 0;

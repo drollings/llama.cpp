@@ -177,18 +177,22 @@ def run_checks(server, captured):
     payload = json.loads(text)
     check(payload["error"]["code"] == 422, "semantic error code 422")
 
-    # 3b. head: an explicit selected request falls back to full logits when the serving context
-    #     cannot expose hidden states (the shared chat context does not), and reports why. Only an
-    #     incompatible model is a client error; auto/full serve normally.
+    # 3b. head: an explicit selected request is a client error (400) when the model cannot expose a
+    #     plain answer head, and otherwise is served (selected) or falls back to full logits when
+    #     the serving context cannot expose hidden states, reporting why. The model family decides
+    #     which branch applies, so both are accepted; the refusal branch is still asserted.
     selected = dict(JEV_VALID)
     selected["head"] = "selected"
     status, text = server.post("/v1/decision", json.dumps(selected))
-    check(status == 200, f"explicit selected head status {status}: {text}")
-    selected_body = json.loads(text)
-    check(selected_body["head"]["mode"] in ("selected", "full"), "selected head mode reported")
-    if selected_body["head"]["mode"] == "full":
-        check(selected_body["head"]["fallback"] is True, "selected fallback is reported")
-        check(bool(selected_body["head"].get("reason")), "selected fallback reason is reported")
+    if status == 400:
+        check("not available" in text, f"selected head refusal names the reason: {text}")
+    else:
+        check(status == 200, f"explicit selected head status {status}: {text}")
+        selected_body = json.loads(text)
+        check(selected_body["head"]["mode"] in ("selected", "full"), "selected head mode reported")
+        if selected_body["head"]["mode"] == "full":
+            check(selected_body["head"]["fallback"] is True, "selected fallback is reported")
+            check(bool(selected_body["head"].get("reason")), "selected fallback reason is reported")
 
     full = dict(JEV_VALID)
     full["head"] = "full"

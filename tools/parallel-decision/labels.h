@@ -3,7 +3,7 @@
 // Answer-label handling for scored decision readouts.
 //
 // A label is one alphabetic answer ("A".."Z", "AA".."ZZ") that must map to a
-// single token in the model vocabulary and survive a text round-trip. The
+// single token at the assistant-answer boundary in the model vocabulary. The
 // tokenizer is abstracted so the pool and boundary logic can be unit tested
 // without a model.
 
@@ -31,12 +31,16 @@ struct label {
 // Adapter over a llama.cpp vocabulary. Owns nothing; the vocab must outlive it.
 std::unique_ptr<label_vocab> make_llama_label_vocab(const llama_vocab * vocab);
 
-// The token for `text` when it is a usable single label, else -1.
-int32_t single_token(const label_vocab & vocab, const std::string & text);
+// The token the model emits for `text` at the answer boundary `tail`, else -1. The label is the
+// single extra token of tokenize(tail + text) when the tokens before it equal tokenize(tail) and
+// that token is non-special. This is the only correct authority for a label token: a
+// SentencePiece vocabulary may resolve the isolated form to a different token than the one the
+// model emits after the framed tail.
+int32_t answer_label_token(const label_vocab & vocab, const std::string & tail, const std::string & text);
 
-// A-Z then AA-ZZ, kept only when single-token, round-tripping, unique and
-// non-special; at most `cap` labels. Throws std::runtime_error if fewer than 2.
-std::vector<label> build_label_pool(const label_vocab & vocab, size_t cap = 64);
+// A-Z then AA-ZZ, kept only when the boundary resolution yields a unique, non-special token; at
+// most `cap` labels. Throws std::runtime_error if fewer than 2.
+std::vector<label> build_label_pool(const label_vocab & vocab, const std::string & tail, size_t cap = 64);
 
 // True when encode(prompt + label) equals encode(prompt) followed by exactly
 // `label_token`. A false result means the scored slot would sit on a different

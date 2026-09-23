@@ -2558,6 +2558,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         ).set_env("LLAMA_ARG_DECISION_SEQS").set_examples({LLAMA_EXAMPLE_SERVER}));
         add_opt(common_arg(
+            {"--decision-ctx-size"}, "N",
+            string_format("context size for the classifier-only decision context; a request that does not fit returns 422 (default: %d = the model's n_ctx)", params.n_ctx_decision),
+            [](common_params & params, int value) {
+                if (value != 0 && value < 3) {
+                    throw std::invalid_argument("--decision-ctx-size needs at least 3 (cached prefix, trunk, one branch)");
+                }
+                params.n_ctx_decision = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_CTX_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
             {"--decision-temperature"}, "F",
             "JSON file with calibrated decision temperatures and provenance; refused if the provenance does not match",
             [](common_params & params, const std::string & value) {

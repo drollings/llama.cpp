@@ -12,6 +12,8 @@
 #include <utility>
 #include <vector>
 
+struct common_params;
+
 namespace llama_decision {
 
 // Bump when the letter prompt layout changes; it is part of the prefix cache identity.
@@ -22,8 +24,24 @@ inline constexpr const char * LETTER_PROMPT_VERSION = "letter-v1";
 // means the calibration is stale and the decision path must refuse it.
 std::string decision_contract_hash(const std::string & model_name, const std::string & template_hash, int vocab_size);
 
+// Quantization label of the loaded model: the general.quantization_version / file_type / type
+// metadata, falling back to the model file name. Shared by the provenance helper and the bench.
+std::string decision_quantization(const llama_model * model, const std::string & fallback_path);
+
+// Provenance of the decision readout running now: model identity, quantization, prompt template
+// hash, and backend flags. Derived from the live params and model so the temperature validation
+// and the response diagnostics cannot drift apart.
+temperature_provenance decision_provenance_current(const std::string & model_name,
+                                                   const common_params & params,
+                                                   const llama_model * model,
+                                                   const common_chat_templates * tmpls, bool use_jinja);
+
 // The fixed system instruction used by the letter readout.
 const char * letter_system_text();
+
+// The assistant-answer tail a label follows: `after` plus the fixed "Answer:\n" marker. One
+// definition, so the framer, the per-request gate and the server cannot drift apart.
+std::string letter_answer_tail(const std::string & after);
 
 struct letter_metrics {
     bool   cache_hit      = false;
@@ -71,11 +89,6 @@ struct head_capability {
     std::string reason;
 };
 
-// The selected-head fast path is only usable when the model exposes a plain, contiguous output
-// tensor whose rows can be dequantized. This probes that once for a loaded model; it never
-// changes the model and never throws.
-head_capability probe_selected_head(const llama_model * model);
-
 // Dequantizes the answer rows for `labels` into an FP32 table the scorer can dot against the
 // post-norm hidden state. Never throws: an unusable table comes back with width 0 and a reason.
 classifier_head build_classifier_head(const llama_model * model, const std::vector<label> & labels);
@@ -84,11 +97,37 @@ classifier_head build_classifier_head(const llama_model * model, const std::vect
 // serve it. The default paths ("auto"/"full") never throw here and always fall back.
 void require_selected_head(const std::string & requested, const head_capability & cap);
 
-const head_capability & selected_head_capability();
+// Caller-owned cache for the model-derived answer-head tables. The tables are pure functions of
+// (model, label tokens), so one cache per loaded model spares each request the GPU-to-host
+// dequantization. Non-copyable and not thread-safe by contract: the owner serializes calls, and
+// the owner must outlive the model it caches.
+class answer_head_cache {
+public:
+    answer_head_cache() = default;
+    answer_head_cache(const answer_head_cache &) = delete;
+    answer_head_cache & operator=(const answer_head_cache &) = delete;
 
-// Startup vocabulary probe: every pooled label must be one shared token that round-trips and sits
-// on a clean prompt boundary. Throws std::runtime_error with a clear reason when it does not, so
-// the caller can refuse the letter path instead of scoring a merged token.
+    // Capability probe for a model. Always returns a value: an unusable output table comes back
+    // with `available == false` and a reason. Never throws.
+    const head_capability & probe(const llama_model * model);
+
+    // Answer-row table for `labels`, built once per (model, label tokens). Never throws.
+    const classifier_head & for_labels(const llama_model * model, const std::vector<label> & labels);
+
+private:
+    bool                     cap_set_   = false;
+    const llama_model *      cap_model_ = nullptr;
+    head_capability          capability_;
+    bool                     head_set_   = false;
+    const llama_model *      head_model_ = nullptr;
+    std::vector<llama_token> head_ids_;
+    classifier_head          head_;
+};
+
+// Startup vocabulary probe: every pooled label must be the single non-special token the answer
+// tail produces, so the scored slot sits on a clean prompt boundary. Throws std::runtime_error
+// with a clear reason when it does not, so the caller can refuse the letter path instead of
+// scoring a merged token.
 void verify_label_pool(const label_vocab & vocab, const std::vector<label> & labels, const std::string & tail);
 
 // Per-request tokenizer gate: the same boundary check applied to the labels the request actually
@@ -100,6 +139,7 @@ void verify_letter_request(const label_vocab & vocab, const std::string & tail,
 // semantic_error when a question needs more labels than the pool provides.
 // When `audit` is non-null the per-question diagnostics are filled in.
 std::vector<std::vector<float>> letter_readout(engine & eng,
+                                               answer_head_cache & head_cache,
                                                const label_vocab & vocab,
                                                const common_chat_templates * tmpls, bool use_jinja,
                                                const jev_request & req,

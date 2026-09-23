@@ -864,6 +864,7 @@ public:
     llama_context *                             decision_letter_engine_ctx = nullptr;
     std::unique_ptr<llama_decision::label_vocab> decision_label_vocab; // letter readout, built once per context
     std::vector<llama_decision::label>          decision_labels;
+    llama_decision::answer_head_cache           decision_head_cache; // owns the answer-row tables for this context
     std::string                                 decision_label_error; // set when the vocabulary probe fails
     // Classifier-only context for the letter readout: shares the model weights, produces hidden
     // states instead of logits, and is created on first use. Null means the letter path keeps
@@ -2411,12 +2412,19 @@ private:
         if (ctx_decision == nullptr && ctx_decision_error.empty()) {
             llama_context_params cp = common_context_params_to_llama(params_base);
             cp.classifier_only = true;
+            // this context serves only the decision engine, so it needs no chat slots and can be
+            // bounded independently of the chat context
+            cp.n_seq_max = params_base.n_seq_decision;
+            if (params_base.n_ctx_decision > 0) {
+                cp.n_ctx = params_base.n_ctx_decision;
+            }
             ctx_decision = llama_init_from_model(model_tgt, cp);
             if (ctx_decision == nullptr) {
                 ctx_decision_error = "the classifier-only decision context could not be created";
                 SRV_WRN("%s; the letter readout falls back to full logits\n", ctx_decision_error.c_str());
             } else {
-                SRV_INF("%s", "decision classifier-only context created: hidden-state readout enabled\n");
+                SRV_INF("decision classifier-only context created: %u cells, %d sequences\n",
+                        llama_n_ctx(ctx_decision), params_base.n_seq_decision);
             }
         }
         return ctx_decision;
@@ -2440,8 +2448,8 @@ private:
             llama_decision::jev_request req = llama_decision::parse_jev_request(body);
             // An explicit request for an unavailable fast path is the only head case that errors;
             // the default path always falls back to full logits.
-            const llama_decision::head_capability head_cap =
-                llama_decision::probe_selected_head(llama_get_model(ctx_tgt));
+            const llama_decision::head_capability & head_cap =
+                decision_head_cache.probe(llama_get_model(ctx_tgt));
             llama_decision::require_selected_head(req.head, head_cap);
             // Prefer the classifier-only context: it turns the readout into a handful of answer-row
             // dots instead of a full-vocabulary projection. A request that forces "full" needs
@@ -2451,19 +2459,24 @@ private:
             if (ctx_readout == nullptr) {
                 ctx_readout = ctx_tgt;
             }
+            // the shared context keeps its chat slots below the decision sequences; the classifier
+            // context has no slots, so its decision sequences start at zero
+            const llama_seq_id readout_seq_base = ctx_readout == ctx_decision
+                ? 0 : (llama_seq_id) params_base.n_parallel;
             if (decision_letter_engine_ctx != ctx_readout) {
                 decision_letter_engine = std::make_unique<llama_decision::engine>(
-                    ctx_readout, (llama_seq_id) params_base.n_parallel, params_base.n_seq_decision);
+                    ctx_readout, readout_seq_base, params_base.n_seq_decision);
                 decision_letter_engine_ctx = ctx_readout;
             }
             if (!decision_label_vocab) {
                 decision_label_vocab = llama_decision::make_llama_label_vocab(
                     llama_model_get_vocab(llama_get_model(ctx_tgt)));
                 try {
-                    decision_labels = llama_decision::build_label_pool(*decision_label_vocab);
                     const auto parts = llama_decision::render_letter_prompt(
                         chat_params.tmpls.get(), chat_params.use_jinja, llama_decision::letter_system_text());
-                    llama_decision::verify_label_pool(*decision_label_vocab, decision_labels, parts.second + "Answer:\n");
+                    const std::string tail = llama_decision::letter_answer_tail(parts.second);
+                    decision_labels = llama_decision::build_label_pool(*decision_label_vocab, tail);
+                    llama_decision::verify_label_pool(*decision_label_vocab, decision_labels, tail);
                     const std::string template_hash = llama_decision::make_prefix_tag(
                         parts.first, parts.second, llama_decision::LETTER_PROMPT_VERSION);
                     decision_contract = llama_decision::decision_contract_hash(
@@ -2492,36 +2505,9 @@ private:
                     ss << in.rdbuf();
                     decision_temp_profile = llama_decision::parse_temperature_profile(json::parse(ss.str()));
 
-                    const auto parts = llama_decision::render_letter_prompt(chat_params.tmpls.get(), chat_params.use_jinja,
-                                                                            llama_decision::letter_system_text());
-                    llama_decision::temperature_provenance current;
-                    current.model         = model_name;
-                    {
-                        std::string quant;
-                        char qbuf[256];
-                        const llama_model * mdl = llama_get_model(ctx_tgt);
-                        if (mdl && llama_model_meta_val_str(mdl, "general.quantization_version", qbuf, sizeof(qbuf)) > 0) {
-                            quant = qbuf;
-                        } else if (mdl && llama_model_meta_val_str(mdl, "general.file_type", qbuf, sizeof(qbuf)) > 0) {
-                            quant = qbuf;
-                        } else if (mdl && llama_model_meta_val_str(mdl, "general.type", qbuf, sizeof(qbuf)) > 0) {
-                            quant = qbuf;
-                        }
-                        if (quant.empty() && !params_base.model.path.empty()) {
-                            quant = params_base.model.path;
-                            auto p = quant.find_last_of("/\\");
-                            if (p != std::string::npos) quant = quant.substr(p + 1);
-                        }
-                        current.quantization = quant;
-                    }
-                    current.template_hash = llama_decision::make_prefix_tag(parts.first, parts.second,
-                                                                            llama_decision::LETTER_PROMPT_VERSION);
-                    char flags[256];
-                    std::snprintf(flags, sizeof(flags), "fa=%d,k=%d,v=%d,unified=%d,swa=%d,ubatch=%u",
-                                  (int) params_base.flash_attn_type, (int) params_base.cache_type_k,
-                                  (int) params_base.cache_type_v, (int) params_base.kv_unified,
-                                  (int) params_base.swa_full, params_base.n_ubatch);
-                    current.backend_flags = flags;
+                    const llama_decision::temperature_provenance current =
+                        llama_decision::decision_provenance_current(model_name, params_base, llama_get_model(ctx_tgt),
+                                                                    chat_params.tmpls.get(), chat_params.use_jinja);
                     try {
                         llama_decision::validate_temperature_profile(decision_temp_profile, current);
                     } catch (const llama_decision::semantic_error & e) {
@@ -2555,7 +2541,8 @@ private:
             std::vector<std::vector<float>> probs;
             // run inside a yield so metrics/slot requests are served while the decision computes
             queue_tasks.yield_to_queue([&]() {
-                probs = llama_decision::letter_readout(*decision_letter_engine, *decision_label_vocab,
+                probs = llama_decision::letter_readout(*decision_letter_engine, decision_head_cache,
+                                                       *decision_label_vocab,
                                                        chat_params.tmpls.get(), chat_params.use_jinja,
                                                        req, decision_labels, jopt, &metrics, &audit);
             });
@@ -2589,34 +2576,13 @@ private:
             out["diagnostics"]["suffix_tokens"]        = (long long) metrics.suffix_tokens;
             out["diagnostics"]["common_suffix_tokens"] = (long long) metrics.common_suffix_tokens;
             {
-                std::string quant;
-                char qbuf[256];
-                const llama_model * mdl = llama_get_model(ctx_tgt);
-                if (mdl && llama_model_meta_val_str(mdl, "general.quantization_version", qbuf, sizeof(qbuf)) > 0) {
-                    quant = qbuf;
-                } else if (mdl && llama_model_meta_val_str(mdl, "general.file_type", qbuf, sizeof(qbuf)) > 0) {
-                    quant = qbuf;
-                } else if (mdl && llama_model_meta_val_str(mdl, "general.type", qbuf, sizeof(qbuf)) > 0) {
-                    quant = qbuf;
-                }
-                if (quant.empty() && !params_base.model.path.empty()) {
-                    quant = params_base.model.path;
-                    auto p = quant.find_last_of("/\\");
-                    if (p != std::string::npos) quant = quant.substr(p + 1);
-                }
-                const auto p2 = llama_decision::render_letter_prompt(chat_params.tmpls.get(), chat_params.use_jinja,
-                                                                      llama_decision::letter_system_text());
-                std::string thash = llama_decision::make_prefix_tag(p2.first, p2.second,
-                                                                     llama_decision::LETTER_PROMPT_VERSION);
-                char flags2[256];
-                std::snprintf(flags2, sizeof(flags2), "fa=%d,k=%d,v=%d,unified=%d,swa=%d,ubatch=%u",
-                              (int) params_base.flash_attn_type, (int) params_base.cache_type_k,
-                              (int) params_base.cache_type_v, (int) params_base.kv_unified,
-                              (int) params_base.swa_full, params_base.n_ubatch);
-                out["diagnostics"]["model"]          = model_name;
-                out["diagnostics"]["quantization"]   = quant;
-                out["diagnostics"]["template_hash"]  = thash;
-                out["diagnostics"]["backend_flags"]  = std::string(flags2);
+                const llama_decision::temperature_provenance prov =
+                    llama_decision::decision_provenance_current(model_name, params_base, llama_get_model(ctx_tgt),
+                                                                chat_params.tmpls.get(), chat_params.use_jinja);
+                out["diagnostics"]["model"]          = prov.model;
+                out["diagnostics"]["quantization"]   = prov.quantization;
+                out["diagnostics"]["template_hash"]  = prov.template_hash;
+                out["diagnostics"]["backend_flags"]  = prov.backend_flags;
             }
             return out;
         }

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Developer tool, not part of CI. Builds bench-decision for the two branches and runs a timing
+# matrix. Requires -DLLAMA_BUILD_DECISION_BENCH=ON (the bench target is off by default) on a
+# machine with the benchmark models; the committed bench artifact was removed, so there is no
+# baseline file to validate against. Regenerate one with the command in
+# tools/parallel-decision/CMakeLists.txt.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -65,6 +70,7 @@ build_one() {
     echo "Note: current HEAD $current != $branch $rev; building from current checkout but logging $branch rev"
   fi
   cmake -B "$dir" -DCMAKE_BUILD_TYPE=Release \
+    -DLLAMA_BUILD_DECISION_BENCH=ON \
     -DGGML_HIP=ON \
     -DGPU_TARGETS="${GPU_TARGETS:-gfx1100}" \
     -DCMAKE_HIP_ARCHITECTURES="${GPU_TARGETS:-gfx1100}" \
@@ -79,20 +85,7 @@ build_one() {
 }
 
 if [ "$DRY_RUN" = "1" ]; then
-  echo "dry-run: checking bench env and build dirs"
-  if [ ! -f "$ROOT/tests/decision-baseline/bench-env.json" ]; then
-    echo "missing bench-env.json" >&2
-    exit 1
-  fi
-  # verify bench-env contains both models
-  if ! grep -q "LFM2.5-2.6B" "$ROOT/tests/decision-baseline/bench-env.json"; then
-    echo "bench-env.json missing LFM2.5-2.6B entry" >&2
-    exit 1
-  fi
-  if ! grep -q "350M" "$ROOT/tests/decision-baseline/bench-env.json"; then
-    echo "bench-env.json missing 350M entry" >&2
-    exit 1
-  fi
+  echo "dry-run: checking build dirs (the bench target needs -DLLAMA_BUILD_DECISION_BENCH=ON)"
   build_one "_decision_synthesis" "$ROOT/build-synthesis"
   echo "dry-run ok"
   exit 0

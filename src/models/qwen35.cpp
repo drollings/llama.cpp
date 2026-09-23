@@ -215,10 +215,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    if (cparams.classifier_only) {
-        ggml_build_forward_expand(gf, cur);
-        return;
-    }
+    if (finish_classifier_only(cur)) return;
 
     // LM head
     cur = build_lora_mm(model.output, cur, model.output_s);

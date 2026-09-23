@@ -97,8 +97,9 @@ def http(method, url, body=None, content_type="application/json", api_key=API_KE
 
 
 class Server:
-    def __init__(self, model):
+    def __init__(self, model, extra_args=None):
         self.model = model
+        self.extra_args = extra_args or []
         self.port = free_port()
         self.proc = None
 
@@ -113,7 +114,7 @@ class Server:
             "--api-key", API_KEY,
             "--port", str(self.port),
             "--host", "127.0.0.1",
-        ]
+        ] + self.extra_args
         env = dict(os.environ)
         build_bin = os.path.dirname(os.path.abspath(SERVER_BIN))
         env["LD_LIBRARY_PATH"] = build_bin + (os.pathsep + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
@@ -277,6 +278,113 @@ def run_checks(server):
     print(f"measured: decision {outcome['ms']:.0f} ms, slots-during {slots_latency:.0f} ms, chat {chat_result['ms']:.0f} ms")
 
 
+def capacity_body(state, temperature=None):
+    body = {
+        "model": "test",
+        "state": state,
+        "questions": {
+            "dept": {
+                "type": "choice",
+                "instructions": "What is the issue?",
+                "criteria": {"billing": "payment", "technical": "bug"},
+            },
+        },
+    }
+    if temperature is not None:
+        body["temperature"] = temperature
+    return json.dumps(body)
+
+
+# Sweep the prompt size against a bounded classifier context: every size up to the budget is
+# accepted and decides identically to a large-context control, every size past it is rejected with
+# 422 and no decision. The accept/reject outcome must not depend on the reported confidence.
+CAPACITY_CTX = 512
+CAPACITY_UNIT = "The customer was charged twice and asked for a refund. "
+
+
+def run_capacity_sweep(model):
+    bounded = Server(model, ["--decision-ctx-size", str(CAPACITY_CTX)])
+    bounded.start()
+    control = None
+    try:
+        if not supports_letter_labels(bounded):
+            return "skip"
+
+        def post_state(state, temperature=None):
+            return bounded.post(capacity_body(state, temperature))
+
+        last_ok = None
+        first_reject = None
+        observed = []
+        for mult in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024):
+            status, _, text = post_state(CAPACITY_UNIT * mult)
+            if status == 413:
+                # the body cap is a separate limit (checked above); the context boundary must have
+                # been reached before the state grows past it, so stop the sweep here
+                break
+            observed.append((mult, status, text))
+            if status == 200:
+                body = json.loads(text)
+                check("answers" in body, "a fitting request returns a decision")
+                last_ok = {"mult": mult, "tokens": body["usage"]["input_tokens"], "body": body}
+            elif status != 422:
+                raise AssertionError(f"capacity sweep unexpected status {status}: {text}")
+
+        check(last_ok is not None, "a request fits within the bounded context")
+        check(any(s == 422 for _, s, _ in observed), "the sweep reaches the capacity boundary")
+        first_reject = next(m for m, s, _ in observed if s == 422)
+        check(first_reject > last_ok["mult"], "the boundary is monotone in state size")
+
+        # every size below the boundary must be accepted and every size at or above it rejected
+        not_fired_ok = all(s == 200 for m, s, _ in observed if m < first_reject)
+        fired_ok = all(s == 422 for m, s, _ in observed if m >= first_reject)
+        check(not_fired_ok, "no false reject below the boundary")
+        check(fired_ok, "no false accept at or above the boundary")
+        expected_not_fired = sum(1 for m, _, _ in observed if m < first_reject)
+        expected_fired = sum(1 for m, _, _ in observed if m >= first_reject)
+        fired = sum(1 for m, s, _ in observed if m >= first_reject and s == 422)
+        not_fired = sum(1 for m, s, _ in observed if m < first_reject and s == 200)
+        precision = fired / expected_fired if expected_fired else 1.0
+        recall = not_fired / expected_not_fired if expected_not_fired else 1.0
+        check(precision == 1.0 and recall == 1.0, f"capacity precision={precision} recall={recall}")
+
+        # no truncation and no KV residue
+        rejected_text = next(t for m, s, t in observed if m == first_reject)
+        rejected = json.loads(rejected_text)
+        check(rejected["error"]["code"] == 422, "the boundary rejection is a 422")
+        check("answers" not in rejected and "results" not in rejected, "a rejected request returns no decision")
+        status, _, text = post_state(CAPACITY_UNIT)
+        check(status == 200, f"the server still serves after a rejection: {status} {text}")
+
+        # the outcome must not depend on the reported confidence: same length, different temperatures
+        sharp = post_state(CAPACITY_UNIT * first_reject, 0.01)
+        flat = post_state(CAPACITY_UNIT * first_reject, 4.0)
+        check(sharp[0] == 422 and flat[0] == 422,
+              f"the reject is independent of confidence/temperature: {sharp[0]} {flat[0]}")
+
+        # control group: the fitting request decides the same on a large-context server
+        control = Server(model)
+        control.start()
+        if not supports_letter_labels(control):
+            return "skip"
+        state = CAPACITY_UNIT * last_ok["mult"]
+        status, _, text = control.post(capacity_body(state))
+        check(status == 200, f"control server serves the fitting request: {status}")
+        cb = json.loads(text)["answers"]["dept"]
+        lb = last_ok["body"]["answers"]["dept"]
+        check(lb["choice"] == cb["choice"], "the bounded and control servers pick the same choice")
+        tv = sum(abs(lb["probabilities"][k] - cb["probabilities"][k]) for k in lb["probabilities"])
+        check(tv <= 5e-2, f"the bounded and control distributions agree (TV={tv})")
+
+        print(f"capacity sweep: fit up to {last_ok['mult']} units ({last_ok['tokens']} input tokens), "
+              f"first reject at {first_reject} units, precision={precision} recall={recall}, ctx={CAPACITY_CTX}")
+        return "pass"
+    finally:
+        if control is not None:
+            control.stop()
+        bounded.stop()
+
+
 def main():
     if not os.path.isfile(SERVER_BIN):
         print(f"SKIP: server binary not found at {SERVER_BIN}")
@@ -306,6 +414,18 @@ def main():
             print(f"FAIL: {e}")
             return 1
         server.stop()
+
+        # bounded-context sweep: a request past the budget is rejected, never truncated
+        try:
+            capacity = run_capacity_sweep(model)
+        except Exception as e:  # noqa: BLE001
+            print(f"FAIL: capacity sweep: {e}")
+            return 1
+        if capacity == "skip":
+            print("SKIP: no usable answer labels for the capacity sweep")
+        else:
+            print("decision capacity sweep passed")
+
         print("decision admission checks passed")
         return 0
 

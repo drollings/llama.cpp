@@ -5,10 +5,15 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <utility>
 
 namespace llama_decision {
+
+std::string letter_answer_tail(const std::string & after) {
+    return after + "Answer:\n";
+}
 
 namespace {
 
@@ -36,7 +41,7 @@ std::string format_letter_suffix_ordered(const jev_question & q, const std::vect
         const std::string & desc = q.options[oi].description.empty() ? q.options[oi].key : q.options[oi].description;
         s += labels[i].text + ": " + desc + "\n";
     }
-    s += "Return the correct letter label." + after + "Answer:\n";
+    s += "Return the correct letter label." + letter_answer_tail(after);
     return s;
 }
 
@@ -73,6 +78,44 @@ std::vector<size_t> permutation_order(size_t count, const std::string & question
 std::string decision_contract_hash(const std::string & model_name, const std::string & template_hash, int vocab_size) {
     return sha256_hex("decision-contract-v1|" + template_hash + "|" + std::string(LETTER_PROMPT_VERSION) + "|" +
                       model_name + "|" + std::to_string(vocab_size));
+}
+
+std::string decision_quantization(const llama_model * model, const std::string & fallback_path) {
+    std::string quant;
+    char buf[256];
+    if (model && llama_model_meta_val_str(model, "general.quantization_version", buf, sizeof(buf)) > 0) {
+        quant = buf;
+    } else if (model && llama_model_meta_val_str(model, "general.file_type", buf, sizeof(buf)) > 0) {
+        quant = buf;
+    } else if (model && llama_model_meta_val_str(model, "general.type", buf, sizeof(buf)) > 0) {
+        quant = buf;
+    }
+    if (quant.empty() && !fallback_path.empty()) {
+        quant = fallback_path;
+        auto p = quant.find_last_of("/\\");
+        if (p != std::string::npos) {
+            quant = quant.substr(p + 1);
+        }
+    }
+    return quant;
+}
+
+temperature_provenance decision_provenance_current(const std::string & model_name,
+                                                   const common_params & params,
+                                                   const llama_model * model,
+                                                   const common_chat_templates * tmpls, bool use_jinja) {
+    const auto parts = render_letter_prompt(tmpls, use_jinja, letter_system_text());
+    temperature_provenance current;
+    current.model         = model_name;
+    current.quantization  = decision_quantization(model, params.model.path);
+    current.template_hash = make_prefix_tag(parts.first, parts.second, LETTER_PROMPT_VERSION);
+    char flags[256];
+    std::snprintf(flags, sizeof(flags), "fa=%d,k=%d,v=%d,unified=%d,swa=%d,ubatch=%u",
+                  (int) params.flash_attn_type, (int) params.cache_type_k,
+                  (int) params.cache_type_v, (int) params.kv_unified,
+                  (int) params.swa_full, params.n_ubatch);
+    current.backend_flags = flags;
+    return current;
 }
 
 const char * letter_system_text() {
@@ -113,37 +156,38 @@ void validate_label_capacity(const jev_request & req, size_t label_count) {
     }
 }
 
-head_capability probe_selected_head(const llama_model * model) {
-    // the probe depends only on the model, so it is resolved once per process
-    static const llama_model * key_model = nullptr;
-    static head_capability     cached;
-    if (model != key_model) {
-        head_capability cap;
-        if (model == nullptr) {
-            cap.reason = "no model is loaded";
+const head_capability & answer_head_cache::probe(const llama_model * model) {
+    if (cap_set_ && model == cap_model_) {
+        return capability_;
+    }
+    head_capability cap;
+    if (model == nullptr) {
+        cap.reason = "no model is loaded";
+    } else {
+        const int width = (int) llama_model_n_embd_out(model);
+        if (width <= 0) {
+            cap.reason = "no hidden state is available";
         } else {
-            const int width = (int) llama_model_n_embd_out(model);
-            if (width <= 0) {
-                cap.reason = "no hidden state is available";
+            const std::vector<llama_token> ids = { 0, 1 };
+            std::vector<float> rows((size_t) ids.size() * (size_t) width, 0.0f);
+            float softcap = 0.0f;
+            // bias_dst is null, but the call still validates the model's output bias, so an
+            // unreadable bias makes the probe fail instead of silently scoring without it
+            const int w = llama_model_classifier_rows(model, ids.data(), (int32_t) ids.size(), rows.data(),
+                                                      rows.size(), &softcap, nullptr);
+            if (w <= 0) {
+                cap.reason = "the model output tensor is not a plain contiguous answer head";
             } else {
-                const std::vector<llama_token> ids = { 0, 1 };
-                std::vector<float> rows((size_t) ids.size() * (size_t) width, 0.0f);
-                float softcap = 0.0f;
-                const int w = llama_model_classifier_rows(model, ids.data(), (int32_t) ids.size(), rows.data(),
-                                                          rows.size(), &softcap, nullptr);
-                if (w <= 0) {
-                    cap.reason = "the model output tensor is not a plain contiguous answer head";
-                } else {
-                    cap.available = true;
-                    cap.width     = w;
-                    cap.softcap   = softcap;
-                }
+                cap.available = true;
+                cap.width     = w;
+                cap.softcap   = softcap;
             }
         }
-        cached    = std::move(cap);
-        key_model = model;
     }
-    return cached;
+    capability_ = std::move(cap);
+    cap_model_  = model;
+    cap_set_    = true;
+    return capability_;
 }
 
 classifier_head build_classifier_head(const llama_model * model, const std::vector<label> & labels) {
@@ -176,43 +220,33 @@ classifier_head build_classifier_head(const llama_model * model, const std::vect
         head.reason = "the model output tensor is not a plain contiguous answer head";
         return head;
     }
-    // an output bias was only written when the model has one; otherwise the table stays unbiased
-    if (head.bias.size() == head.ids.size() && std::all_of(head.bias.begin(), head.bias.end(),
-            [](float v) { return v == 0.0f; })) {
-        head.bias.clear();
-    }
     head.width = w;
     return head;
 }
 
-namespace {
-// The answer-row table and its probe depend only on (model, label tokens), which are fixed for the
-// process lifetime, so the GPU-to-host row dequantization runs once instead of on every request.
-const classifier_head & cached_answer_head(const llama_model * model, const std::vector<label> & labels) {
-    static const llama_model *    key_model = nullptr;
-    static std::vector<llama_token> key_ids;
-    static classifier_head          cached;
-    bool same = model == key_model && key_ids.size() == labels.size();
+const classifier_head & answer_head_cache::for_labels(const llama_model * model, const std::vector<label> & labels) {
+    bool same = head_set_ && model == head_model_ && head_ids_.size() == labels.size();
     if (same) {
         for (size_t i = 0; i < labels.size(); ++i) {
-            if (key_ids[i] != labels[i].token) {
+            if (head_ids_[i] != labels[i].token) {
                 same = false;
                 break;
             }
         }
     }
-    if (!same) {
-        cached = build_classifier_head(model, labels);
-        key_model = model;
-        key_ids.clear();
-        key_ids.reserve(labels.size());
-        for (const auto & l : labels) {
-            key_ids.push_back(l.token);
-        }
+    if (same) {
+        return head_;
     }
-    return cached;
+    head_ = build_classifier_head(model, labels);
+    head_model_ = model;
+    head_set_   = true;
+    head_ids_.clear();
+    head_ids_.reserve(labels.size());
+    for (const auto & l : labels) {
+        head_ids_.push_back(l.token);
+    }
+    return head_;
 }
-} // namespace
 
 void require_selected_head(const std::string & requested, const head_capability & cap) {
     if (requested == "selected" && !cap.available) {
@@ -220,22 +254,8 @@ void require_selected_head(const std::string & requested, const head_capability 
     }
 }
 
-const head_capability & selected_head_capability() {
-    // Derived once (C++11 local-static initialization is thread-safe). No row table is built:
-    // this build exposes no hidden-state seam to project the answer rows against, so the
-    // readout always gathers from full logits. A supported build would fill `available` here.
-    static const head_capability cap = {
-        false, 0, 0.0f,
-        "selected-head projection is not available in this build; full logits are used",
-    };
-    return cap;
-}
-
 void verify_label_pool(const label_vocab & vocab, const std::vector<label> & labels, const std::string & tail) {
     for (const auto & l : labels) {
-        if (single_token(vocab, l.text) != l.token || vocab.piece(l.token) != l.text) {
-            throw std::runtime_error("answer label " + l.text + " is not a single round-tripping token");
-        }
         if (!check_boundary(vocab, tail, l.text, l.token)) {
             throw std::runtime_error("answer label " + l.text + " does not sit on a clean prompt boundary");
         }
@@ -244,7 +264,7 @@ void verify_label_pool(const label_vocab & vocab, const std::vector<label> & lab
 
 void verify_letter_request(const label_vocab & vocab, const std::string & after,
                            const jev_request & req, const std::vector<label> & labels) {
-    const std::string tail = after + "Answer:\n";
+    const std::string tail = letter_answer_tail(after);
     // the boundary is a fixed property of (tail, label), not of a question, so tokenize each
     // label once and let the per-question walk look the result up
     size_t max_options = 0;
@@ -278,6 +298,7 @@ std::string format_letter_suffix(const jev_question & q, const std::vector<label
 }
 
 std::vector<std::vector<float>> letter_readout(engine & eng,
+                                               answer_head_cache & head_cache,
                                                const label_vocab & vocab,
                                                const common_chat_templates * tmpls, bool use_jinja,
                                                const jev_request & req,
@@ -327,10 +348,10 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
     // answer rows and the context exposes hidden states, and the full-logits path is used
     // otherwise. Only an explicit request for it on an incompatible model is a client error.
     if (req.head == "selected") {
-        require_selected_head(req.head, probe_selected_head(eng.get_model()));
+        require_selected_head(req.head, head_cache.probe(eng.get_model()));
     }
-    // the row table is a pure function of (model, labels), so it is built once and shared
-    const classifier_head & head = cached_answer_head(eng.get_model(), labels);
+    // the row table is a pure function of (model, labels), so the cache builds it once
+    const classifier_head & head = head_cache.for_labels(eng.get_model(), labels);
     if (req.head != "full" && head.available()) {
         readout_opt.head = &head;
     }

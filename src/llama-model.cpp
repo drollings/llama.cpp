@@ -3367,6 +3367,18 @@ int32_t llama_model_classifier_rows(const llama_model * model, const llama_token
             !ggml_is_contiguous(tensor)) return 0;
     const auto * traits = ggml_get_type_traits(tensor->type);
     if (tensor->type != GGML_TYPE_F32 && !traits->to_float) return 0;
+
+    // a per-id output bias must be readable whenever the model has one, else every score would
+    // silently drop the bias; validate it regardless of whether the caller wants the values
+    const ggml_tensor * bias = model->output_b;
+    const ggml_type_traits * bias_traits = nullptr;
+    if (bias != nullptr) {
+        bias_traits = ggml_get_type_traits(bias->type);
+        if (!ggml_is_contiguous(bias) || bias->ne[0] != tensor->ne[1] ||
+                (bias->type != GGML_TYPE_F32 && (bias_traits == nullptr || bias_traits->to_float == nullptr))) {
+            return 0;
+        }
+    }
     for (int i = 0; i < count; ++i) if (ids[i] < 0 || ids[i] >= tensor->ne[1]) return 0;
     try {
         const size_t bytes = ggml_row_size(tensor->type, width);
@@ -3376,20 +3388,13 @@ int32_t llama_model_classifier_rows(const llama_model * model, const llama_token
             if (tensor->type == GGML_TYPE_F32) std::memcpy(dst + size_t(i) * width, row.data(), bytes);
             else traits->to_float(row.data(), dst + size_t(i) * width, width);
         }
-        if (model->output_b != nullptr && bias_dst != nullptr) {
-            // a per-id output bias is a plain 1-D vector over the vocabulary
-            const auto * bias = model->output_b;
-            if (ggml_is_contiguous(bias) && bias->ne[0] == tensor->ne[1]) {
-                const size_t bias_bytes = ggml_row_size(bias->type, 1);
-                const auto * bias_traits = ggml_get_type_traits(bias->type);
-                if (bias->type == GGML_TYPE_F32 || (bias_traits && bias_traits->to_float)) {
-                    std::vector<uint8_t> b(bias_bytes);
-                    for (int i = 0; i < count; ++i) {
-                        ggml_backend_tensor_get(bias, b.data(), size_t(ids[i]) * bias->nb[0], bias_bytes);
-                        if (bias->type == GGML_TYPE_F32) std::memcpy(bias_dst + i, b.data(), bias_bytes);
-                        else bias_traits->to_float(b.data(), bias_dst + i, 1);
-                    }
-                }
+        if (bias != nullptr && bias_dst != nullptr) {
+            const size_t bias_bytes = ggml_row_size(bias->type, 1);
+            std::vector<uint8_t> b(bias_bytes);
+            for (int i = 0; i < count; ++i) {
+                ggml_backend_tensor_get(bias, b.data(), size_t(ids[i]) * bias->nb[0], bias_bytes);
+                if (bias->type == GGML_TYPE_F32) std::memcpy(bias_dst + i, b.data(), bias_bytes);
+                else bias_traits->to_float(b.data(), bias_dst + i, 1);
             }
         }
         if (model->arch == LLM_ARCH_GEMMA4) {

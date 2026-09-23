@@ -29,6 +29,14 @@ branches share the context's cells.
 ./build/bin/llama-server -m model.gguf -ngl 99 -fa on -c 32768 --decision-seqs 24 --port 8096
 ```
 
+The letter readout runs on its own classifier-only context, which by default uses the model's context size.
+That context has no chat slots: its only sequences are the decision engine's, numbered from zero, while the
+shared chat context keeps the decision sequences above its slots. `--decision-ctx-size N` bounds the
+classifier context independently, so it does not reserve a second full-size KV cache.
+`N` is a cell budget: the request is checked against its peak use (the cached instructions plus every live
+question branch) before any decode. A request that does not fit is rejected with `422`, returns no decision,
+and leaves no partial state; the next request still succeeds. The decision path never truncates a prompt.
+
 With a presets file, one loaded model serves chat and decisions:
 
 ```ini
@@ -174,7 +182,7 @@ Error responses use `{"error": {"code", "message", "type"}}` and map to HTTP sta
 | 401 | `authentication_error` | missing or wrong API key |
 | 413 | `payload_too_large` | body over the configured cap |
 | 415 | `unsupported_media_type` | `Content-Type` is not `application/json` |
-| 422 | `invalid_request_error` | valid JSON, invalid semantics (empty state, too many options, label/tokenizer mismatch) |
+| 422 | `invalid_request_error` | valid JSON, invalid semantics (empty state, too many options, label/tokenizer mismatch, request past the decision context budget) |
 | 429 | `rate_limit_error` | decision queue full; `Retry-After: 1` |
 | 499 | `client_closed_request` | the client disconnected before the answer was ready |
 | 500 | `server_error` | unexpected internal failure |
@@ -182,6 +190,26 @@ Error responses use `{"error": {"code", "message", "type"}}` and map to HTTP sta
 | 529 | `overloaded_error` | server overloaded; `Retry-After: 1` |
 
 The decision path never truncates: an over-limit request is rejected, never silently clipped.
+
+### Prefix cache
+
+The shared prefix (instructions, schema, state) is cached per request tag. A cached entry is stored
+in the self-contained host format, because a device-format entry references a context staging buffer
+that the next save reuses. The active request keeps a device-format copy for its own trunks and
+branches, so a warm prefix restores device-to-device while a later save cannot corrupt an older
+cache entry.
+
+### Selected answer head
+
+The letter readout can score answer rows from the model's output table instead of projecting the
+whole vocabulary (`head: "selected"`, or `"auto"` to use it when available). It runs on a
+classifier-only context that shares the weights and stops at the post-norm hidden state. An arch is
+eligible only when its graph can stop there and its output table is a plain contiguous matrix
+(`llm_arch_supports_classifier`). If the model also carries a per-id output bias, that bias must be
+readable as a contiguous 1-D vector over the vocabulary; an unreadable bias makes the head
+unavailable instead of silently scoring without it. A zero bias is kept and adds zero; it is not
+treated as "no bias". `head: "auto"` falls back to full logits when the head is unavailable; an
+explicit `head: "selected"` on an incompatible model is a 400.
 
 ### Usage and audit
 
@@ -218,6 +246,11 @@ them, the distribution still sums to 1 over the wrong set. Never gate admission,
 routing or persistence on `confidence` or `certainty`, and never present them as probability
 of being correct.
 
+Admission is not part of this axis. `--decision-ctx-size` bounds the classifier context by token
+cells, and each request is accepted or rejected by its token footprint alone, never by
+`confidence`/`certainty`. A low-confidence and a high-confidence request of the same length get the
+same outcome.
+
 A calibrated temperature is deployment-specific. `--decision-temperature FILE` loads a JSON
 profile `{"temperatures": {"noul": ..., "choice": ..., "score": ...}, "provenance": {"model": ...,
 "quantization": ..., "template_hash": ..., "backend_flags": ...}}`. If any temperature differs
@@ -233,12 +266,17 @@ answer labels and returns one closed distribution per typed question. Both share
 the branch scorer, the softmax and the SWA clamp; the letter readout is a thin layer over the trie
 scorer, not a second implementation.
 
+Letter labels are resolved at the framed answer boundary, not in isolation. A SentencePiece /
+`add_space_prefix` vocabulary tokenizes a bare `A` as the space-prefixed form in isolation but
+emits the bare token after the tail, so the pool is built from the tail and the letter readout
+works on both SentencePiece and BPE tokenizers.
+
 ## Model card snippet
 
 ```yaml
 model: <base gguf>
 task: single-pass decision / classification over a supplied state
-readout: letter labels over a verified single-token pool (Jev), or token-path trie (schema)
+readout: letter labels resolved at the framed answer tail (SentencePiece and BPE), or token-path trie (schema)
 context: shared prefix + one state per request; branches forked on a unified KV cache
 output: probability distributions only, output_tokens always 0, closed over the supplied options
 confidence: max(p) and 1 - H/log(K); concentration, NOT calibrated accuracy

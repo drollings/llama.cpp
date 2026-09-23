@@ -13,6 +13,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 NEEDLES = ("temperature", "confidence", "certainty", "provenance")
+# Run only the temperature/confidence/certainty/provenance tests, so this driver is not coupled to
+# model-family-specific tests (selected heads, LFM2.5 fixtures) that an SPM model cannot serve.
+FILTER = r"decision engine harness(\.(.*(temperature|confidence|certainty|provenance).*))?"
 
 
 def find_bin():
@@ -36,9 +39,19 @@ def main():
 
     env = os.environ.copy()
     env["LD_LIBRARY_PATH"] = os.path.dirname(BIN) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
-    proc = subprocess.run([BIN], capture_output=True, text=True, errors="replace", env=env)
+    proc = subprocess.run([BIN, FILTER], capture_output=True, text=True, errors="replace", env=env)
     output = proc.stdout + proc.stderr
-    if proc.returncode != 0 or "FAIL" in output:
+    # the harness exit code and its summary are authoritative; do not match the literal "FAIL",
+    # which also appears in the expected-failure and xpass status markers
+    failed = proc.returncode != 0
+    for line in output.splitlines():
+        key, _, value = line.strip().partition(":")
+        if key.strip() in ("failures", "xpass"):
+            try:
+                failed = failed or int(value.strip()) != 0
+            except ValueError:
+                pass
+    if failed:
         print(output)
         print("FAIL: temperature checks failed")
         return 1

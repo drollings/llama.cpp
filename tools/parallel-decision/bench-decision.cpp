@@ -1,4 +1,5 @@
 #include "decision-engine.h"
+#include "letter_readout.h"
 
 #include "common.h"
 #include "json.h"
@@ -203,29 +204,19 @@ int main(int argc, char ** argv) {
         auto cs = llama_decision::compile_schema(req.at("schema"), req.value("instructions", std::string("")));
         std::string ctx_text = req.at("contexts").at(0).get<std::string>();
 
-        std::vector<std::string> modes = { "auto", "tree", "greedy" };
-        if (bo.mode != "auto" || bo.bench == false) {
-            // when bench not default, respect explicit mode filter
-            if (bo.mode.find(',') != std::string::npos) {
-                modes.clear();
-                std::stringstream ss(bo.mode);
-                std::string tok;
-                while (std::getline(ss, tok, ',')) if (!tok.empty()) modes.push_back(tok);
-            } else if (bo.mode != "auto") {
-                bool is_bench_default = bo.mode == "auto" && bo.contexts == 1;
-                if (!is_bench_default && bo.mode != "auto,tree,greedy") {
-                    // single mode requested via --mode
-                    if (modes.size() != 1 || modes[0] != bo.mode) {
-                        // handled by earlier branch; keep single
-                    }
+        std::vector<std::string> modes;
+        if (bo.mode.find(',') != std::string::npos) {
+            std::stringstream ss(bo.mode);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                if (!tok.empty()) {
+                    modes.push_back(tok);
                 }
             }
-            if (bo.bench && bo.mode == "auto") {
-                // bench default: all three modes
-                modes = { "auto", "tree", "greedy" };
-            } else if (bo.mode != "auto") {
-                modes = { bo.mode };
-            }
+        } else if (bo.mode == "auto") {
+            modes = { "auto", "tree", "greedy" }; // the bench default runs all three
+        } else {
+            modes = { bo.mode };
         }
 
         common_json timings = common_json::array();
@@ -299,7 +290,7 @@ int main(int argc, char ** argv) {
         std::ifstream mf(bo.model, std::ios::binary | std::ios::ate);
         long long bytes = mf ? (long long) mf.tellg() : -1;
         env["model_bytes"] = bytes;
-        env["quantization"] = "Q4_0";
+        env["quantization"] = llama_decision::decision_quantization(ld.model, bo.model);
         common_json backend = common_json::object();
         backend["kv_unified"] = true;
         backend["swa_full"] = false;
