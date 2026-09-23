@@ -3358,9 +3358,9 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
     return (uint32_t) nelements;
 }
 
-int32_t llama_model_classifier_rows(const llama_model * model, const llama_token * ids, int32_t count, float * dst, size_t dst_count, float * softcap) {
+int32_t llama_model_classifier_rows(const llama_model * model, const llama_token * ids, int32_t count, float * dst, size_t dst_count, float * softcap, float * bias_dst) {
     if (!model || !ids || !dst || !softcap || count < 2 || count > 64 ||
-            !llm_arch_supports_classifier(model->arch) || !model->output || model->output_s || model->output_b) return 0;
+            !llm_arch_supports_classifier(model->arch) || !model->output || model->output_s) return 0;
     const auto * tensor = model->output;
     const auto width = tensor->ne[0];
     if (width != model->hparams.n_embd || dst_count != size_t(count) * size_t(width) ||
@@ -3375,6 +3375,22 @@ int32_t llama_model_classifier_rows(const llama_model * model, const llama_token
             ggml_backend_tensor_get(tensor, row.data(), size_t(ids[i]) * tensor->nb[1], bytes);
             if (tensor->type == GGML_TYPE_F32) std::memcpy(dst + size_t(i) * width, row.data(), bytes);
             else traits->to_float(row.data(), dst + size_t(i) * width, width);
+        }
+        if (model->output_b != nullptr && bias_dst != nullptr) {
+            // a per-id output bias is a plain 1-D vector over the vocabulary
+            const auto * bias = model->output_b;
+            if (ggml_is_contiguous(bias) && bias->ne[0] == tensor->ne[1]) {
+                const size_t bias_bytes = ggml_row_size(bias->type, 1);
+                const auto * bias_traits = ggml_get_type_traits(bias->type);
+                if (bias->type == GGML_TYPE_F32 || (bias_traits && bias_traits->to_float)) {
+                    std::vector<uint8_t> b(bias_bytes);
+                    for (int i = 0; i < count; ++i) {
+                        ggml_backend_tensor_get(bias, b.data(), size_t(ids[i]) * bias->nb[0], bias_bytes);
+                        if (bias->type == GGML_TYPE_F32) std::memcpy(bias_dst + i, b.data(), bias_bytes);
+                        else bias_traits->to_float(b.data(), bias_dst + i, 1);
+                    }
+                }
+            }
         }
         if (model->arch == LLM_ARCH_GEMMA4) {
             *softcap = model->hparams.f_final_logit_softcapping;

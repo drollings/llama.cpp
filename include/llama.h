@@ -1071,8 +1071,11 @@ extern "C" {
     // Dequantize the output (classifier) rows for the given token ids into dst. Returns the row
     // width, or zero when the model's output tensor is unsupported. On success softcap is set to
     // the final logit softcap (0 when the model has none). dst must hold count * width floats.
+    // When bias_dst is not NULL it receives count per-id output bias values, or is left untouched
+    // when the model's output has no bias. Pass NULL when only the rows are needed.
     LLAMA_API int32_t llama_model_classifier_rows(const struct llama_model * model,
-            const llama_token * ids, int32_t count, float * dst, size_t dst_count, float * softcap);
+            const llama_token * ids, int32_t count, float * dst, size_t dst_count, float * softcap,
+            float * bias_dst);
 
     // Get the embeddings for a sequence id
     // Returns NULL if pooling_type is LLAMA_POOLING_TYPE_NONE

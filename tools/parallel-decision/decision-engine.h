@@ -50,6 +50,7 @@ struct field_input {
 struct classifier_head {
     std::vector<llama_token> ids;   // ids[r] owns rows[r]
     std::vector<float>       rows;  // ids.size() * width floats
+    std::vector<float>       bias;  // per-id output bias, empty when the model's output has none
     int                      width   = 0;
     float                    softcap = 0.0f; // final logit softcap, 0 when the model has none
     std::string              reason;         // why the head is unavailable, empty when usable
@@ -192,6 +193,11 @@ class engine {
     fork_kind           active_fork_ = fork_kind::copy;
     llama_pos           swa_         = 0; // sliding-window size, 0 = none
     std::vector<uint8_t> prefix_state_;
+
+    // restore forks keep the saved state on device when the memory layout allows it, so the
+    // per-branch restore is a device-to-device copy instead of a host round-trip; falls back to
+    // host when the state cannot be staged on device
+    mutable bool restore_on_device_ = true;
 
     struct prefix_entry {
         std::string          tag;

@@ -114,28 +114,36 @@ void validate_label_capacity(const jev_request & req, size_t label_count) {
 }
 
 head_capability probe_selected_head(const llama_model * model) {
-    head_capability cap;
-    if (model == nullptr) {
-        cap.reason = "no model is loaded";
-        return cap;
+    // the probe depends only on the model, so it is resolved once per process
+    static const llama_model * key_model = nullptr;
+    static head_capability     cached;
+    if (model != key_model) {
+        head_capability cap;
+        if (model == nullptr) {
+            cap.reason = "no model is loaded";
+        } else {
+            const int width = (int) llama_model_n_embd_out(model);
+            if (width <= 0) {
+                cap.reason = "no hidden state is available";
+            } else {
+                const std::vector<llama_token> ids = { 0, 1 };
+                std::vector<float> rows((size_t) ids.size() * (size_t) width, 0.0f);
+                float softcap = 0.0f;
+                const int w = llama_model_classifier_rows(model, ids.data(), (int32_t) ids.size(), rows.data(),
+                                                          rows.size(), &softcap, nullptr);
+                if (w <= 0) {
+                    cap.reason = "the model output tensor is not a plain contiguous answer head";
+                } else {
+                    cap.available = true;
+                    cap.width     = w;
+                    cap.softcap   = softcap;
+                }
+            }
+        }
+        cached    = std::move(cap);
+        key_model = model;
     }
-    const int width = (int) llama_model_n_embd_out(model);
-    if (width <= 0) {
-        cap.reason = "no hidden state is available";
-        return cap;
-    }
-    const std::vector<llama_token> ids = { 0, 1 };
-    std::vector<float> rows((size_t) ids.size() * (size_t) width, 0.0f);
-    float softcap = 0.0f;
-    const int w = llama_model_classifier_rows(model, ids.data(), (int32_t) ids.size(), rows.data(), rows.size(), &softcap);
-    if (w <= 0) {
-        cap.reason = "the model output tensor is not a plain contiguous answer head";
-        return cap;
-    }
-    cap.available = true;
-    cap.width     = w;
-    cap.softcap   = softcap;
-    return cap;
+    return cached;
 }
 
 classifier_head build_classifier_head(const llama_model * model, const std::vector<label> & labels) {
@@ -158,17 +166,53 @@ classifier_head build_classifier_head(const llama_model * model, const std::vect
         head.ids.push_back(l.token);
     }
     head.rows.assign(head.ids.size() * (size_t) width, 0.0f);
+    head.bias.assign(head.ids.size(), 0.0f);
     const int w = llama_model_classifier_rows(model, head.ids.data(), (int32_t) head.ids.size(),
-                                              head.rows.data(), head.rows.size(), &head.softcap);
+                                              head.rows.data(), head.rows.size(), &head.softcap, head.bias.data());
     if (w <= 0) {
         head.ids.clear();
         head.rows.clear();
+        head.bias.clear();
         head.reason = "the model output tensor is not a plain contiguous answer head";
         return head;
+    }
+    // an output bias was only written when the model has one; otherwise the table stays unbiased
+    if (head.bias.size() == head.ids.size() && std::all_of(head.bias.begin(), head.bias.end(),
+            [](float v) { return v == 0.0f; })) {
+        head.bias.clear();
     }
     head.width = w;
     return head;
 }
+
+namespace {
+// The answer-row table and its probe depend only on (model, label tokens), which are fixed for the
+// process lifetime, so the GPU-to-host row dequantization runs once instead of on every request.
+const classifier_head & cached_answer_head(const llama_model * model, const std::vector<label> & labels) {
+    static const llama_model *    key_model = nullptr;
+    static std::vector<llama_token> key_ids;
+    static classifier_head          cached;
+    bool same = model == key_model && key_ids.size() == labels.size();
+    if (same) {
+        for (size_t i = 0; i < labels.size(); ++i) {
+            if (key_ids[i] != labels[i].token) {
+                same = false;
+                break;
+            }
+        }
+    }
+    if (!same) {
+        cached = build_classifier_head(model, labels);
+        key_model = model;
+        key_ids.clear();
+        key_ids.reserve(labels.size());
+        for (const auto & l : labels) {
+            key_ids.push_back(l.token);
+        }
+    }
+    return cached;
+}
+} // namespace
 
 void require_selected_head(const std::string & requested, const head_capability & cap) {
     if (requested == "selected" && !cap.available) {
@@ -201,12 +245,22 @@ void verify_label_pool(const label_vocab & vocab, const std::vector<label> & lab
 void verify_letter_request(const label_vocab & vocab, const std::string & after,
                            const jev_request & req, const std::vector<label> & labels) {
     const std::string tail = after + "Answer:\n";
+    // the boundary is a fixed property of (tail, label), not of a question, so tokenize each
+    // label once and let the per-question walk look the result up
+    size_t max_options = 0;
+    for (const auto & q : req.questions) {
+        max_options = std::max(max_options, q.options.size());
+    }
+    if (max_options > labels.size()) {
+        throw semantic_error("a question has more options than available answer labels");
+    }
+    std::vector<char> ok(max_options, 0);
+    for (size_t i = 0; i < max_options; ++i) {
+        ok[i] = check_boundary(vocab, tail, labels[i].text, labels[i].token) ? 1 : 0;
+    }
     for (const auto & q : req.questions) {
         for (size_t i = 0; i < q.options.size(); ++i) {
-            if (i >= labels.size()) {
-                throw semantic_error("question \"" + q.id + "\" has more options than available answer labels");
-            }
-            if (!check_boundary(vocab, tail, labels[i].text, labels[i].token)) {
+            if (!ok[i]) {
                 throw semantic_error("question \"" + q.id + "\": answer label " + labels[i].text +
                                      " does not tokenize cleanly after the prompt");
             }
@@ -275,12 +329,10 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
     if (req.head == "selected") {
         require_selected_head(req.head, probe_selected_head(eng.get_model()));
     }
-    classifier_head head;
-    if (req.head != "full") {
-        head = build_classifier_head(eng.get_model(), labels);
-        if (head.available()) {
-            readout_opt.head = &head;
-        }
+    // the row table is a pure function of (model, labels), so it is built once and shared
+    const classifier_head & head = cached_answer_head(eng.get_model(), labels);
+    if (req.head != "full" && head.available()) {
+        readout_opt.head = &head;
     }
 
     const auto b = eng.decide_batch(split.first, { render_state(req.state) }, fields, readout_opt);
