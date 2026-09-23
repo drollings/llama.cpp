@@ -1,6 +1,6 @@
 #pragma once
 
-// Letter readout: score each Jev question as one next-token choice over the
+// Letter readout: score each decision question as one next-token choice over the
 // verified label pool, sharing one framed state prefix across all questions.
 // Built on the same engine and the same branch scorer as the trie path.
 
@@ -67,11 +67,11 @@ std::pair<std::string, std::string> render_letter_prompt(const common_chat_templ
                                                          bool enable_thinking = false);
 
 // The per-question branch text, ending just before the label is generated.
-std::string format_letter_suffix(const jev_question & q, const std::vector<label> & labels,
+std::string format_letter_suffix(const decision_question & q, const std::vector<label> & labels,
                                  const std::string & after);
 
 // Throws semantic_error when a question needs more labels than the pool provides.
-void validate_label_capacity(const jev_request & req, size_t label_count);
+void validate_label_capacity(const decision_request & req, size_t label_count);
 
 // Deterministic option order for one de-bias pass: pass 0 is the identity, later passes are
 // distinct seeded shuffles of the option indices. Seeded by the question id, so a question always
@@ -114,6 +114,10 @@ public:
     // Answer-row table for `labels`, built once per (model, label tokens). Never throws.
     const classifier_head & for_labels(const llama_model * model, const std::vector<label> & labels);
 
+    // Drops the cached probe and rows. The owner calls this when the cached model is freed, so a
+    // reloaded model at the same address cannot hit a stale probe.
+    void clear();
+
 private:
     bool                     cap_set_   = false;
     const llama_model *      cap_model_ = nullptr;
@@ -133,7 +137,7 @@ void verify_label_pool(const label_vocab & vocab, const std::vector<label> & lab
 // Per-request tokenizer gate: the same boundary check applied to the labels the request actually
 // uses. A mismatch throws semantic_error naming the question (HTTP 422), never a silent score.
 void verify_letter_request(const label_vocab & vocab, const std::string & tail,
-                           const jev_request & req, const std::vector<label> & labels);
+                           const decision_request & req, const std::vector<label> & labels);
 
 // One probability vector per question, index-aligned with q.options. Throws
 // semantic_error when a question needs more labels than the pool provides.
@@ -142,7 +146,7 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
                                                answer_head_cache & head_cache,
                                                const label_vocab & vocab,
                                                const common_chat_templates * tmpls, bool use_jinja,
-                                               const jev_request & req,
+                                               const decision_request & req,
                                                const std::vector<label> & labels,
                                                const options & opt,
                                                letter_metrics * metrics = nullptr,

@@ -1,4 +1,5 @@
 #include "decision-engine.h"
+#include "decision-protocol.h"
 
 #include "chat.h"
 #include "common.h"
@@ -235,18 +236,8 @@ std::vector<float> score_answer_rows(const float * hidden, const classifier_head
 
 std::string make_prefix_tag(const std::string & system_text, const std::string & after,
                             const std::string & prompt_version) {
-    uint64_t h = 1469598103934665603ull;
-    auto mix = [&h](const std::string & s) {
-        for (unsigned char c : s) {
-            h ^= c;
-            h *= 1099511628211ull;
-        }
-        h ^= 0x1f;
-        h *= 1099511628211ull;
-    };
-    mix(prompt_version);
-    mix(system_text);
-    mix(after);
+    // the trailing separator byte keeps the same chained FNV-1a as the pre-refactor mixing
+    const uint64_t h = fnv1a64(prompt_version + "\x1f" + system_text + "\x1f" + after + "\x1f");
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long) h);
     return std::string("decision-prefix-v1:") + buf;
@@ -306,7 +297,9 @@ engine::saved_state engine::save_seq(llama_seq_id seq, bool prefer_device) const
     }
     const size_t size = llama_state_seq_get_size(ctx, seq);
     if (size == 0) {
-        return {};
+        // A sequence that was never decoded has no state; saving it must be an error, never a
+        // silently-empty state that a later load would restore as nothing.
+        throw std::runtime_error("failed to save a decision sequence state: no state is available");
     }
     std::vector<uint8_t> buf(size);
     if (llama_state_seq_get_data(ctx, buf.data(), buf.size(), seq) != size) {
@@ -317,7 +310,9 @@ engine::saved_state engine::save_seq(llama_seq_id seq, bool prefer_device) const
 
 void engine::load_seq(const saved_state & state, llama_seq_id seq) const {
     if (state.bytes.empty()) {
-        return;
+        // save_seq refuses to produce an empty state, so this can only be a caller bug; fail
+        // loudly instead of silently restoring nothing.
+        throw std::runtime_error("cannot load an empty decision sequence state");
     }
     // The format belongs to the value: the device flag is never substituted for the host flag or
     // the other way around, so a stale engine flag cannot misread the bytes.
@@ -807,11 +802,6 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
     out.leaf_suffix_tokens   = leaf_suffix_tokens;
     out.items.resize(contexts.size());
 
-    // Bounded decision context: reject a request whose peak KV use cannot fit before touching the
-    // cache, so the failure is a clean client error and never a partial restore. A unified cache
-    // bounds all live sequences together, so the check uses the engine's peak live set: the
-    // snapshot plus the whole sequence pool, each at the longest this request builds. Never
-    // truncate.
     size_t max_tail = 0;
     for (const auto & t : tails) {
         max_tail = std::max(max_tail, t.size());
@@ -824,10 +814,10 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
     }
 
     // Bounded decision context: reject a request whose peak KV use cannot fit before touching the
-    // cache, so the failure is a clean client error and never a partial restore. A unified cache
-    // bounds all live sequences together, so the check uses the engine's peak live set: the
-    // snapshot, the group's trunks, and one wave of branch sequences, each at the longest this
-    // request builds. Never truncate.
+    // cache, so the failure is a clean client error. The peak estimate uses the full n_ctx as the
+    // budget and ignores resident chat cells (no free-cell API exists), so it is conservative and
+    // may reject a request that would fit; the decode-time rc==1 path is the actual guarantee
+    // against a partial restore. Never truncate.
     const size_t per_group = std::clamp<size_t>(n_pool / (1 + branches), 1, contexts.size());
     const size_t group     = std::min(per_group, contexts.size());
     const size_t n_free    = (size_t) std::max(0, n_pool - (int) group);
@@ -1158,24 +1148,8 @@ std::pair<std::string, std::string> render_prompt(const common_chat_templates * 
     if (tmpls == nullptr) {
         return { system_text + "\nContext:\n", safe_ctx + "\nOutput:\n{\n" };
     }
-    static const std::string sentinel = "\x1f<<decision-context>>\x1f";
-    common_chat_templates_inputs in;
-    in.use_jinja             = use_jinja;
-    in.add_generation_prompt = true;
-    in.enable_thinking       = enable_thinking;
-    common_chat_msg sys;
-    sys.role    = "system";
-    sys.content = system_text;
-    common_chat_msg usr;
-    usr.role    = "user";
-    usr.content = sentinel;
-    in.messages = { sys, usr };
-    const std::string prompt = common_chat_templates_apply(tmpls, in).prompt;
-    const size_t at = prompt.find(sentinel);
-    if (at == std::string::npos) {
-        throw std::runtime_error("the chat template did not keep the user message");
-    }
-    return { prompt.substr(0, at), safe_ctx + prompt.substr(at + sentinel.size()) + "{\n" };
+    const auto parts = split_chat_template(tmpls, use_jinja, system_text, enable_thinking);
+    return { parts.first, safe_ctx + parts.second + "{\n" };
 }
 
 common_json assemble(const compiled_schema & cs, const result & r) {

@@ -1,29 +1,241 @@
 {
-  "note": "Frozen baseline facts for the decision endpoint. Values here are contracts, not tunables. Update only with a matching code change and a re-measured gate.",
-  "partition": {
-    "slots_first": 0,
-    "slots_last_exclusive": 2,
-    "decision_first": 2,
-    "decision_count": 8,
-    "n_seq_max": 10,
-    "rule": "n_seq_max = n_parallel + n_seq_decision; decisions never share sequence ids with slots"
-  },
-  "routes": {
-    "canonical": "/v1/decision",
-    "deprecated_alias": "/decision",
-    "sizing_flag": "--decision-seqs",
-    "env_flag": "LLAMA_ARG_DECISION_SEQS"
-  },
-  "backend_flags": {
-    "kv_unified": true,
-    "swa_full_default": true,
-    "flash_attn": "on (production preset)",
-    "cache_type_k": "q8_0 (production preset)",
-    "cache_type_v": "q8_0 (production preset)"
-  },
-  "fixtures": [
-    "contexts_schema.request.json",
-    "compiled_schema.golden.json",
-    "jev_basic.shape.json"
-  ]
+ "note": "Frozen baseline facts for the decision endpoint. Values here are contracts, not tunables. Update only with a matching code change and a re-measured gate.",
+ "partition": {
+  "slots_first": 0,
+  "slots_last_exclusive": 2,
+  "decision_first": 2,
+  "decision_count": 8,
+  "n_seq_max": 10,
+  "rule": "n_seq_max = n_parallel + n_seq_decision; decisions never share sequence ids with slots"
+ },
+ "routes": {
+  "canonical": "/v1/decision",
+  "deprecated_alias": "/decision",
+  "sizing_flag": "--decision-seqs",
+  "env_flag": "LLAMA_ARG_DECISION_SEQS"
+ },
+ "backend_flags": {
+  "kv_unified": true,
+  "swa_full_default": true,
+  "flash_attn": "on (production preset)",
+  "cache_type_k": "q8_0 (production preset)",
+  "cache_type_v": "q8_0 (production preset)"
+ },
+ "fixtures": [
+  "contexts_schema.request.json",
+  "compiled_schema.golden.json",
+  "decision_basic.shape.json"
+ ],
+ "reference": {
+  "note": "Reference /v1/decision request -> response pairs recorded on the M0 reference model with a bit-reproducible flag set (flash attention off) and a fixed --alias so the contract hash is machine-independent. Values are the frozen oracle for byte-identity proofs: a refactor must not change these answers, and the template/contract hashes must not drift. Run-to-run timing fields are excluded.",
+  "model": "lfm2.5-350m-gguf/latest.gguf",
+  "model_path": "/app/ai/models/gguf/liquidai/lfm2.5-350m-gguf/latest.gguf",
+  "recorded": "2026-09-23",
+  "backend_flags": "fa=0,k=1,v=1,unified=1,swa=0,ubatch=512",
+  "contract_hash": "dc11458851f22827e9333dd529a724f5834be3ff8844ca4db84c91b73ef220e6",
+  "template_hash": "decision-prefix-v1:95f038da5f9e69be",
+  "prompt_version": "letter-v1",
+  "quantization": "2",
+  "responses": {
+   "letter": {
+    "model": "test",
+    "answers": {
+     "refund": {
+      "type": "noul",
+      "noul": 0.9959607720375061,
+      "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
+      "prompt_sha256": "09757a4f8227f0ee55c7ec257554a9fa4bab5b7620440e5719d2137574ab08f8",
+      "prompt_version": "letter-v1",
+      "answer_token_ids": [
+       542,
+       543
+      ],
+      "allowed_token_mass": 1.0,
+      "full_vocab_argmax_id": -1,
+      "option_logits": [
+       27.970382690429688,
+       33.47803497314453
+      ]
+     },
+     "dept": {
+      "type": "choice",
+      "confidence": 0.930706262588501,
+      "certainty": 0.6367175807667123,
+      "choice": "technical",
+      "probabilities": {
+       "billing": 0.06929371505975723,
+       "technical": 0.930706262588501
+      },
+      "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
+      "prompt_sha256": "09757a4f8227f0ee55c7ec257554a9fa4bab5b7620440e5719d2137574ab08f8",
+      "prompt_version": "letter-v1",
+      "answer_token_ids": [
+       542,
+       543
+      ],
+      "allowed_token_mass": 1.0,
+      "full_vocab_argmax_id": -1,
+      "option_logits": [
+       28.560556411743164,
+       31.158145904541016
+      ]
+     },
+     "urgency": {
+      "type": "score",
+      "confidence": 0.9511141777038574,
+      "certainty": 0.8027698529144875,
+      "score": 1.033285304903984,
+      "probabilities": {
+       "0": 0.007800265680998564,
+       "1": 0.9511141777038574,
+       "2": 0.041085563600063324
+      },
+      "legend": {
+       "0": "calm",
+       "1": "upset",
+       "2": "furious"
+      },
+      "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
+      "prompt_sha256": "09757a4f8227f0ee55c7ec257554a9fa4bab5b7620440e5719d2137574ab08f8",
+      "prompt_version": "letter-v1",
+      "answer_token_ids": [
+       542,
+       543,
+       544
+      ],
+      "allowed_token_mass": 1.0,
+      "full_vocab_argmax_id": -1,
+      "option_logits": [
+       26.256282806396484,
+       31.05975914001465,
+       27.917781829833984
+      ]
+     }
+    },
+    "usage": {
+     "input_tokens": 54,
+     "output_tokens": 0,
+     "cached_tokens": 0,
+     "state_cache_hit": false,
+     "head_mode": "selected"
+    },
+    "head": {
+     "mode": "selected",
+     "fallback": false
+    },
+    "diagnostics": {
+     "contract_hash": "dc11458851f22827e9333dd529a724f5834be3ff8844ca4db84c91b73ef220e6",
+     "prompt_version": "letter-v1",
+     "suffix_tokens": 97,
+     "common_suffix_tokens": 0,
+     "model": "lfm2.5-350m-gguf/latest.gguf",
+     "quantization": "2",
+     "template_hash": "decision-prefix-v1:95f038da5f9e69be",
+     "backend_flags": "fa=0,k=1,v=1,unified=1,swa=0,ubatch=512"
+    }
+   },
+   "letter2": {
+    "model": "test",
+    "answers": {
+     "refund": {
+      "type": "noul",
+      "noul": 0.999737560749054,
+      "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
+      "prompt_sha256": "f046fd14c4a78b7967f57028ad939debbb5d0154b3628649dbcf55b06783ddbe",
+      "prompt_version": "letter-v1",
+      "answer_token_ids": [
+       542,
+       543
+      ],
+      "allowed_token_mass": 1.0,
+      "full_vocab_argmax_id": -1,
+      "option_logits": [
+       25.352861404418945,
+       33.59809112548828
+      ]
+     },
+     "dept": {
+      "type": "choice",
+      "confidence": 0.9998111724853516,
+      "certainty": 0.9973917659162155,
+      "choice": "technical",
+      "probabilities": {
+       "billing": 0.0001888203260023147,
+       "technical": 0.9998111724853516
+      },
+      "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
+      "prompt_sha256": "f046fd14c4a78b7967f57028ad939debbb5d0154b3628649dbcf55b06783ddbe",
+      "prompt_version": "letter-v1",
+      "answer_token_ids": [
+       542,
+       543
+      ],
+      "allowed_token_mass": 1.0,
+      "full_vocab_argmax_id": -1,
+      "option_logits": [
+       24.339780807495117,
+       32.914306640625
+      ]
+     }
+    },
+    "usage": {
+     "input_tokens": 56,
+     "output_tokens": 0,
+     "cached_tokens": 42,
+     "state_cache_hit": true,
+     "head_mode": "selected"
+    },
+    "head": {
+     "mode": "selected",
+     "fallback": false
+    },
+    "diagnostics": {
+     "contract_hash": "dc11458851f22827e9333dd529a724f5834be3ff8844ca4db84c91b73ef220e6",
+     "prompt_version": "letter-v1",
+     "suffix_tokens": 63,
+     "common_suffix_tokens": 0,
+     "model": "lfm2.5-350m-gguf/latest.gguf",
+     "quantization": "2",
+     "template_hash": "decision-prefix-v1:95f038da5f9e69be",
+     "backend_flags": "fa=0,k=1,v=1,unified=1,swa=0,ubatch=512"
+    }
+   },
+   "legacy": {
+    "object": "decision",
+    "results": [
+     {
+      "decision": {
+       "category": "billing",
+       "urgent": true
+      },
+      "fields": {
+       "category": {
+        "value": "billing",
+        "probability": 0.9657906889915466,
+        "scored_nodes": 1,
+        "tree": true
+       },
+       "urgent": {
+        "value": true,
+        "probability": 0.9848628640174866,
+        "scored_nodes": 1,
+        "tree": true
+       }
+      },
+      "usage": {
+       "context_tokens": 16,
+       "scored_rows": 10
+      }
+     }
+    ],
+    "model": "lfm2.5-350m-gguf/latest.gguf",
+    "usage": {
+     "prompt_tokens": 91,
+     "cached_tokens": 0,
+     "context_tokens": 16,
+     "scored_rows": 10
+    }
+   }
+  }
+ }
 }

@@ -20,6 +20,7 @@
 #include "decision-protocol.h"
 #include "labels.h"
 #include "letter_readout.h"
+#include "server-decision-state.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -857,23 +858,7 @@ public:
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
-    std::unique_ptr<llama_decision::engine> decision_engine; // created by the first /decision request
-    // Separate engine for the letter readout: it runs on the classifier-only context when that
-    // context is available, so its prefix cache does not thrash against the trie engine.
-    std::unique_ptr<llama_decision::engine> decision_letter_engine;
-    llama_context *                             decision_letter_engine_ctx = nullptr;
-    std::unique_ptr<llama_decision::label_vocab> decision_label_vocab; // letter readout, built once per context
-    std::vector<llama_decision::label>          decision_labels;
-    llama_decision::answer_head_cache           decision_head_cache; // owns the answer-row tables for this context
-    std::string                                 decision_label_error; // set when the vocabulary probe fails
-    // Classifier-only context for the letter readout: shares the model weights, produces hidden
-    // states instead of logits, and is created on first use. Null means the letter path keeps
-    // reading full logits from the shared context.
-    llama_context *                             ctx_decision = nullptr;
-    std::string                                 ctx_decision_error;
-    std::string                                 decision_contract;    // identity of the decision readout contract
-    bool                                        decision_temp_loaded = false;
-    llama_decision::temperature_profile         decision_temp_profile;
+    server_decision_state decision; // all /v1/decision state tied to the loaded model
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
@@ -967,13 +952,7 @@ private:
         ctx_dft   = nullptr;
         model_dft = nullptr;
 
-        if (ctx_decision) {
-            llama_free(ctx_decision);
-            ctx_decision = nullptr;
-        }
-        decision_engine.reset();
-        decision_letter_engine.reset();
-        decision_letter_engine_ctx = nullptr;
+        decision.reset();
 
         llama_init.reset();
 
@@ -2409,7 +2388,7 @@ private:
     // shares the model weights and is created on first use. On failure the letter path keeps the
     // shared context and reports why the fast path is off.
     llama_context * decision_hidden_ctx() {
-        if (ctx_decision == nullptr && ctx_decision_error.empty()) {
+        if (decision.ctx_decision == nullptr && decision.ctx_decision_error.empty()) {
             llama_context_params cp = common_context_params_to_llama(params_base);
             cp.classifier_only = true;
             // this context serves only the decision engine, so it needs no chat slots and can be
@@ -2418,16 +2397,16 @@ private:
             if (params_base.n_ctx_decision > 0) {
                 cp.n_ctx = params_base.n_ctx_decision;
             }
-            ctx_decision = llama_init_from_model(model_tgt, cp);
-            if (ctx_decision == nullptr) {
-                ctx_decision_error = "the classifier-only decision context could not be created";
-                SRV_WRN("%s; the letter readout falls back to full logits\n", ctx_decision_error.c_str());
+            decision.ctx_decision = llama_init_from_model(model_tgt, cp);
+            if (decision.ctx_decision == nullptr) {
+                decision.ctx_decision_error = "the classifier-only decision context could not be created";
+                SRV_WRN("%s; the letter readout falls back to full logits\n", decision.ctx_decision_error.c_str());
             } else {
                 SRV_INF("decision classifier-only context created: %u cells, %d sequences\n",
-                        llama_n_ctx(ctx_decision), params_base.n_seq_decision);
+                        llama_n_ctx(decision.ctx_decision), params_base.n_seq_decision);
             }
         }
-        return ctx_decision;
+        return decision.ctx_decision;
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -2437,19 +2416,19 @@ private:
         if (params_base.n_seq_decision < 3) {
             throw std::invalid_argument("decisions are disabled: start the server with --decision-seqs N (N >= 3)");
         }
-        const bool has_jev = body.contains("questions") || body.contains("state");
+        const bool has_decision = body.contains("questions") || body.contains("state");
         const bool has_generic = body.contains("contexts") || body.contains("schema");
-        if (has_jev && has_generic) {
+        if (has_decision && has_generic) {
             throw llama_decision::semantic_error("request must be either state+questions or contexts+schema, not both");
         }
-        // Jev shape: state + typed questions, scored as one next-token choice over the
+        // Decision shape: state + typed questions, scored as one next-token choice over the
         // verified letter labels, sharing one framed state prefix across all questions.
-        if (llama_decision::is_jev_request(body)) {
-            llama_decision::jev_request req = llama_decision::parse_jev_request(body);
+        if (llama_decision::is_decision_request(body)) {
+            llama_decision::decision_request req = llama_decision::parse_decision_request(body);
             // An explicit request for an unavailable fast path is the only head case that errors;
             // the default path always falls back to full logits.
             const llama_decision::head_capability & head_cap =
-                decision_head_cache.probe(llama_get_model(ctx_tgt));
+                decision.decision_head_cache.probe(llama_get_model(ctx_tgt));
             llama_decision::require_selected_head(req.head, head_cap);
             // Prefer the classifier-only context: it turns the readout into a handful of answer-row
             // dots instead of a full-vocabulary projection. A request that forces "full" needs
@@ -2461,64 +2440,64 @@ private:
             }
             // the shared context keeps its chat slots below the decision sequences; the classifier
             // context has no slots, so its decision sequences start at zero
-            const llama_seq_id readout_seq_base = ctx_readout == ctx_decision
+            const llama_seq_id readout_seq_base = ctx_readout == decision.ctx_decision
                 ? 0 : (llama_seq_id) params_base.n_parallel;
-            if (decision_letter_engine_ctx != ctx_readout) {
-                decision_letter_engine = std::make_unique<llama_decision::engine>(
+            if (decision.decision_letter_engine_ctx != ctx_readout) {
+                decision.decision_letter_engine = std::make_unique<llama_decision::engine>(
                     ctx_readout, readout_seq_base, params_base.n_seq_decision);
-                decision_letter_engine_ctx = ctx_readout;
+                decision.decision_letter_engine_ctx = ctx_readout;
             }
-            if (!decision_label_vocab) {
-                decision_label_vocab = llama_decision::make_llama_label_vocab(
+            if (!decision.decision_label_vocab) {
+                decision.decision_label_vocab = llama_decision::make_llama_label_vocab(
                     llama_model_get_vocab(llama_get_model(ctx_tgt)));
                 try {
                     const auto parts = llama_decision::render_letter_prompt(
                         chat_params.tmpls.get(), chat_params.use_jinja, llama_decision::letter_system_text());
                     const std::string tail = llama_decision::letter_answer_tail(parts.second);
-                    decision_labels = llama_decision::build_label_pool(*decision_label_vocab, tail);
-                    llama_decision::verify_label_pool(*decision_label_vocab, decision_labels, tail);
+                    decision.decision_labels = llama_decision::build_label_pool(*decision.decision_label_vocab, tail);
+                    llama_decision::verify_label_pool(*decision.decision_label_vocab, decision.decision_labels, tail);
                     const std::string template_hash = llama_decision::make_prefix_tag(
                         parts.first, parts.second, llama_decision::LETTER_PROMPT_VERSION);
-                    decision_contract = llama_decision::decision_contract_hash(
+                    decision.decision_contract = llama_decision::decision_contract_hash(
                         model_name, template_hash, llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt))));
-                    SRV_INF("decision contract: %s\n", decision_contract.c_str());
-                    if (!params_base.decision_contract.empty() && params_base.decision_contract != decision_contract) {
-                        decision_label_error = "decision contract mismatch: expected " + params_base.decision_contract +
-                                               ", running " + decision_contract;
+                    SRV_INF("decision contract: %s\n", decision.decision_contract.c_str());
+                    if (!params_base.decision_contract.empty() && params_base.decision_contract != decision.decision_contract) {
+                        decision.decision_label_error = "decision contract mismatch: expected " + params_base.decision_contract +
+                                               ", running " + decision.decision_contract;
                     }
                 } catch (const std::exception & e) {
-                    decision_label_error = e.what();
+                    decision.decision_label_error = e.what();
                 }
             }
-            if (!decision_label_error.empty()) {
+            if (!decision.decision_label_error.empty()) {
                 throw llama_decision::unsupported_error(
-                    "this model cannot serve decision questions: " + decision_label_error);
+                    "this model cannot serve decision questions: " + decision.decision_label_error);
             }
 
             if (!params_base.decision_temperature.empty()) {
-                if (!decision_temp_loaded) {
+                if (!decision.decision_temp_loaded) {
                     std::ifstream in(params_base.decision_temperature);
                     if (!in) {
                         throw std::runtime_error("cannot read --decision-temperature file: " + params_base.decision_temperature);
                     }
                     std::stringstream ss;
                     ss << in.rdbuf();
-                    decision_temp_profile = llama_decision::parse_temperature_profile(json::parse(ss.str()));
+                    decision.decision_temp_profile = llama_decision::parse_temperature_profile(json::parse(ss.str()));
 
                     const llama_decision::temperature_provenance current =
                         llama_decision::decision_provenance_current(model_name, params_base, llama_get_model(ctx_tgt),
                                                                     chat_params.tmpls.get(), chat_params.use_jinja);
                     try {
-                        llama_decision::validate_temperature_profile(decision_temp_profile, current);
+                        llama_decision::validate_temperature_profile(decision.decision_temp_profile, current);
                     } catch (const llama_decision::semantic_error & e) {
                         // a stale profile is a server configuration problem, not a client error
                         throw std::runtime_error(std::string("decision temperature profile: ") + e.what());
                     }
-                    decision_temp_loaded = true;
+                    decision.decision_temp_loaded = true;
                 }
                 if (!req.temperatures.is_object()) {
                     json temps = json::object();
-                    for (const auto & kv : decision_temp_profile.temperatures) {
+                    for (const auto & kv : decision.decision_temp_profile.temperatures) {
                         temps[kv.first] = kv.second;
                     }
                     req.temperatures = temps;
@@ -2541,10 +2520,10 @@ private:
             std::vector<std::vector<float>> probs;
             // run inside a yield so metrics/slot requests are served while the decision computes
             queue_tasks.yield_to_queue([&]() {
-                probs = llama_decision::letter_readout(*decision_letter_engine, decision_head_cache,
-                                                       *decision_label_vocab,
+                probs = llama_decision::letter_readout(*decision.decision_letter_engine, decision.decision_head_cache,
+                                                       *decision.decision_label_vocab,
                                                        chat_params.tmpls.get(), chat_params.use_jinja,
-                                                       req, decision_labels, jopt, &metrics, &audit);
+                                                       req, decision.decision_labels, jopt, &metrics, &audit);
             });
 
             json usage = json::object();
@@ -2555,7 +2534,7 @@ private:
             usage["head_mode"]       = metrics.head_active ? "selected" : "full";
 
             const std::string echo = req.model.empty() ? model_name : req.model;
-            json out = llama_decision::assemble_jev_response(req, probs, echo, usage, &audit);
+            json out = llama_decision::assemble_decision_response(req, probs, echo, usage, &audit);
             // the fast path is optional; report how the answer was actually read out
             const bool head_fallback = req.head != "full" && !metrics.head_active;
             out["head"] = json::object();
@@ -2563,13 +2542,13 @@ private:
             out["head"]["fallback"] = head_fallback;
             if (head_fallback) {
                 const std::string & reason = !metrics.head_reason.empty() ? metrics.head_reason
-                                          : !ctx_decision_error.empty()   ? ctx_decision_error
+                                          : !decision.ctx_decision_error.empty()   ? decision.ctx_decision_error
                                                                           : head_cap.reason;
                 out["head"]["reason"] = reason;
             }
             // additive diagnostics: the readout contract identity this server is running
             out["diagnostics"] = json::object();
-            out["diagnostics"]["contract_hash"]  = decision_contract;
+            out["diagnostics"]["contract_hash"]  = decision.decision_contract;
             out["diagnostics"]["prompt_version"] = llama_decision::LETTER_PROMPT_VERSION;
             out["diagnostics"]["prefill_ms"]     = metrics.prefill_ms;
             out["diagnostics"]["scoring_ms"]     = metrics.scoring_ms;
@@ -2600,8 +2579,8 @@ private:
         if (!body.contains("schema")) {
             throw std::invalid_argument("\"schema\" must be provided");
         }
-        if (!decision_engine) {
-            decision_engine = std::make_unique<llama_decision::engine>(ctx_tgt, (llama_seq_id) params_base.n_parallel,
+        if (!decision.decision_engine) {
+            decision.decision_engine = std::make_unique<llama_decision::engine>(ctx_tgt, (llama_seq_id) params_base.n_parallel,
                                                                         params_base.n_seq_decision);
         }
         const auto cs = llama_decision::compile_schema(body.at("schema"), body.value("instructions", std::string()));
@@ -2629,7 +2608,7 @@ private:
         llama_decision::batch_result b;
         // run inside a yield so metrics/slot requests are served while the decision computes
         queue_tasks.yield_to_queue([&]() {
-            b = decision_engine->decide_batch(shared, dynamic, cs.inputs, opt);
+            b = decision.decision_engine->decide_batch(shared, dynamic, cs.inputs, opt);
         });
 
         size_t context_tokens = 0;

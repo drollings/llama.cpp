@@ -1,5 +1,7 @@
 #include "decision-protocol.h"
 
+#include "chat.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -9,6 +11,38 @@
 
 namespace llama_decision {
 
+uint64_t fnv1a64(const std::string & s) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+std::pair<std::string, std::string> split_chat_template(const common_chat_templates * tmpls, bool use_jinja,
+                                                        const std::string & system_text, bool enable_thinking) {
+    static const std::string sentinel = "\x1f<<decision-context>>\x1f";
+    common_chat_templates_inputs in;
+    in.use_jinja             = use_jinja;
+    in.add_generation_prompt = true;
+    in.enable_thinking       = enable_thinking;
+    common_chat_msg sys;
+    sys.role    = "system";
+    sys.content = system_text;
+    common_chat_msg usr;
+    usr.role    = "user";
+    usr.content = sentinel;
+    in.messages = { sys, usr };
+    const std::string prompt = common_chat_templates_apply(tmpls, in).prompt;
+    const size_t at = prompt.find(sentinel);
+    if (at == std::string::npos) {
+        throw std::runtime_error("the chat template did not keep the user message");
+    }
+    return { prompt.substr(0, at), prompt.substr(at + sentinel.size()) };
+}
+
+// Structured criteria values keep their shape as text for the model; null is empty.
 std::string render_text(const common_json & v) {
     if (v.is_string()) {
         return v.get<std::string>();
@@ -23,11 +57,6 @@ namespace {
 
 bool is_textual(const common_json & v) {
     return v.is_string() || v.is_object() || v.is_array();
-}
-
-// Structured criteria values keep their shape as text for the model; null is empty.
-std::string render(const common_json & v) {
-    return render_text(v);
 }
 
 void check_allowed_keys(const common_json & obj, std::initializer_list<const char *> allowed, const std::string & where) {
@@ -71,7 +100,7 @@ void validate_state(const common_json & s) {
     throw semantic_error("state must be a string, object or array");
 }
 
-jev_question parse_question(const std::string & id, const common_json & spec) {
+decision_question parse_question(const std::string & id, const common_json & spec) {
     if (!spec.is_object()) {
         throw semantic_error("question \"" + id + "\" must be an object");
     }
@@ -82,7 +111,7 @@ jev_question parse_question(const std::string & id, const common_json & spec) {
     }
     const std::string raw_type = spec.at("type").get<std::string>();
 
-    jev_question q;
+    decision_question q;
     q.id          = id;
     q.type        = canonical_type(raw_type);
     q.has_criteria = spec.contains("criteria") && !spec.at("criteria").is_null();
@@ -100,8 +129,8 @@ jev_question parse_question(const std::string & id, const common_json & spec) {
     }
 
     if (q.type == "noul") {
-        jev_option no;
-        jev_option yes;
+        decision_option no;
+        decision_option yes;
         no.key  = "false";
         yes.key = "true";
         if (q.has_criteria) {
@@ -115,10 +144,10 @@ jev_question parse_question(const std::string & id, const common_json & spec) {
                 }
             }
             if (crit.contains("false")) {
-                no.description = render(crit.at("false"));
+                no.description = render_text(crit.at("false"));
             }
             if (crit.contains("true")) {
-                yes.description = render(crit.at("true"));
+                yes.description = render_text(crit.at("true"));
             }
         }
         q.options = { no, yes };
@@ -134,9 +163,9 @@ jev_question parse_question(const std::string & id, const common_json & spec) {
             if (e.key().empty()) {
                 throw semantic_error("question \"" + id + "\": option keys must not be empty");
             }
-            jev_option o;
+            decision_option o;
             o.key         = e.key();
-            o.description = render(e.value());
+            o.description = render_text(e.value());
             o.original    = e.value();
             q.options.push_back(o);
         }
@@ -150,9 +179,9 @@ jev_question parse_question(const std::string & id, const common_json & spec) {
                 throw semantic_error("question \"" + id + "\": score needs 2-64 levels");
             }
             for (size_t i = 0; i < crit.size(); ++i) {
-                jev_option o;
+                decision_option o;
                 o.key         = std::to_string(i);
-                o.description = render(crit.at(i));
+                o.description = render_text(crit.at(i));
                 o.original    = crit.at(i);
                 q.options.push_back(o);
             }
@@ -165,9 +194,9 @@ jev_question parse_question(const std::string & id, const common_json & spec) {
                 if (e.key() != std::to_string(i)) {
                     throw semantic_error("question \"" + id + "\": score legend keys must be \"0\"..\"K-1\" in order");
                 }
-                jev_option o;
+                decision_option o;
                 o.key         = std::to_string(i);
-                o.description = render(e.value());
+                o.description = render_text(e.value());
                 o.original    = e.value();
                 q.options.push_back(o);
                 ++i;
@@ -261,7 +290,7 @@ void validate_temperature_profile(const temperature_profile & profile, const tem
     }
 }
 
-double question_temperature(const jev_request & req, const jev_question & q) {
+double question_temperature(const decision_request & req, const decision_question & q) {
     if (req.temperatures.is_object() && req.temperatures.contains(q.type)) {
         const common_json & v = req.temperatures.at(q.type);
         if (v.is_number()) {
@@ -271,17 +300,17 @@ double question_temperature(const jev_request & req, const jev_question & q) {
     return req.temperature;
 }
 
-bool is_jev_request(const common_json & body) {
+bool is_decision_request(const common_json & body) {
     return body.is_object() && (body.contains("questions") || body.contains("state"));
 }
 
-jev_request parse_jev_request(const common_json & body) {
+decision_request parse_decision_request(const common_json & body) {
     if (!body.is_object()) {
         throw semantic_error("request must be an object");
     }
     check_allowed_keys(body, { "model", "state", "questions", "temperature", "temperatures", "permutations", "head" }, "request");
 
-    jev_request req;
+    decision_request req;
 
     if (body.contains("model") && !body.at("model").is_null()) {
         if (!body.at("model").is_string()) {
@@ -360,7 +389,7 @@ jev_request parse_jev_request(const common_json & body) {
     return req;
 }
 
-std::vector<std::vector<float>> uniform_probs(const jev_request & req) {
+std::vector<std::vector<float>> uniform_probs(const decision_request & req) {
     std::vector<std::vector<float>> out;
     out.reserve(req.questions.size());
     for (const auto & q : req.questions) {
@@ -425,7 +454,7 @@ std::string sha256_hex(const std::string & text) {
     return std::string(buf);
 }
 
-common_json assemble_jev_response(const jev_request & req,
+common_json assemble_decision_response(const decision_request & req,
                                   const std::vector<std::vector<float>> & probs,
                                   const std::string & model,
                                   const common_json & usage,
@@ -434,7 +463,7 @@ common_json assemble_jev_response(const jev_request & req,
 
     common_json answers = common_json::object();
     for (size_t qi = 0; qi < req.questions.size(); ++qi) {
-        const jev_question & q = req.questions[qi];
+        const decision_question & q = req.questions[qi];
         std::vector<float> p = (qi < probs.size() && !probs[qi].empty()) ? probs[qi] : uniform[qi];
         if (p.size() != q.options.size()) {
             p = uniform[qi];

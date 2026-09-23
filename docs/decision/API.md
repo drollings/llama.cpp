@@ -7,9 +7,8 @@ Section 0 first: it fixes the endpoint name, defines every term used later,
 and (Section 0.6) introduces the technical challenges of serving this API
 inside llama.cpp. Sections 1 onward are the contract.
 
-Status: implemented on branch `_decision_synthesis`. A passage marked
-DEFERRED is not built here; today only the optional selected-head fast path is
-deferred (Section 6.1).
+Status: implemented on branch `_decision_synthesis_2`. A passage marked
+DEFERRED is not built here; nothing is currently deferred.
 
 The endpoint naming is the one deliberate difference from Jev, and it is
 settled:
@@ -66,7 +65,7 @@ the client dials. The three question primitives are:
 ### 0.3 What this repository is and which branch this is
 
 This is `llama.cpp`, a C/C++ inference engine for GGUF-quantized LLMs. The
-relevant local branch is `_decision_synthesis`. The decision feature is these
+relevant local branch is `_decision_synthesis_2`. The decision feature is these
 files:
 
 - engine (`tools/parallel-decision/decision-engine.{h,cpp}`, namespace
@@ -95,11 +94,11 @@ reference material only. Do not assume `tools/server/winnow/` exists.
 
 What a fresh reader can rely on for this branch:
 
-| Area | As built on `_decision_synthesis` |
+| Area | As built on `_decision_synthesis_2` |
 |---|---|
 | Routes | `POST /v1/decision` canonical; `POST /decision` deprecated alias; no `/v1/systemone` |
 | Request | both shapes: Jev `state` + `questions`, and generic `contexts[]` + `schema` |
-| Response | Jev `{model, answers{qid}, usage}`; generic `{object:"decision", results:[...], usage, timings}` |
+| Response | Jev `{model, answers{qid}, usage}` + additive `head` and `diagnostics`; generic `{object:"decision", results:[...], usage, timings}` |
 | Readout | dual: letter labels (Jev) and surface-form trie (generic), one engine and one softmax |
 | Errors | full contract in Section 4 (400/401/413/415/422/429/499/500/501/529) |
 | Fork | probe: copy fast path (`llama_memory_seq_cp`) or `llama_state_seq` save/restore on hybrid/recurrent memory; SWA clamp |
@@ -110,7 +109,7 @@ What a fresh reader can rely on for this branch:
 | Audit | `allowed_token_mass`, `full_vocab_argmax_id`, `answer_token_ids`, `option_logits`, `prompt_sha256`, `prompt_version`, `probability_status` |
 | Provenance | contract hash (tokenizer + template + label code), logged and returned |
 | Mode | `auto`/`tree`/`greedy`, `tree_max`, `cache_prompt` for the trie path |
-| DEFERRED | optional selected-head fast path (Section 6.1); the capability seam exists and always falls back to full logits |
+| Head | selected-head fast path (Section 6.1): classifier-only graph + answer-row dot product; `auto`/`selected`/`full`; falls back to full logits unless `selected` is forced and unavailable |
 
 ### 0.5 Glossary
 
@@ -205,11 +204,13 @@ in the order a newcomer meets them:
    `option_logits`) so prompt drift or a wrong readout shows up as data instead
    of a silently wrong answer.
 
-9. **Optional fast head (DEFERRED).** A production server could project only
-   the K answer rows instead of the whole vocabulary, which needs a hidden-state
-   seam in the model graph. This branch ships the capability probe and an
-   unconditional fallback to full logits; the projection itself is left to a
-   separate multi-family effort (Section 6.1).
+9. **Selected-head fast path.** A classifier-only context stops the graph after
+   the final normalization layer, skipping the full-vocabulary projection;
+   `llama_model_classifier_rows` dequantizes only the K answer rows, scored with
+   a host-side dot product. When the head is unavailable (unsupported arch,
+   hidden states absent, row/layout mismatch) the readout falls back to full
+   logits; only an explicit `head: "selected"` on an unavailable head is an
+   error (Section 6.1).
 
 Everything after this section is the contract that these challenges produce:
 request (Section 2), response (Section 3), errors (Section 4), and the chosen
@@ -291,6 +292,11 @@ reject unknown top-level or per-question fields.
   shuffle, per-order softmax then mean by semantic key (seeded by
   `(seed, qid)`; noul second order = swapped). Values above 8 are accepted and
   capped at 8; document the measured cost (~1.1x for 2).
+* `head` (optional, string): scoring path. Omit or `""` for auto; `"full"`
+  forces full-vocabulary logits on the shared context; `"selected"` requests
+  the answer-head fast path (Section 6.1). The default path uses the head when
+  it is available and silently falls back to full logits otherwise; an explicit
+  `head: "selected"` on an unavailable head is a client error (400).
 
 ### 2.2 Question types (canonical names)
 
@@ -357,7 +363,8 @@ selects the trie readout. Never mix both in one call.
                "confidence": c, "certainty": c}
   },
   "usage": {"input_tokens": N, "output_tokens": 0,
-            "cached_tokens": M, "state_cache_hit": true|false}
+            "cached_tokens": M, "state_cache_hit": true|false,
+            "head_mode": "selected"|"full"}
 }
 ```
 
@@ -382,13 +389,13 @@ selects the trie readout. Never mix both in one call.
 * `usage.output_tokens` MUST be 0 (warmup/branch tokens are accounting-only).
   `usage.input_tokens` includes cache hits + warmup and counts a shared prefix
   ONCE. `cached_tokens` and `state_cache_hit` expose prefix-cache behavior.
-* Optional diagnostics object (winnow-style, opt-in via request flag):
-  per-answer `{logits, temperature, probability_semantics:
-  "conditional_on_answers", confidence_method:
-  "normalized_inverse_entropy"}` plus timings
-  `{tokenize/prefill/questions/decode_ms, cache_hit, waves,
-  suffix_tokens}`. Never enabled by default; with diagnostics off, the
-  response carries no keys beyond the frozen Jev shape.
+* The response always carries two additive objects beyond the frozen Jev shape.
+  `head` reports how the answer was read out (`mode: selected|full`, `fallback`,
+  and a `reason` when it fell back). `diagnostics` reports the readout identity
+  (`contract_hash`, `prompt_version`, `model`, `quantization`,
+  `template_hash`, `backend_flags`) and timings (`prefill_ms`, `scoring_ms`,
+  `suffix_tokens`, `common_suffix_tokens`). These are additive and never change
+  an answer.
 
 ### 3.2 Worked example
 
@@ -419,7 +426,8 @@ Response:
                "legend": {"0": "low", "1": "medium", "2": "high"},
                "confidence": 0.74, "certainty": 0.35}},
  "usage": {"input_tokens": 412, "output_tokens": 0,
-           "cached_tokens": 180, "state_cache_hit": false}}
+           "cached_tokens": 180, "state_cache_hit": false,
+           "head_mode": "selected"}}
 ```
 
 ---
@@ -508,8 +516,7 @@ non-calibrated; assemble-by-code; never truncate (reject over-limit).
 
 ### 6.1 Selected: llama.cpp dual-readout + hybrid fork + optional adapters
 
-This is what the branch implements. Every bullet below is as-built unless it is
-marked DEFERRED.
+This is what the branch implements. Every bullet below is as-built.
 
 * Prompt (Section 2): `apply_chat_template(add_generation_prompt=true,
   enable_thinking=false)`; raw fallback `system + "\nContext:\n" + state`.
@@ -540,15 +547,15 @@ marked DEFERRED.
   AFTER the scored position; per-row last-valid gather; logits at selected
   positions only; semaphore-bounded concurrency; cooperative yield + atomic
   cancel.
-* Head fast path (DEFERRED, auto-detected seam only): a production build could
-  project only the K label rows in FP32 (Nimble union-projection / winnow
-  `classifier_rows`), re-applying softcap where it applies, and fall back to
-  full-logits+gather on any arch/head/layout mismatch. This branch ships the
-  capability probe only: it reports the fast path as unavailable and always
-  reads full logits, so every answer is correct and no row table is built. The
-  explicit `head: "selected"` request returns a plain 400; the default path
-  never errors on head. The projection itself belongs to a separate
-  multi-family head effort. `option_logits` and probabilities are both
+* Head fast path (implemented): a classifier-only context stops the graph after
+  the final normalization layer, and `llama_model_classifier_rows` dequantizes
+  only the K answer rows, scored with a host-side dot product (re-applying the
+  logit softcap where the architecture has one). The head is used when the
+  architecture supports the classifier stop and the hidden state and answer
+  rows match; on any arch/head/layout mismatch it falls back to full-logits +
+  gather, so an unavailable head never changes an answer. An explicit
+  `head: "selected"` on an unavailable head is a client error (400). The row
+  table is cached per model. `option_logits` and probabilities are both
   exposed; full-vocab probabilities never are.
 * Order de-bias: `permutations` (default 1, capped 8), identity plus seeded
   distinct shuffles, per-order softmax then mean by option key. Default 1 is
@@ -660,7 +667,7 @@ Rules:
 
 ## 8. Minimal implementation checklist (any back-end)
 
-Status on `_decision_synthesis`: items 1-7 and 9, 11, 12 are implemented;
+Status on `_decision_synthesis_2`: items 1-7 and 9, 11, 12 are implemented;
 item 8 is implemented except the optional latency headers; item 10 ships the
 permutation option but not an offline refit script.
 

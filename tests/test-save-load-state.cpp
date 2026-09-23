@@ -503,10 +503,87 @@ static bool test_state_roundtrip(struct llama_model * model, const struct common
         return false;
     }
 
-    LOG("\nPASS\n");
+LOG("\nPASS\n");
     return true;
 }
 
+// Test 10: device byte-cursor read path
+// - decode a prompt into seq 0 (several KV cells)
+// - save the device-format state blob
+// - delete a middle cell so the restore's read-side ranges differ from the write-side ranges
+// - restore the blob and assert the re-saved state is byte-identical
+// exercises llama_io_read_device's byte walk and the single-synchronize staging; the CPU backend
+// falls back to a blocking copy, so this runs in CI without a GPU
+static bool test_device_byte_cursor(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_ctx      = 256;
+    params_ctx.n_seq_max  = 2;
+    params_ctx.kv_unified = true;
+
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+    if (!ctx) {
+        LOG_ERR("%s: failed to create context\n", __func__);
+        return false;
+    }
+
+    LOG("\n=== Test 10: device byte-cursor read path ===\n");
+
+    // a middle-cell deletion needs a cell-level KV cache; recurrent memory cannot erase a
+    // partial middle range, so the non-same-chunking read path does not apply there
+    if (llama_model_is_recurrent(model) || llama_model_is_hybrid(model)) {
+        LOG("SKIP: middle-cell deletion is not supported on recurrent memory\n");
+        return true;
+    }
+
+    const size_t n_tokens = tokens.size() < 64 ? tokens.size() : 64;
+    if (n_tokens < 4) {
+        LOG_ERR("%s: need at least 4 tokens\n", __func__);
+        return false;
+    }
+
+    llama_batch_ptr batch(n_tokens, 0, 1);
+    for (size_t i = 0; i < n_tokens; ++i) {
+        common_batch_add(batch.get(), tokens[i], (llama_pos) i, { 0 }, i == n_tokens - 1);
+    }
+    if (llama_decode(ctx.get(), batch.get())) {
+        LOG_ERR("%s: failed to decode prompt\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> blob(llama_state_seq_get_size_ext(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
+    if (blob.empty() ||
+        llama_state_seq_get_data_ext(ctx.get(), blob.data(), blob.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != blob.size()) {
+        LOG_ERR("%s: failed to save the device-format state\n", __func__);
+        return false;
+    }
+
+    // drop one middle cell so the read-side ranges no longer match the write-side ranges
+    const llama_pos mid = (llama_pos) n_tokens / 2;
+    if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, mid, mid)) {
+        LOG_ERR("%s: failed to remove the middle cell\n", __func__);
+        return false;
+    }
+
+    if (llama_state_seq_set_data_ext(ctx.get(), blob.data(), blob.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != blob.size()) {
+        LOG_ERR("%s: failed to restore the device-format state\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> reblob(llama_state_seq_get_size_ext(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
+    if (reblob.empty() ||
+        llama_state_seq_get_data_ext(ctx.get(), reblob.data(), reblob.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != reblob.size()) {
+        LOG_ERR("%s: failed to re-save the restored state\n", __func__);
+        return false;
+    }
+    if (reblob != blob) {
+        LOG_ERR("%s: restored state differs from the saved state (%zu vs %zu bytes)\n",
+                __func__, reblob.size(), blob.size());
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
 
 // Test 9: format separation
 // - save the same sequence as a device blob and then as a host blob
@@ -664,6 +741,11 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
 
     // Test 9: device and host formats are distinct and each round-trips
     if (!test_format_separation(model, params, tokens)) {
+        return false;
+    }
+
+    // Test 10: device byte-cursor read path survives a middle-cell gap
+    if (!test_device_byte_cursor(model, params, tokens)) {
         return false;
     }
 

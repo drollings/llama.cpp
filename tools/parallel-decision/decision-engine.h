@@ -179,10 +179,9 @@ class engine {
 
     enum class fork_kind { copy, restore };
 
-    // A saved sequence state carries its own storage format, so a load never has to guess: the
-    // bytes and the flag travel together. The device format stages the tensor bytes in the context
-    // staging buffer and returns only metadata, so it is valid only while nothing saves over that
-    // buffer; any state that must outlive the current request uses the host format.
+    // The device and host formats are distinct and the flag travels with the bytes, so a load
+    // never guesses. The device format stages tensor bytes in the context staging buffer (valid
+    // only until something saves over it); host format outlives the request. Empty state is invalid.
     struct saved_state {
         std::vector<uint8_t> bytes;
         bool                 on_device = false;

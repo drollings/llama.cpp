@@ -3359,7 +3359,7 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
 }
 
 int32_t llama_model_classifier_rows(const llama_model * model, const llama_token * ids, int32_t count, float * dst, size_t dst_count, float * softcap, float * bias_dst) {
-    if (!model || !ids || !dst || !softcap || count < 2 || count > 64 ||
+    if (!model || !ids || !dst || !softcap || count < 1 || count > 64 ||
             !llm_arch_supports_classifier(model->arch) || !model->output || model->output_s) return 0;
     const auto * tensor = model->output;
     const auto width = tensor->ne[0];
@@ -3368,14 +3368,18 @@ int32_t llama_model_classifier_rows(const llama_model * model, const llama_token
     const auto * traits = ggml_get_type_traits(tensor->type);
     if (tensor->type != GGML_TYPE_F32 && !traits->to_float) return 0;
 
-    // a per-id output bias must be readable whenever the model has one, else every score would
-    // silently drop the bias; validate it regardless of whether the caller wants the values
+    // a per-id output bias must be readable element-wise whenever the model has one, else every
+    // score would silently drop it; validate it regardless of whether the caller wants the values.
+    // Only a float (or element-wise dequantizable, e.g. F16/BF16) contiguous bias is supported: a
+    // block-quantized 1-D bias is refused (0 -> caller falls back to full logits) because its rows
+    // are block-granular, not per-element addressable.
     const ggml_tensor * bias = model->output_b;
     const ggml_type_traits * bias_traits = nullptr;
     if (bias != nullptr) {
         bias_traits = ggml_get_type_traits(bias->type);
-        if (!ggml_is_contiguous(bias) || bias->ne[0] != tensor->ne[1] ||
-                (bias->type != GGML_TYPE_F32 && (bias_traits == nullptr || bias_traits->to_float == nullptr))) {
+        const bool elementwise = bias->type == GGML_TYPE_F32 ||
+            (bias_traits && bias_traits->to_float && ggml_row_size(bias->type, 1) == ggml_type_size(bias->type));
+        if (!ggml_is_contiguous(bias) || bias->ne[0] != tensor->ne[1] || !elementwise) {
             return 0;
         }
     }
@@ -3400,6 +3404,10 @@ int32_t llama_model_classifier_rows(const llama_model * model, const llama_token
         if (model->arch == LLM_ARCH_GEMMA4) {
             *softcap = model->hparams.f_final_logit_softcapping;
         } else {
+            // Load-bearing: only GEMMA4 softcaps among the supported classifier arches, and
+            // f_final_logit_softcapping defaults to 30.0 and is never reset for qwen/lfm, so this
+            // else 0.0f branch is what keeps their reported softcap at "none". The other
+            // softcapping arches (gemma2/3/3n, grok, dflash) are excluded by llm_arch_supports_classifier.
             *softcap = 0.0f;
         }
         return int32_t(width);

@@ -139,9 +139,9 @@ Numeric fields take `aggregate`: `mode` (default), `median` or `mean`.
 | `tree_max` | 128 | per-field switch between tree and greedy |
 | `cache_prompt` | true | reuse the cached instructions + schema prefix |
 
-## Jev decision shape (`state` + `questions`)
+## Decision shape (`state` + `questions`)
 
-`POST /v1/decision` also accepts the Jev shape: one `state` and 1-256 typed `questions`
+`POST /v1/decision` also accepts the decision shape: one `state` and 1-256 typed `questions`
 (`noul` yes/no, `choice` pick-one, `score` ordered rating). Answers come back as one closed
 distribution per question, with `output_tokens` always 0:
 
@@ -261,7 +261,7 @@ With no file the default stays 1.0.
 ### Two readouts, one engine
 
 The same engine serves two readouts. The `contexts`/`schema` shape scores arbitrary token paths
-(trie or greedy) and is the general-purpose form. The Jev `state`/`questions` shape scores declared
+(trie or greedy) and is the general-purpose form. The decision `state`/`questions` shape scores declared
 answer labels and returns one closed distribution per typed question. Both share the prefix cache,
 the branch scorer, the softmax and the SWA clamp; the letter readout is a thin layer over the trie
 scorer, not a second implementation.

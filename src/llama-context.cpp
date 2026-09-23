@@ -1235,6 +1235,12 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         return true;
     }
 
+    // A classifier-only context has no logits and never samples, so a sampler would be silently
+    // ignored. Reject it at this single mutation point, matching the creation-time guard.
+    if (get_cparams().classifier_only && sampler != nullptr) {
+        throw std::runtime_error("cannot attach a sampler to a classifier-only context (classifier_only requires no sampler)");
+    }
+
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
     if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {

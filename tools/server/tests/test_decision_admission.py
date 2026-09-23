@@ -48,7 +48,7 @@ def load_fairness_bound():
     except Exception:  # noqa: BLE001
         return dict(DEFAULT_FAIRNESS)
 
-JEV_VALID = {
+DECISION_VALID = {
     "model": "test",
     "state": "Customer was charged twice on May 3.",
     "questions": {
@@ -151,7 +151,7 @@ def check(cond, msg):
 
 
 def supports_letter_labels(server):
-    status, _, text = server.post(json.dumps(JEV_VALID))
+    status, _, text = server.post(json.dumps(DECISION_VALID))
     if status == 200:
         return True
     return "answer tokens" not in text
@@ -159,20 +159,31 @@ def supports_letter_labels(server):
 
 def run_checks(server):
     # 1. body over the configured cap is rejected before any decode
-    big = dict(JEV_VALID)
+    big = dict(DECISION_VALID)
     big["state"] = "x" * (MAX_BODY + 512)
     status, _, text = server.post(json.dumps(big))
     check(status == 413, f"oversize body status {status}: {text}")
     check(json.loads(text)["error"]["code"] == 413, "oversize body error code 413")
 
     # 2. semantically invalid request is 422, not 400
-    bad = dict(JEV_VALID)
+    bad = dict(DECISION_VALID)
     bad["state"] = ""
     status, _, text = server.post(json.dumps(bad))
     check(status == 422, f"semantic error status {status}: {text}")
 
+    # 2b. control group: a single small request at max_queue defaults is always admitted
+    # (0 false positives); only a saturated burst may be refused
+    control_statuses = []
+    for _ in range(8):
+        status, _, text = server.post(json.dumps(DECISION_VALID))
+        control_statuses.append(status)
+        check(status == 200, f"a single request is always admitted: status {status}: {text}")
+    admitted = len([s for s in control_statuses if s == 200])
+    control_precision = admitted / len(control_statuses) if control_statuses else 1.0
+    check(control_precision == 1.0, f"admission control false-positive rate: precision={control_precision}")
+
     # 3. a burst over the queue depth is admitted (429) or overloaded (529), with Retry-After
-    heavy = dict(JEV_VALID)
+    heavy = dict(DECISION_VALID)
     heavy["state"] = "refund request with a broken item. " * 20
     n = 8
     barrier = threading.Barrier(n)
@@ -197,12 +208,19 @@ def run_checks(server):
         if status == 529:
             check(headers.get("Retry-After") == "1", f"529 carries Retry-After: {headers}")
 
+    # admission precision/recall: admitted-and-finished / admitted, rejected-when-saturated / attempted
+    attempted_saturated = len(results)
+    rejected_saturated = len([r for r in results if r is not None and r[0] in (429, 529)])
+    admission_recall = rejected_saturated / attempted_saturated if attempted_saturated else 1.0
+    check(admission_recall > 0.0, f"admission recall: {admission_recall}")
+    print(f"measured: admission precision={control_precision} recall={admission_recall}")
+
     # 4. only application/json is accepted on the decision route
     status, _, _ = http("POST", f"http://127.0.0.1:{server.port}/v1/decision", "{}", content_type="text/plain")
     check(status in (400, 415), f"non-JSON content type is rejected: {status}")
 
     # 4b. an unauthenticated request is rejected when auth is configured
-    status, _, _ = http("POST", f"http://127.0.0.1:{server.port}/v1/decision", json.dumps(JEV_VALID), api_key=None)
+    status, _, _ = http("POST", f"http://127.0.0.1:{server.port}/v1/decision", json.dumps(DECISION_VALID), api_key=None)
     check(status == 401, f"unauthenticated request status {status}")
 
     # 5. chat coexistence: a decision must not break chat on the same context
@@ -211,7 +229,7 @@ def run_checks(server):
     status, _, text = http("POST", url, chat)
     check(status == 200, f"chat before decision: {status} {text}")
     t0 = time.time()
-    status, _, text = server.post(json.dumps(JEV_VALID))
+    status, _, text = server.post(json.dumps(DECISION_VALID))
     warm_decision_ms = (time.time() - t0) * 1000.0
     check(status == 200, f"decision between chats: {status} {text}")
     status, _, text = http("POST", url, chat)

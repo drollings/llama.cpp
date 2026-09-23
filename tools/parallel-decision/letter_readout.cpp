@@ -23,17 +23,13 @@ std::string render_state(const common_json & state) {
 }
 
 uint64_t permutation_seed(const std::string & question_id, int pass) {
-    uint64_t h = 1469598103934665603ull; // FNV offset basis
-    for (unsigned char c : question_id) {
-        h ^= c;
-        h *= 1099511628211ull;
-    }
+    uint64_t h = fnv1a64(question_id);
     h ^= (uint64_t) (uint32_t) pass * 0x9e3779b97f4a7c15ull;
     h *= 1099511628211ull;
     return h != 0 ? h : 1;
 }
 
-std::string format_letter_suffix_ordered(const jev_question & q, const std::vector<label> & labels,
+std::string format_letter_suffix_ordered(const decision_question & q, const std::vector<label> & labels,
                                          const std::string & after, const std::vector<size_t> & order) {
     std::string s = "\nQuestion: " + render_text(q.instructions) + "\nOptions:\n";
     for (size_t i = 0; i < order.size(); ++i) {
@@ -128,27 +124,10 @@ std::pair<std::string, std::string> render_letter_prompt(const common_chat_templ
     if (tmpls == nullptr) {
         return { system_text + "\n", "\n" };
     }
-    static const std::string sentinel = "\x1f<<decision-context>>\x1f";
-    common_chat_templates_inputs in;
-    in.use_jinja             = use_jinja;
-    in.add_generation_prompt = true;
-    in.enable_thinking       = enable_thinking;
-    common_chat_msg sys;
-    sys.role    = "system";
-    sys.content = system_text;
-    common_chat_msg usr;
-    usr.role    = "user";
-    usr.content = sentinel;
-    in.messages = { sys, usr };
-    const std::string prompt = common_chat_templates_apply(tmpls, in).prompt;
-    const size_t at = prompt.find(sentinel);
-    if (at == std::string::npos) {
-        throw std::runtime_error("the chat template did not keep the user message");
-    }
-    return { prompt.substr(0, at), prompt.substr(at + sentinel.size()) };
+    return split_chat_template(tmpls, use_jinja, system_text, enable_thinking);
 }
 
-void validate_label_capacity(const jev_request & req, size_t label_count) {
+void validate_label_capacity(const decision_request & req, size_t label_count) {
     for (const auto & q : req.questions) {
         if (q.options.size() > label_count) {
             throw semantic_error("question \"" + q.id + "\" has more options than available answer labels");
@@ -248,6 +227,16 @@ const classifier_head & answer_head_cache::for_labels(const llama_model * model,
     return head_;
 }
 
+void answer_head_cache::clear() {
+    cap_set_   = false;
+    cap_model_ = nullptr;
+    capability_ = {};
+    head_set_   = false;
+    head_model_ = nullptr;
+    head_ids_.clear();
+    head_ = {};
+}
+
 void require_selected_head(const std::string & requested, const head_capability & cap) {
     if (requested == "selected" && !cap.available) {
         throw std::invalid_argument("head \"selected\" is not available: " + cap.reason);
@@ -263,7 +252,7 @@ void verify_label_pool(const label_vocab & vocab, const std::vector<label> & lab
 }
 
 void verify_letter_request(const label_vocab & vocab, const std::string & after,
-                           const jev_request & req, const std::vector<label> & labels) {
+                           const decision_request & req, const std::vector<label> & labels) {
     const std::string tail = letter_answer_tail(after);
     // the boundary is a fixed property of (tail, label), not of a question, so tokenize each
     // label once and let the per-question walk look the result up
@@ -288,7 +277,7 @@ void verify_letter_request(const label_vocab & vocab, const std::string & after,
     }
 }
 
-std::string format_letter_suffix(const jev_question & q, const std::vector<label> & labels,
+std::string format_letter_suffix(const decision_question & q, const std::vector<label> & labels,
                                  const std::string & after) {
     std::vector<size_t> order(q.options.size());
     for (size_t i = 0; i < order.size(); ++i) {
@@ -301,7 +290,7 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
                                                answer_head_cache & head_cache,
                                                const label_vocab & vocab,
                                                const common_chat_templates * tmpls, bool use_jinja,
-                                               const jev_request & req,
+                                               const decision_request & req,
                                                const std::vector<label> & labels,
                                                const options & opt,
                                                letter_metrics * metrics,
@@ -320,7 +309,7 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
     std::vector<size_t>              field_question; // per field: owning question index
     fields.reserve(req.questions.size() * (size_t) n_perm);
     for (size_t qi = 0; qi < req.questions.size(); ++qi) {
-        const jev_question & q = req.questions[qi];
+        const decision_question & q = req.questions[qi];
         const size_t k = q.options.size();
         for (int o = 0; o < n_perm; ++o) {
             std::vector<size_t> order = permutation_order(k, q.id, o);

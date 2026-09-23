@@ -1,15 +1,19 @@
 #pragma once
 
-// Jev decision request/response bridge: the wire shape on one side, the internal
+// Decision request/response bridge: the wire shape on one side, the internal
 // per-question option lists on the other. Pure JSON logic, no llama calls, so it
 // can be unit tested without a model.
 
 #include "json.h"
 
+#include <cstdint>
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
+
+struct common_chat_templates;
 
 namespace llama_decision {
 
@@ -19,6 +23,18 @@ struct semantic_error : std::invalid_argument {
     using std::invalid_argument::invalid_argument;
 };
 
+// FNV-1a 64 over the bytes of `s` (offset basis 1469598103934665603, prime 1099511628211).
+// The single hash primitive behind the decision prefix tag and the permutation seed.
+uint64_t fnv1a64(const std::string & s);
+
+// Renders the chat template with a sentinel user message and returns the text before and after
+// the sentinel. `render_prompt` and `render_letter_prompt` share it and differ only in how they
+// use the split; `tmpls` must be non-null.
+std::pair<std::string, std::string> split_chat_template(const common_chat_templates * tmpls,
+                                                        bool use_jinja,
+                                                        const std::string & system_text,
+                                                        bool enable_thinking);
+
 // The running model cannot serve the decision path at all (for example its vocabulary has no
 // usable single-token answer labels). The server maps this to HTTP 501, never a client error.
 struct unsupported_error : std::runtime_error {
@@ -26,24 +42,24 @@ struct unsupported_error : std::runtime_error {
 };
 
 // One allowed answer of a question.
-struct jev_option {
+struct decision_option {
     std::string key;         // choice key, level index string, or "true"/"false"
     std::string description; // text shown to the model
     common_json original;    // original criterion value, echoed by `legend`
 };
 
-struct jev_question {
+struct decision_question {
     std::string              id;
     std::string              type;         // canonical: noul | choice | score
     common_json              instructions; // string/object/array, may be null
-    std::vector<jev_option>  options;
+    std::vector<decision_option>  options;
     bool                     has_criteria = false;
 };
 
-struct jev_request {
+struct decision_request {
     std::string               model;
     common_json               state;
-    std::vector<jev_question> questions;
+    std::vector<decision_question> questions;
     double                    temperature = 1.0;
     common_json               temperatures; // object or null
     int                       permutations = 1;
@@ -54,16 +70,16 @@ struct jev_request {
 std::string render_text(const common_json & value);
 
 // Effective softmax temperature for a question: per-type override, else the global value.
-double question_temperature(const jev_request & req, const jev_question & q);
+double question_temperature(const decision_request & req, const decision_question & q);
 
-// True when the body carries the Jev shape (state and/or questions).
-bool is_jev_request(const common_json & body);
+// True when the body carries the decision shape (state and/or questions).
+bool is_decision_request(const common_json & body);
 
-// Throws semantic_error on any invalid Jev content.
-jev_request parse_jev_request(const common_json & body);
+// Throws semantic_error on any invalid decision content.
+decision_request parse_decision_request(const common_json & body);
 
 // Uniform distributions, one per question, sized to its option count.
-std::vector<std::vector<float>> uniform_probs(const jev_request & req);
+std::vector<std::vector<float>> uniform_probs(const decision_request & req);
 
 // Identity a calibrated temperature profile was fitted against. It is never used
 // to gate answers; it only stops a profile fitted on one deployment from silently
@@ -105,9 +121,9 @@ struct answer_audit {
 // Lowercase hex SHA-256 of the given bytes. Used for the prompt identity in the audit trail.
 std::string sha256_hex(const std::string & text);
 
-// Canonical Jev response. `probs` is index-aligned with req.questions and their
+// Canonical decision response. `probs` is index-aligned with req.questions and their
 // options; a missing or empty entry falls back to a uniform distribution.
-common_json assemble_jev_response(const jev_request & req,
+common_json assemble_decision_response(const decision_request & req,
                                   const std::vector<std::vector<float>> & probs,
                                   const std::string & model,
                                   const common_json & usage,

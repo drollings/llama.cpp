@@ -275,6 +275,9 @@ target_compile_definitions(test-decision-engine PRIVATE
     DECISION_TEST_GENERATED_MODEL_DIR="${CMAKE_CURRENT_BINARY_DIR}/test-models"
     DECISION_TEST_SPM_MODEL="${CMAKE_BINARY_DIR}/tinyllamas/stories15M-q4_0.gguf")
 llama_test(test-decision-engine LABEL decision)
+# the host-runnable sections of the decision test must run in the standard CPU CI lane, so the
+# binary also carries the main label; the GPU/model-gated tests inside it skip on a CPU build
+set_tests_properties(test-decision-engine PROPERTIES LABELS "decision;main")
 # CPU-only cases in the decision test load a generated dummy model from the generate-models fixture
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-decision-engine PROPERTIES FIXTURES_REQUIRED generate-models)

@@ -1069,11 +1069,13 @@ extern "C" {
     LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 
     // Dequantize the output (classifier) rows for the given token ids into dst. Returns the row
-    // width, or zero when the model's output tensor is unsupported. On success softcap is set to
-    // the final logit softcap (0 when the model has none). dst must hold count * width floats.
-    // When the model has a per-id output bias it must be readable as a contiguous 1-D vector over
-    // the vocabulary, else the call returns zero; when bias_dst is not NULL it receives count bias
-    // values. Pass NULL when only the rows are needed.
+    // width, or zero when the model's output tensor is unsupported or a required id is out of
+    // range. count must be >= 1 (a zero count returns zero) and dst must hold exactly
+    // count * width floats; dst_count is checked against that exact size. On success softcap is
+    // set to the final logit softcap (0 when the model has none). When the model has a per-id
+    // output bias it must be readable as a contiguous 1-D vector over the vocabulary in a float
+    // (or element-wise dequantizable) type, else the call returns zero; when bias_dst is not NULL
+    // it receives count bias values. Pass NULL when only the rows are needed.
     LLAMA_API int32_t llama_model_classifier_rows(const struct llama_model * model,
             const llama_token * ids, int32_t count, float * dst, size_t dst_count, float * softcap,
             float * bias_dst);

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """End-to-end checks for the decision endpoint envelope and error contract.
 
-Starts llama-server with --decision-seqs and exercises the Jev request shape
+Starts llama-server with --decision-seqs and exercises the decision request shape
 plus the legacy contexts/schema shape. Skips cleanly (exit 0) when the server
 binary or a small test model is not available, so it never fails open.
 """
@@ -25,7 +25,7 @@ MODEL_CANDIDATES = [
     os.path.join(HERE, "tmp", "moe_shakespeare15M.gguf"),
 ]
 
-JEV_VALID = {
+DECISION_VALID = {
     "model": "test",
     "state": "Customer was charged twice on May 3.",
     "questions": {
@@ -128,8 +128,8 @@ def check(cond, msg):
 
 
 def run_checks(server, captured):
-    # 1. valid Jev envelope
-    status, text = server.post("/v1/decision", json.dumps(JEV_VALID))
+    # 1. valid decision envelope
+    status, text = server.post("/v1/decision", json.dumps(DECISION_VALID))
     check(status == 200, f"valid request status {status}: {text}")
     body = json.loads(text)
     contract = body.get("diagnostics", {}).get("contract_hash", "")
@@ -170,7 +170,7 @@ def run_checks(server, captured):
     check(status == 400, f"malformed JSON status {status}: {text}")
 
     # 3. semantic error -> 422
-    bad = dict(JEV_VALID)
+    bad = dict(DECISION_VALID)
     bad["state"] = ""
     status, text = server.post("/v1/decision", json.dumps(bad))
     check(status == 422, f"semantic error status {status}: {text}")
@@ -181,7 +181,7 @@ def run_checks(server, captured):
     #     plain answer head, and otherwise is served (selected) or falls back to full logits when
     #     the serving context cannot expose hidden states, reporting why. The model family decides
     #     which branch applies, so both are accepted; the refusal branch is still asserted.
-    selected = dict(JEV_VALID)
+    selected = dict(DECISION_VALID)
     selected["head"] = "selected"
     status, text = server.post("/v1/decision", json.dumps(selected))
     if status == 400:
@@ -194,7 +194,7 @@ def run_checks(server, captured):
             check(selected_body["head"]["fallback"] is True, "selected fallback is reported")
             check(bool(selected_body["head"].get("reason")), "selected fallback reason is reported")
 
-    full = dict(JEV_VALID)
+    full = dict(DECISION_VALID)
     full["head"] = "full"
     status, text = server.post("/v1/decision", json.dumps(full))
     check(status == 200, f"explicit full head status {status}: {text}")
@@ -204,7 +204,7 @@ def run_checks(server, captured):
     check("option_logits" in full_body["answers"]["dept"], "option logits exposed")
 
     # 3c. permutations: two passes are accepted and stay a valid distribution
-    permuted = dict(JEV_VALID)
+    permuted = dict(DECISION_VALID)
     permuted["permutations"] = 2
     status, text = server.post("/v1/decision", json.dumps(permuted))
     check(status == 200, f"permutations status {status}: {text}")
@@ -219,7 +219,7 @@ def run_checks(server, captured):
     legacy = json.loads(text)
     check(legacy.get("object") == "decision", "legacy object marker")
     check("results" in legacy and "decision" in legacy["results"][0], "legacy results shape")
-    check("answers" not in legacy, "legacy response must not use the Jev envelope")
+    check("answers" not in legacy, "legacy response must not use the decision envelope")
     check("prompt_tokens" in legacy["usage"], "legacy usage reports prompt_tokens")
     check("cached_tokens" in legacy["usage"], "legacy usage reports a cached_tokens split")
 
@@ -227,13 +227,68 @@ def run_checks(server, captured):
 def supports_letter_labels(server):
     """A usable model must yield at least two single-token letter labels."""
     try:
-        status, text = server.post("/v1/decision", json.dumps(JEV_VALID))
+        status, text = server.post("/v1/decision", json.dumps(DECISION_VALID))
     except Exception:
         return False
     if status == 200:
         return True
     # an unsupported vocabulary is a model limitation, not a server bug
     return "answer tokens" not in text
+
+
+def run_sleep_reload_checks(model):
+    """decision -> sleep -> decision: a reload must rebuild the decision state cleanly.
+
+    Before the owner-state fix the label vocab and contract survived the model free, so a
+    sleep->wake reload could read freed memory. This asserts a valid post-reload answer with a
+    recomputed, consistent template/contract hash. Skips cleanly when the build cannot sleep.
+    """
+    server = Server(model, ["--sleep-idle-seconds", "1"])
+    try:
+        server.start()
+    except Exception as e:  # noqa: BLE001
+        server.stop()
+        print(f"skip sleep-reload on {os.path.basename(model)}: {e}")
+        return True
+
+    try:
+        status, text = server.post("/v1/decision", json.dumps(DECISION_VALID))
+        check(status == 200, f"pre-sleep decision status {status}: {text}")
+        before = json.loads(text)
+        check(set(before.get("answers", {})) == {"refund", "dept", "urgency"}, "pre-sleep answers")
+        pre_template = before["diagnostics"]["template_hash"]
+        pre_contract = before["diagnostics"]["contract_hash"]
+        check(bool(pre_template) and bool(pre_contract), "pre-sleep hashes present")
+
+        deadline = time.time() + 30
+        slept = False
+        while time.time() < deadline:
+            try:
+                status, text = http("GET", f"http://127.0.0.1:{server.port}/props")
+                if status == 200 and json.loads(text).get("is_sleeping"):
+                    slept = True
+                    break
+            except Exception:
+                pass
+            time.sleep(0.2)
+        if not slept:
+            server.stop()
+            print("skip sleep-reload: server did not enter the sleeping state")
+            return True
+
+        # the next decision wakes the model; the readout must rebuild from the new model
+        status, text = server.post("/v1/decision", json.dumps(DECISION_VALID))
+        check(status == 200, f"post-sleep decision status {status}: {text}")
+        after = json.loads(text)
+        check(set(after.get("answers", {})) == {"refund", "dept", "urgency"}, "post-sleep answers")
+        check(after["diagnostics"]["template_hash"] == pre_template, "template hash recomputed after reload")
+        check(after["diagnostics"]["contract_hash"] == pre_contract, "contract hash recomputed after reload")
+    except Exception as e:  # noqa: BLE001
+        server.stop()
+        print(f"FAIL: {e}")
+        return False
+    server.stop()
+    return True
 
 
 def main():
@@ -271,17 +326,20 @@ def main():
         try:
             good = Server(model, ["--decision-contract", captured["contract_hash"]])
             good.start()
-            status, text = good.post("/v1/decision", json.dumps(JEV_VALID))
+            status, text = good.post("/v1/decision", json.dumps(DECISION_VALID))
             good.stop()
             check(status == 200, f"pinned contract status {status}: {text}")
 
             bad = Server(model, ["--decision-contract", "0" * 64])
             bad.start()
-            status, text = bad.post("/v1/decision", json.dumps(JEV_VALID))
+            status, text = bad.post("/v1/decision", json.dumps(DECISION_VALID))
             bad.stop()
             check(status == 501, f"mismatched contract status {status}: {text}")
         except Exception as e:  # noqa: BLE001
             print(f"FAIL: {e}")
+            return 1
+
+        if not run_sleep_reload_checks(model):
             return 1
 
         print("decision envelope checks passed")

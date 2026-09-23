@@ -18,7 +18,9 @@
         "recall": 1.0,
         "false_positives": 0,
         "false_negatives": 0,
-        "pairs": 520
+        "pairs": 520,
+        "outcome_tv_bound": 0.05,
+        "outcome_argmax_agree": true
       }
     },
     "question_dedup": {
@@ -135,7 +137,25 @@
         "answer key"
       ],
       "production_gate": false,
-      "verdict": "T=1.0 default; non-default needs matching provenance; stale profile refused"
+      "verdict": "T=1.0 default; non-default needs matching provenance; stale profile refused",
+      "measurements": {
+        "match_accepted": 1,
+        "mismatch_refused": 4,
+        "mismatch_cases": 4
+      }
+    },
+    "admission_control": {
+      "trigger": "single decision request at max_queue defaults",
+      "axis": "resource",
+      "may_gate": [
+        "how many concurrent decisions run"
+      ],
+      "may_not_gate": [
+        "single-request rejection",
+        "answer validity"
+      ],
+      "production_gate": false,
+      "verdict": "a single small request is always admitted at the configured queue depth; only a saturated burst may be refused (429/529); measured by test_decision_admission.py"
     }
   },
   "model_measurements": {
@@ -149,10 +169,9 @@
         "n_ctx": 2048,
         "n_batch": 512,
         "n_ubatch": 512,
-      "n_seq_max": 10,
-      "gpu_layers": -1,
-      "flash_attn": false
-    }
+        "n_seq_max": 10,
+        "gpu_layers": 0
+      }
     },
     "values": {
       "small_tv": 0.0,
@@ -165,13 +184,17 @@
       "bypass_off_ms": 0.0,
       "bypass_speedup": 1.0,
       "bypass_applicable": false,
-      "prefill_cached_ms": 40.8958,
-      "prefill_cold_ms": 175.248192,
+      "prefill_cached_ms": 117.016856,
+      "prefill_cold_ms": 163.41252,
       "auto_at_tree_max_is_tree": true,
       "auto_above_tree_max_is_tree": false,
-      "temperature_nll_t1": 0.10462794287046091,
-      "temperature_nll_t1_3": 0.16194065398871915,
-      "temperature_nll_delta": 0.05731271111825823
+      "temperature_nll_t1": 0.10424429911551152,
+      "temperature_nll_t1_3": 0.15921439965611014,
+      "temperature_nll_delta": 0.05497010054059862,
+      "hoist_argmax_agree": true,
+      "hoist_tv": 0.015760422247694805,
+      "hoist_fired": true,
+      "wide_auto_default_is_tree": true
     }
   }
 }

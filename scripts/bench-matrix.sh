@@ -12,18 +12,10 @@ FIXTURE=""
 MODES=""
 ALLOW_CACHE=""
 
+# Handle --fixture=value / --mode=value and --dry-run
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
-    --fixture) FIXTURE="next" ;;
-    --mode) MODES="next" ;;
-    *) ;;
-  esac
-done
-
-# Handle --fixture <value> and --mode <value> and --allow_cache style if passed via --fixture= form
-for arg in "$@"; do
-  case "$arg" in
     --fixture=*) FIXTURE="${arg#--fixture=}" ;;
     --mode=*) MODES="${arg#--mode=}" ;;
   esac

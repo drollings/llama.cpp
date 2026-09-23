@@ -185,8 +185,8 @@ private:
 
     // decision admission: bound concurrent decision requests so a burst cannot pile up work
     std::atomic<int> decision_inflight{0};
-    size_t           decision_max_body  = 2u * 1024u * 1024u; // 2 MiB, matching openjev-sglang
-    int              decision_max_queue = 4;                  // concurrent requests before rate limiting
+    size_t           decision_max_body  = 2u * 1024u * 1024u;
+    int              decision_max_queue = 4;
 
     // cached responses, to be used during sleep
     std::mutex     mutex_cache;
