@@ -2764,9 +2764,23 @@ private:
     std::vector<uint8_t> temp_buffer;
 };
 
+// Map a buffer type to the context backend that owns its device; used to stage device-to-device
+// copies on one stream so a per-tensor sync does not dominate small state restores.
+static ggml_backend_t find_backend_for_buft(const std::vector<ggml_backend_ptr> & backends,
+                                            ggml_backend_buffer_type_t buft) {
+    const ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    for (const auto & backend : backends) {
+        if (backend && ggml_backend_get_device(backend.get()) == dev) {
+            return backend.get();
+        }
+    }
+    return nullptr;
+}
+
 class llama_io_write_device : public llama_io_write_i {
 public:
-    llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
+    llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs,
+                          const std::vector<ggml_backend_ptr> & backends) : ptr(p), buf_size(len), mbufs(mbufs), backends(backends)  {
     }
 
     ~llama_io_write_device() {
@@ -2855,8 +2869,18 @@ public:
                 }
             }
 
+            // stage the device-to-device copies on the backend stream and drain it once, so the
+            // per-tensor sync in the synchronous copy does not dominate small state restores
+            ggml_backend_t backend = find_backend_for_buft(backends, buft);
             for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
+                if (backend != nullptr) {
+                    ggml_backend_tensor_copy_async(backend, backend, mbuf_cur.org[i], mbuf_cur.cpy[i]);
+                } else {
+                    ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
+                }
+            }
+            if (backend != nullptr) {
+                ggml_backend_synchronize(backend);
             }
         }
     }
@@ -2894,11 +2918,13 @@ private:
     std::vector<write_info> winfos;
 
     llama_memory_buffers & mbufs;
+    const std::vector<ggml_backend_ptr> & backends;
 };
 
 class llama_io_read_device : public llama_io_read_i {
 public:
-    llama_io_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs) {
+    llama_io_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & mbufs,
+                         const std::vector<ggml_backend_ptr> & backends) : ptr(p), buf_size(len), mbufs(mbufs), backends(backends) {
     }
 
     ~llama_io_read_device() {
@@ -2953,9 +2979,17 @@ public:
                 }
 
                 if (same_chunking) {
-                    // same chunking: copy 1:1 by index
+                    // same chunking: copy 1:1 by index, staged on the backend stream and drained once
+                    ggml_backend_t backend = find_backend_for_buft(backends, buft);
                     for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                        ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
+                        if (backend != nullptr) {
+                            ggml_backend_tensor_copy_async(backend, backend, mbuf_cur.cpy[i], mbuf.org[i]);
+                        } else {
+                            ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
+                        }
+                    }
+                    if (backend != nullptr) {
+                        ggml_backend_synchronize(backend);
                     }
                     continue;
                 }
@@ -2973,6 +3007,9 @@ public:
                 /*.no_alloc   =*/ true,
             };
             ggml_context * ctx_scratch = ggml_init(params_scratch);
+
+            ggml_backend_t backend   = find_backend_for_buft(backends, buft);
+            bool           needs_sync = false;
 
             size_t src_pos  = 0;
             size_t dst_pos  = 0;
@@ -3001,7 +3038,13 @@ public:
                 auto * dst_v = ggml_view_1d(ctx_scratch, dst_t, n_el, dst_off);
                 ggml_backend_view_init(dst_v);
 
-                ggml_backend_tensor_copy(src_v, dst_v);
+                // stage on the backend stream and drain it once after the byte walk
+                if (backend != nullptr) {
+                    ggml_backend_tensor_copy_async(backend, backend, src_v, dst_v);
+                } else {
+                    ggml_backend_tensor_copy(src_v, dst_v);
+                }
+                needs_sync = true;
 
                 src_pos += n_copy;
                 dst_pos += n_copy;
@@ -3023,6 +3066,10 @@ public:
             }
             for (size_t i = dst_i; i < mbuf.org.size(); ++i) {
                 GGML_ASSERT(ggml_nbytes(mbuf.org[i]) == 0);
+            }
+
+            if (needs_sync && backend != nullptr) {
+                ggml_backend_synchronize(backend);
             }
 
             ggml_free(ctx_scratch);
@@ -3064,6 +3111,7 @@ private:
     std::vector<read_info> rinfos;
 
     const llama_memory_buffers & mbufs;
+    const std::vector<ggml_backend_ptr> & backends;
 };
 
 size_t llama_context::state_get_size() {
@@ -3114,7 +3162,7 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
-        io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
+        io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id], backends);
     } else {
         io = std::make_unique<llama_io_write_host>(dst, size);
     }
@@ -3147,7 +3195,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
         GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
 
-        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
+        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read], backends);
     } else {
         io = std::make_unique<llama_io_read_host>(src, size);
     }

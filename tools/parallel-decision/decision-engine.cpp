@@ -237,7 +237,11 @@ engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs)
 
 void engine::select_fork(const std::string & requested) {
     if (requested == "copy") {
-        // [EXP] temporarily allow forcing copy on recurrent/hybrid to verify correctness
+        // A copy fork only moves attention KV cells. Recurrent state (e.g. LFM2's short
+        // convolution) lives outside the KV cache, so copy would silently drop it.
+        if (probe_fork_ != fork_kind::copy) {
+            throw std::invalid_argument("fork \"copy\" is not supported by a recurrent model; use auto or restore");
+        }
         active_fork_ = fork_kind::copy;
     } else if (requested == "restore") {
         active_fork_ = fork_kind::restore;
@@ -475,8 +479,6 @@ std::vector<engine::branch_score> engine::score_branches(const std::vector<branc
         }
         llama_batch batch = llama_batch_init(rows, 0, 1);
         std::vector<int> out_idx;
-        double t_restore = 0, t_decode = 0, t_gather = 0;
-        auto t0 = std::chrono::steady_clock::now();
         for (size_t b = start; b < end; ++b) {
             const llama_seq_id seq = first + (llama_seq_id) (b - start);
             if (active_fork_ == fork_kind::restore) {
@@ -489,12 +491,8 @@ std::vector<engine::branch_score> engine::score_branches(const std::vector<branc
                 }
                 llama_memory_seq_rm(mem, seq, -1, -1);
                 load_seq((*parent_states)[idx], seq);
-                t_restore += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                t0 = std::chrono::steady_clock::now();
             } else {
                 fork_into(branches[b].trunk, seq, nullptr);
-                t_restore += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                t0 = std::chrono::steady_clock::now();
             }
             const auto & toks = branches[b].toks;
             for (size_t i = 0; i < toks.size(); ++i) {
@@ -505,8 +503,6 @@ std::vector<engine::branch_score> engine::score_branches(const std::vector<branc
                 common_batch_add(batch, toks[i], branches[b].pos0 + (llama_pos) i, { seq }, last);
             }
         }
-        t_decode = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        t0 = std::chrono::steady_clock::now();
         check_cancel();
         const int rc = llama_decode(ctx, batch);
         llama_batch_free(batch);
@@ -515,18 +511,11 @@ std::vector<engine::branch_score> engine::score_branches(const std::vector<branc
                                          : "llama_decode failed on the decision branches (" + std::to_string(rc) + ")");
         }
         llama_synchronize(ctx); // the scored rows are on the host only after the async decode drains
-        t_decode += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        t0 = std::chrono::steady_clock::now();
         for (size_t b = start; b < end; ++b) {
             gather_candidates(out_idx[b - start], branches[b].cands, result[b]);
             llama_memory_seq_rm(mem, first + (llama_seq_id) (b - start), -1, -1);
         }
         llama_synchronize(ctx);
-        t_gather = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        static const bool exp_timing = std::getenv("LLAMA_DECISION_EXP_TIMING") != nullptr;
-        if (exp_timing) {
-            fprintf(stderr, "decision: group rows=%d restore=%.1fms decode=%.1fms gather=%.1fms\n", rows, t_restore, t_decode, t_gather);
-        }
         start = end;
     }
     return result;

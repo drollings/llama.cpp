@@ -1367,104 +1367,6 @@ static void test_fork_real(testing & t) {
     });
 }
 
-static void test_exp_fork_diff(testing & t) {
-    t.test("exp: copy vs restore full-state byte diff", [](testing & t) {
-        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
-            return;
-        }
-        test_engine te;
-        if (!te.load(path)) {
-            t.assert_true("model loads", false);
-            return;
-        }
-        try {
-            const auto vocab = llama_model_get_vocab(te.model);
-            auto tok = [&](const std::string & s) {
-                return common_tokenize(vocab, s, true, true);
-            };
-            const std::vector<llama_token> prompt = tok("The user says: hello world and then asks for help.");
-            llama_batch bp = llama_batch_init((int) prompt.size(), 0, 1);
-            for (size_t i = 0; i < prompt.size(); ++i) {
-                common_batch_add(bp, prompt[i], (llama_pos) i, { 0 }, i + 1 == prompt.size());
-            }
-            llama_decode(te.ctx, bp);
-            llama_batch_free(bp);
-            llama_synchronize(te.ctx);
-
-            auto save = [&](llama_seq_id s) {
-                const size_t sz = llama_state_seq_get_size(te.ctx, s);
-                std::vector<uint8_t> buf(sz);
-                llama_state_seq_get_data(te.ctx, buf.data(), sz, s);
-                return buf;
-            };
-            const std::vector<uint8_t> s0 = save(0);
-            const std::vector<llama_token> suffix = tok(" reflect");
-            const llama_pos p0 = (llama_pos) prompt.size();
-
-            // Two branches, forked two ways, decoded together in ONE batch so the branch
-            // interactions are identical to a real scoring round.
-            // seq 1 = restore fork, seq 3 = copy fork (the SAME branch text, both from seq 0)
-            llama_memory_seq_rm(llama_get_memory(te.ctx), 1, -1, -1);
-            llama_state_seq_set_data(te.ctx, s0.data(), s0.size(), 1);
-            llama_memory_seq_cp(llama_get_memory(te.ctx), 0, 2, -1, -1);
-            llama_memory_seq_rm(llama_get_memory(te.ctx), 3, -1, -1);
-            llama_state_seq_set_data(te.ctx, s0.data(), s0.size(), 3);
-            llama_memory_seq_cp(llama_get_memory(te.ctx), 0, 4, -1, -1);
-
-            // decode both pairs in one batch: seq1+seq2 same text, seq3+seq4 same text
-            llama_batch bb = llama_batch_init((int) suffix.size() * 4, 0, 1);
-            for (int s = 1; s <= 4; ++s) {
-                for (size_t i = 0; i < suffix.size(); ++i) {
-                    common_batch_add(bb, suffix[i], p0 + (llama_pos) i, { s }, i + 1 == suffix.size());
-                }
-            }
-            llama_decode(te.ctx, bb);
-            llama_batch_free(bb);
-            llama_synchronize(te.ctx);
-
-            const std::vector<uint8_t> s1 = save(1); // restore, text A
-            const std::vector<uint8_t> s2 = save(2); // copy,    text A
-            const std::vector<uint8_t> s3 = save(3); // restore, text B
-            const std::vector<uint8_t> s4 = save(4); // copy,    text B
-
-            auto report = [&](const char * tag, const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) {
-                size_t ndiff = 0, first = SIZE_MAX;
-                for (size_t i = 0; i < a.size() && i < b.size(); ++i) {
-                    if (a[i] != b[i]) {
-                        ++ndiff;
-                        if (first == SIZE_MAX) first = i;
-                    }
-                }
-                fprintf(stderr, "[EXP] %s sizes=%zu/%zu ndiff=%zu first=%zu\n", tag, a.size(), b.size(), ndiff, first);
-            };
-            report("restore-vs-copy textA (1 vs 2)", s1, s2);
-            report("restore-vs-copy textB (3 vs 4)", s3, s4);
-
-            // Now run the real letter-readout path with each fork and diff the option logits
-            llama_decision::engine eng(te.ctx, 2, 8);
-            auto lvocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-            const auto pool = llama_decision::build_label_pool(*lvocab, 64);
-            const auto req = llama_decision::parse_jev_request(common_json::parse(jev_valid_body()));
-            llama_decision::options orc, ocp;
-            orc.fork = "restore"; orc.cache_tag = "expR";
-            ocp.fork = "copy";    ocp.cache_tag = "expC";
-            const auto pr = llama_decision::letter_readout(eng, *lvocab, nullptr, false, req, pool, orc, nullptr);
-            const auto pc = llama_decision::letter_readout(eng, *lvocab, nullptr, false, req, pool, ocp, nullptr);
-            for (size_t qi = 0; qi < pr.size() && qi < pc.size(); ++qi) {
-                std::string dl;
-                for (size_t k = 0; k < pr[qi].size() && k < pc[qi].size(); ++k) {
-                    dl += " " + std::to_string(pr[qi][k]) + "/" + std::to_string(pc[qi][k]);
-                }
-                fprintf(stderr, "[EXP] question %zu restore/copy probs:%s\n", qi, dl.c_str());
-            }
-            t.assert_true("experiment ran", true);
-        } catch (const std::exception & e) {
-            t.assert_true(std::string("exp diff: ") + e.what(), false);
-        }
-    });
-}
 
 static void test_prefix_cache_coherence(testing & t) {
     t.test("prefix cache never hits across a changed identity", [](testing & t) {
@@ -3547,7 +3449,6 @@ int main(int argc, char ** argv) {
         test_label_pool_real(t);
         test_letter_readout_real(t);
         test_fork_real(t);
-        test_exp_fork_diff(t);
         test_prefix_cache_coherence(t);
         test_token_cache(t);
         test_prefix_reuse(t);
