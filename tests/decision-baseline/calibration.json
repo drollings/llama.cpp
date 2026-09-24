@@ -137,6 +137,40 @@
         "outcome_argmax_agree": true
       }
     },
+    "head_vs_full": {
+      "trigger": "head vs full producer equivalence",
+      "axis": "task-value",
+      "may_gate": [
+        "whether the selected-head fast path may run"
+      ],
+      "may_not_gate": [
+        "admission",
+        "caching",
+        "routing",
+        "persistence"
+      ],
+      "production_gate": false,
+      "verdict": "winner equality between the selected head and full logits is the task-value gate; total variation is producer confidence, recorded per model in model_measurements, never a gate; a family that flips a winner is refused statically in the classifier predicate, never by a runtime confidence threshold",
+      "control_group": {
+        "cases": [
+          {
+            "input": "selected head available on the model",
+            "expect": "used"
+          },
+          {
+            "input": "selected head unavailable",
+            "expect": "falls back to full logits"
+          },
+          {
+            "input": "winner disagrees on a family",
+            "expect": "that family is refused statically"
+          }
+        ],
+        "winner_axis": "task-value",
+        "tv_axis": "producer confidence (recorded, never asserted as a gate)",
+        "tv_bound": 0.05
+      }
+    },
     "adapter_scope": {
       "trigger": "adapter scope (base model only)",
       "axis": "task-value",
@@ -374,6 +408,38 @@
         "max_options": 64
       }
     },
+    "label_pool_capacity": {
+      "trigger": "realized answer-label pool size",
+      "axis": "task-value",
+      "may_gate": [
+        "whether a question's option set can be represented"
+      ],
+      "may_not_gate": [
+        "answers",
+        "admission",
+        "caching"
+      ],
+      "production_gate": false,
+      "verdict": "the protocol cap is 64 (LABEL_POOL_CAP, equal to DECISION_MAX_CHOICE_OPTIONS); the realized pool is model-dependent and may be smaller; a request whose widest question needs more labels than the realized pool is a 422",
+      "control_group": {
+        "cases": [
+          {
+            "input": "a question at the realized pool size",
+            "expect": "accepted"
+          },
+          {
+            "input": "a question one above the realized pool",
+            "expect": "422"
+          },
+          {
+            "input": "a double-letter vocabulary at the cap",
+            "expect": "realized pool reaches 64"
+          }
+        ],
+        "protocol_cap": 64,
+        "realized_source": "diagnostics.label_pool_size; recorded per model in model_measurements"
+      }
+    },
     "score_level_limits": {
       "trigger": "score level count limits",
       "axis": "task-value",
@@ -600,7 +666,7 @@
       "backend_flags": {
         "kv_unified": true,
         "swa_full": false,
-        "n_ctx": 2048,
+        "n_ctx": 8192,
         "n_batch": 512,
         "n_ubatch": 512,
         "n_seq_max": 10,
@@ -618,13 +684,17 @@
       "bypass_off_ms": 0.0,
       "bypass_speedup": 1.0,
       "bypass_applicable": false,
-      "prefill_cached_ms": 129.965272,
-      "prefill_cold_ms": 240.973099,
+      "prefill_cached_ms": 130.838912,
+      "prefill_cold_ms": 243.870027,
       "auto_at_tree_max_is_tree": true,
       "auto_above_tree_max_is_tree": false,
-      "temperature_nll_t1": 0.40988211536576785,
+      "label_pool_size": 64,
+      "head_vs_full_available": true,
+      "head_vs_full_winner_agree": true,
+      "head_vs_full_tv": 0.036204785108566284,
+      "temperature_nll_t1": 0.4210483778644587,
       "temperature_nll_t1_3": 0.5024737106302805,
-      "temperature_nll_delta": 0.09259159526451259,
+      "temperature_nll_delta": 0.08142533276582171,
       "hoist_argmax_agree": true,
       "hoist_tv": 0.02950456610415131,
       "hoist_fired": true,

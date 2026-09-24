@@ -1,3 +1,6 @@
+> Non-normative design notes, KV background, and benchmarks. The normative
+> contract is `docs/decision/API.md`.
+
 ## What the /v1/decision endpoint is really trying to do:
 
 At its core, this work adds a new kind of query to llama-server:

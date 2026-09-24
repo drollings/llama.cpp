@@ -10,8 +10,6 @@ import os
 import subprocess
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 NEEDLES = ("temperature", "confidence", "certainty", "provenance")
 # Run only the temperature/confidence/certainty/provenance tests, so this driver is not coupled to
 # model-family-specific tests (selected heads, LFM2.5 fixtures) that an SPM model cannot serve.
@@ -19,20 +17,18 @@ FILTER = r"decision engine harness(\.(.*(temperature|confidence|certainty|proven
 
 
 def find_bin():
-    explicit = os.environ.get("LLAMA_DECISION_TEST_BIN", "")
-    if explicit:
-        return explicit
-    for name in ("build-synthesis", "build"):
-        cand = os.path.join(REPO, name, "bin", "test-decision-engine")
-        if os.path.isfile(cand):
-            return cand
-    return os.path.join(REPO, "build", "bin", "test-decision-engine")
+    # the CMake test registration injects the exact target path; without it there is no safe
+    # guess at a build directory, so the driver skips instead of probing hardcoded paths
+    return os.environ.get("LLAMA_DECISION_TEST_BIN", "")
 
 
 BIN = find_bin()
 
 
 def main():
+    if not BIN:
+        print("SKIP: LLAMA_DECISION_TEST_BIN is not set")
+        return 0
     if not os.path.isfile(BIN):
         print(f"SKIP: {BIN} not built")
         return 0

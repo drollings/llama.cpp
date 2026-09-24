@@ -1,12 +1,8 @@
-# Jev-Compatible Decision API (`/v1/decision`) - Introduction and Specification
+# Jev-Compatible Decision API (`/v1/decision`) - Specification
 
-Audience: a human or AI coder meeting this project for the first time. Read
-Section 0 first: it fixes the endpoint name, defines every term used later,
-and (Section 0.6) introduces the technical challenges of serving this API
-inside llama.cpp. Sections 1 onward are the contract.
-
-Status: implemented. A passage marked
-DEFERRED is not built here; nothing is currently deferred.
+Status: implemented. This is the normative contract: routes, request, response,
+errors, and limits. Non-normative design notes, the backend survey, and the
+benchmark narrative live in `README.md`.
 
 The endpoint naming is the one deliberate difference from Jev, and it is
 settled:
@@ -26,201 +22,13 @@ confidence.
 
 ---
 
-## 0. Orientation for a fresh reader
-
-### 0.1 The problem this solves
-
-A "decision" request asks a language model many small closed questions about
-one piece of evidence, and wants CALIBRATED-ISH probabilities, not prose. For
-example: given a support ticket, answer 12 questions at once - "should we
-refund? (yes/no)", "which department? (billing/support/...)", "how urgent?
-(low/med/high)". The caller needs the full distribution over the allowed
-options for each question, with no generated text. This differs from chat:
-there is no free-form output, no sampling, and every answer is guaranteed to be
-one of the declared options.
-
-### 0.2 What "Jev" means here
-
-Jev is a hosted decision API whose public contract is `POST /v1/systemone`
-with a request of `state` + typed `questions` and a response of typed
-`answers`. "Jev-compatible" means our server returns the same field names and
-semantics, so a client written for Jev can be pointed at our server with only a
-base-URL/path change.
-
-On this server the path is `/v1/decision`, not `/v1/systemone`:
-
-- Jev host path: `POST /v1/systemone`.
-- This server: `POST /v1/decision` (canonical), `POST /decision` (deprecated
-  alias). No `/v1/systemone`.
-
-Nothing about the request or the response changes with the path; only the URL
-the client dials. The three question primitives are:
-- `noul` - a yes/no probability (`noul` in [0,1]);
-- `choice` - pick one of N options (`choice` + `probabilities` + `confidence`);
-- `score` - a rating on an ordered scale (`score` + `legend` + `probabilities`
-  + `confidence`).
-
-### 0.3 What this repository is and where the feature lives
-
-This is `llama.cpp`, a C/C++ inference engine for GGUF-quantized LLMs. The
-decision feature is these files:
-
-- engine (`tools/parallel-decision/decision-engine.{h,cpp}`, namespace
-  `llama_decision`): the fork/score substrate shared by both readouts.
-- protocol (`tools/parallel-decision/decision-protocol.{h,cpp}`): the Jev
-  request/response shape, error types, temperature profile, contract hash.
-- labels (`tools/parallel-decision/labels.{h,cpp}`): the single-token letter
-  pool and the prompt-boundary checks.
-- letter readout (`tools/parallel-decision/letter_readout.{h,cpp}`): the Jev
-  scoring path built on the engine.
-- HTTP wiring: `tools/server/server-context.cpp` (`handle_decision`),
-  `tools/server/server.cpp` (routes), `tools/server/server-task.h`
-  (`SERVER_TASK_TYPE_DECISION`).
-- sizing flag: `--decision-seqs N` (`common/arg.cpp`, `common/common.h`),
-  which reserves sequence ids and forces a unified KV cache.
-- a standalone CLI client: `tools/parallel-decision/parallel-decision.cpp`
-  (`llama-parallel-decision`).
-- tests: `tests/test-decision-engine.cpp`, `tools/server/tests/test_decision_*.py`,
-  and the recorded baselines under `tests/decision-baseline/`.
-
-A separate experimental decision service (its own `/v1/systemone` route,
-classifier head, exclusive mode) is not part of this work; it is reference
-material only.
-
-### 0.4 As-built map in one table
-
-What a fresh reader can rely on:
-
-| Area | As built |
-|---|---|
-| Routes | `POST /v1/decision` canonical; `POST /decision` deprecated alias; no `/v1/systemone` |
-| Request | both shapes: Jev `state` + `questions`, and generic `contexts[]` + `schema` |
-| Response | default Jev `{model, answers{qid}, usage{input_tokens, output_tokens}}`; `head`, `diagnostics`, per-answer audit, `certainty`, and extra usage counters only with `diagnostics: true`; generic `{object:"decision", results:[...], usage, timings}` |
-| Readout | dual: letter labels (Jev) and surface-form trie (generic), one engine and one softmax |
-| Errors | full contract in Section 4 (400/401/413/415/422/429/499/500/501/529) |
-| Fork | probe: copy fast path (`llama_memory_seq_cp`) or `llama_state_seq` save/restore on hybrid/recurrent memory; SWA clamp |
-| Prefix cache | bounded LRU (copy mode: token cache; restore mode: state LRU) |
-| Temperature | `temperature` + `temperatures{}` with optional provenance; `T=1.0` default |
-| Order de-bias | `permutations` (default 1, capped 8) |
-| Admission | body cap (413), queue cap (429/529 + `Retry-After`), cancel (499), cooperative yield |
-| Audit | `allowed_token_mass`, `full_vocab_argmax_id`, `answer_token_ids`, `option_logits`, `prompt_sha256`, `prompt_version`, `probability_status`; emitted only with `diagnostics: true`; the two full-vocab fields are omitted under the selected head (Section 3.1) |
-| Provenance | contract hash (tokenizer + template + label code), logged and returned |
-| Mode | `auto`/`tree`/`greedy`, `tree_max`, `cache_prompt` for the trie path |
-| Head | selected-head fast path (Section 6.1): classifier-only graph + answer-row dot product; `auto`/`selected`/`full`; falls back to full logits unless `selected` is forced and unavailable |
-
-### 0.5 Glossary
-
-- **state**: the evidence document; opaque to the server, treated as DATA.
-- **question**: one typed decision over a `state`; identified by an opaque
-  `qid` that is never shown to the model.
-- **option / candidate**: one allowed answer value for a question.
-- **label**: a single-token letter (`A`, `B`, ... up to `BL`) the model emits
-  instead of the option text; probability comes from that token's logit.
-- **readout**: how option probabilities are extracted. Letter readout uses one
-  label token per option; trie readout scores the model's own token paths for
-  surface-form values.
-- **branch / trunk / prefix**: one KV sequence per scored path; a trunk is
-  `shared prefix + context`; the prefix is the cacheable head.
-- **producer confidence vs task value**: two DIFFERENT axes (Section 7). Never
-  use a confidence number to gate caching/admission/correctness.
-- **closed-world probabilities**: `probabilities` are conditional on the
-  supplied options; they do not measure the chance that all options are wrong.
-- **contract hash**: a hash over the tokenizer identity, the framed prompt
-  template, and the label code. If it changes, any earlier calibration is
-  stale. Logged at startup and returned as `diagnostics.contract_hash`.
-- **audit fields**: additive per-answer telemetry (`allowed_token_mass`,
-  `full_vocab_argmax_id`, `answer_token_ids`, `option_logits`,
-  `prompt_sha256`, `prompt_version`, `probability_status`). For inspection
-  only; they never change an answer.
-
-### 0.6 The technical challenges of serving this inside llama.cpp
-
-llama.cpp is a token sampler at heart: you feed tokens, call `llama_decode`,
-and read logits so you can sample. A decision request wants the opposite:
-no sampling, no generation, just a clean probability distribution over a small
-set of declared options. Most of the engineering is making "score, do not
-generate" work well on top of a KV-cache engine built for chat. The challenges,
-in the order a newcomer meets them:
-
-1. **Score, do not sample.** You still call `llama_decode`, but you read
-   `llama_get_logits` at one chosen position (the last token of the question
-   suffix) and softmax only over the allowed tokens. No token is ever appended
-   to the output; `output_tokens` stays 0. Getting the position right matters:
-   read the logits at the position that predicts the first answer token, not
-   after it.
-
-2. **One piece of evidence, many questions, one forward pass.** Prefill the
-   shared system prompt and the `state` once, then answer every question from
-   that cache instead of re-prefilling per question. llama.cpp exposes this as
-   sequence ids plus fork/trim calls; the engine keeps one trunk
-   (`shared prefix + state`) and forks a short branch for each question.
-
-3. **Forking a KV cache is architecture-dependent.** On plain attention you can
-   copy a sequence (`llama_memory_seq_cp`) cheaply, because unified memory
-   shares cells. Recurrent and hybrid models (for example Qwen3.5, Gemma, LFM2)
-   cannot copy sequence state that way; there you save and restore a whole
-   sequence with `llama_state_seq_get_data` / `set_data`. Sliding-window models
-   only retain a window, so a copy must be clamped to that window or branch
-   memory grows without bound. The engine probes the loaded model and picks a
-   path, and `fork: copy|restore|auto` overrides it.
-
-4. **Tokenization must be exact.** The model answers with a single label token
-   (`A`, `B`, ...). The label token is resolved at the assistant-answer
-   boundary, not in isolation: a SentencePiece / `add_space_prefix` vocabulary
-   tokenizes a bare `"A"` as the space-prefixed form `" A"`, but emits the bare
-   `"A"` after the framed tail, so isolation picks the wrong token. Byte-pair
-   tokenizers can likewise merge a label into the previous text depending on
-   whitespace and template, so `"\n" + "A"` may encode as one token. If that
-   happens the score silently comes from the wrong position. Every label is
-   therefore resolved and verified at startup and per request:
-   `encode(tail + label) == encode(tail) + [label]`, else a hard error. The
-   assistant-answer tail is template-specific and asserted exactly.
-
-5. **Closed-world probabilities, and honesty about them.** The distribution is
-   conditional on the options the caller supplied; it does not express the
-   chance that every option is wrong. `confidence = 1 - H/log(K)` and
-   `certainty = max(p)` measure concentration, not accuracy. They are
-   never allowed to gate admission, caching, routing, or persistence.
-
-6. **Set it inside a chat server that must keep working.** The same loaded
-   model also serves `/v1/chat/completions`. A decision pass must not corrupt
-   chat KV state, must not freeze the scheduler for seconds (the engine yields
-   between waves so metrics and slot reads stay responsive), must respect
-   admission (body cap 413, queue cap 429/529), and must cancel when the client
-   leaves: cancellation has to reach the compute loop, not just the HTTP wait.
-
-7. **Batch many questions while keeping them blind.** Questions are independent
-   by contract: a `qid` never appears in the prompt and one question's options
-   never condition another's answer. The engine packs branches into waves
-   bounded by the sequence pool and the batch row budget, and gathers logits
-   only at the scored positions.
-
-8. **Make drift visible.** Record the model, quantization, template hash, and
-   backend flags; hash the whole readout contract and refuse a mismatch; emit
-   per-answer audit fields (`allowed_token_mass`, `full_vocab_argmax_id`,
-   `option_logits`) so prompt drift or a wrong readout shows up as data instead
-   of a silently wrong answer.
-
-9. **Selected-head fast path.** A classifier-only context stops the graph after
-   the final normalization layer, skipping the full-vocabulary projection;
-   `llama_model_classifier_rows` dequantizes only the K answer rows, scored with
-   a host-side dot product. When the head is unavailable (unsupported arch,
-   hidden states absent, row/layout mismatch) the readout falls back to full
-   logits; only an explicit `head: "selected"` on an unavailable head is an
-   error (Section 6.1).
-
-Everything after this section is the contract that these challenges produce:
-request (Section 2), response (Section 3), errors (Section 4), and the chosen
-implementation plus alternatives (Sections 5 and 6).
-
----
-
 ## 1. What the API is
 
 One POST. No generation. A caller supplies opaque `state` (evidence, treated
-as DATA, never as instructions) plus 1-256 independently-scored typed
-questions. The server returns one closed-world distribution per question,
-assembled by code. `output_tokens` is always 0; no text is sampled.
+as DATA, never as instructions) plus `DECISION_MIN_QUESTIONS` to
+`DECISION_MAX_QUESTIONS` independently-scored typed questions. The server
+returns one closed-world distribution per question, assembled by code.
+`output_tokens` is always 0; no text is sampled.
 
 ```
 POST /v1/decision
@@ -238,7 +46,7 @@ Route policy:
 
 Coexistence: the same model/server also serves the OpenAI-compatible API
 (`/v1/chat/completions`, `/v1/models`, `/health`). Decision traffic must not
-corrupt chat KV state; see Section 6.1.
+corrupt chat KV state, including on hybrid/recurrent models.
 
 ---
 
@@ -275,26 +83,27 @@ silently default).
   (`[{role, content}]` / `{"messages": [...]}`) MAY be accepted and are
   passed through as evidence. The state is DATA: frame it as evidence, escape
   `<` as `\u003c`, and instruct the model that state content is not
-  instructions (prompt-injection hardening; full corpus in Section 7).
-* `questions` (required): object mapping `qid -> question spec`, 1-256
-  entries. `qid`s are opaque: they MUST NEVER be shown to the model, and
+  instructions (prompt-injection hardening; full corpus in Section 6).
+* `questions` (required): object mapping `qid -> question spec`,
+  `DECISION_MIN_QUESTIONS` to `DECISION_MAX_QUESTIONS` entries. `qid`s are
+  opaque: they MUST NEVER be shown to the model, and
   adding/removing/reordering questions MUST NOT change other answers
   (independent branches/rows).
 * `temperature` (optional, float > 0, default 1.0): global softmax
-  temperature applied to gathered label logits; see Section 7 for provenance
+  temperature applied to gathered label logits; see Section 6 for provenance
   rules.
 * `temperatures` (optional): per-primitive overrides
   `{noul, choice, score}`. Effective temperature for a question =
   `temperatures[type]` if present else `temperature`. Ship `1.0` everywhere;
-  fit per deployment offline (Section 7).
-* `permutations` (optional, int 1-8 or null, default 1): order-debiasing
-  passes. `1` = single canonical order. `2` = identity + one seeded distinct
-  shuffle, per-order softmax then mean by semantic key (seeded by
-  `(seed, qid)`; noul second order = swapped). Values above 8 are accepted and
-  capped at 8; document the measured cost (~1.1x for 2).
+  fit per deployment offline (Section 6).
+* `permutations` (optional, int 1-`DECISION_MAX_PERMUTATIONS` or null, default
+  1): order-debiasing passes. `1` = single canonical order. `2` = identity +
+  one seeded distinct shuffle, per-order softmax then mean by semantic key
+  (seeded by `(seed, qid)`; noul second order = swapped). Values above the cap
+  are accepted and capped; document the measured cost (~1.1x for 2).
 * `head` (optional, string): scoring path. Omit or `""` for auto; `"full"`
   forces full-vocabulary logits on the shared context; `"selected"` requests
-  the answer-head fast path (Section 6.1). The default path uses the head when
+  the answer-head fast path. The default path uses the head when
   it is available and silently falls back to full logits otherwise; an explicit
   `head: "selected"` on an unavailable head is a client error (400).
 * `diagnostics` (optional, bool, default `false`): when `true`, the response
@@ -320,24 +129,20 @@ INPUT; always emit canonical `noul`/`choice`/`score` on output.
   be strings; treat missing as null desc). Internally two options
   `["false","true"]` (or lettered `A:yes/B:no` - equivalent after mapping).
 * `choice`: categorical selection.
-  `criteria` REQUIRED: object `{key: desc|null}`, 2-64 entries, keys in object
+  `criteria` REQUIRED: object `{key: desc|null}`, keys in object
   order. Model sees description, or key when null. Answer uses the KEY.
 * `score`: ordered rating, zero-based.
-  `criteria` REQUIRED: ordered array of 2-10 level descriptions, low -> high
-  (equivalently `{"0": desc, ...}` legend dict on input). Model sees each
-  level; answer is the expected index.
+  `criteria` REQUIRED: ordered array of `DECISION_MIN_OPTIONS` to
+  `DECISION_MAX_SCORE_LEVELS` level descriptions, low -> high (equivalently
+  `{"0": desc, ...}` legend dict on input). Model sees each level; answer is
+  the expected index.
 
-Validation limits: `noul` fixed 2 options; `choice`
-`DECISION_MIN_OPTIONS`-`DECISION_MAX_CHOICE_OPTIONS` (2-64); `score`
-`DECISION_MIN_OPTIONS`-`DECISION_MAX_SCORE_LEVELS` (2-10); questions
-`DECISION_MIN_QUESTIONS`-`DECISION_MAX_QUESTIONS` (1-256); permutations capped
-at `DECISION_MAX_PERMUTATIONS` (8); the answer-label pool is `LABEL_POOL_CAP`
-(64). `choice` and `score` limits are the letter-mode caps; trie-mode generic
-schemas allow up to 255 values/field - Section 6.1. Option IDs/keys unique.
-Reject over-limit; NEVER truncate. Reject empty `criteria` where required.
-Structured `instructions`/`criteria` values are rendered into the prompt,
-never silently stringified; `legend` echoes the ORIGINAL structured values so
-they round-trip.
+Every count limit is listed once in Section 5 and owned by a single constant;
+the validator, the response, and this document read the same value. Option
+IDs/keys must be unique. Over-limit requests are rejected (never truncated).
+Reject empty `criteria` where required. Structured `instructions`/`criteria`
+values are rendered into the prompt, never silently stringified; `legend`
+echoes the ORIGINAL structured values so they round-trip.
 
 Each option line is rendered by `format_option_line` (one function) as
 `label: <key> - <description>`, where the label is the single letter the model
@@ -347,7 +152,7 @@ the option names for choice, and `"0".."K-1"` for score.
 
 ### 2.3 Generic-schema request (trie mode)
 
-The branch already implements a non-Jev flat-JSON form. It stays supported
+The branch also implements a non-Jev flat-JSON form. It stays supported
 byte-identically; the Jev form is added beside it.
 
 ```json
@@ -355,7 +160,8 @@ byte-identically; the Jev form is added beside it.
  "mode": "auto|tree|greedy", "tree_max": 128, "cache_prompt": true}
 ```
 
-* `contexts`: 1-256 non-empty strings, decided in order, sharing one schema.
+* `contexts`: 1-`DECISION_MAX_CONTEXTS` non-empty strings, decided in order,
+  sharing one schema.
 * `schema`: compact `{name: {type, description, choices/enum, minimum,
   maximum, step, aggregate}}` or JSON-Schema `{properties: {...}}`, 1-32
   fields. Types: `boolean`, `enum` (1-255), `integer`/`number` (1-255 grid
@@ -392,7 +198,8 @@ The default response is exactly the Jev envelope:
 
 With `diagnostics: true` the same answers are returned with additive fields:
 `certainty` on choice/score, the per-answer audit fields, the `head` and
-`diagnostics` objects, and the extra `usage` counters:
+`diagnostics` objects, and the extra `usage` counters. The answers themselves
+are byte-identical either way.
 
 ```json
 {
@@ -433,10 +240,11 @@ With `diagnostics: true` the same answers are returned with additive fields:
   frozen Jev shape. `head` reports how the answer was read out
   (`mode: selected|full`, `fallback`, and a `reason` when it fell back).
   `diagnostics` reports the readout identity (`contract_hash`, `prompt_version`,
-  `model`, `quantization`, `template_hash`, `backend_flags`), the adapter scope
-  (`adapters_configured`, `adapter_scope`), and timings (`prefill_ms`,
-  `scoring_ms`, `suffix_tokens`, `common_suffix_tokens`). These are additive and
-  never change an answer. The default response omits all of them.
+  `model`, `quantization`, `template_hash`, `backend_flags`, `label_pool_size`),
+  the adapter scope (`adapters_configured`, `adapter_scope`), and timings
+  (`prefill_ms`, `scoring_ms`, `suffix_tokens`, `common_suffix_tokens`). These
+  are additive and never change an answer. The default response omits all of
+  them.
 * Audit availability depends on the readout. `allowed_token_mass` and
   `full_vocab_argmax_id` are full-vocabulary measurements; under
   `head_mode: "selected"` only the K answer rows are read, so those two fields
@@ -518,7 +326,7 @@ is 501. The full contract follows.
 | 404 | `not_found_error` | unknown model/route | in router mode the decision route follows the existing proxy behavior, like the other routes |
 | 413 | `payload_too_large` | request body over the configured cap | must reject before decode |
 | 415 | `unsupported_media_type` | `Content-Type` is not `application/json` | enforced by the shared HTTP layer |
-| 422 | `invalid_request_error` (semantic) | valid JSON but invalid decision schema: bad question type, 0/257 questions, 1/65 options, 1 or 11+ score levels, duplicate keys, missing `instructions`, missing required `criteria`, unknown field inside a question | Jev semantic-failure code; never downgrade to 400. Unknown top-level fields are ignored, not rejected |
+| 422 | `invalid_request_error` (semantic) | valid JSON but invalid decision schema: bad question type, `DECISION_MIN_QUESTIONS`-`DECISION_MAX_QUESTIONS` questions, `DECISION_MIN_OPTIONS`-`DECISION_MAX_CHOICE_OPTIONS` options, `DECISION_MIN_OPTIONS`-`DECISION_MAX_SCORE_LEVELS` score levels, duplicate keys, missing `instructions`, missing required `criteria`, unknown field inside a question | Jev semantic-failure code; never downgrade to 400. Unknown top-level fields are ignored, not rejected |
 | 429 | `rate_limit_error` | decision queue full | include `Retry-After` |
 | 499 | `client_closed_request` | client disconnected / cancelled mid-evaluation | cancel siblings; never report as a normal answer |
 | 500 | `server_error` | inference/engine failure | reset engine state |
@@ -559,147 +367,35 @@ Notes:
 
 ---
 
-## 5. Back-end approaches surveyed
+## 5. Limits
 
-| Approach | Prompt | Readout | Parallelism | Calibration | Model scope |
-|---|---|---|---|---|---|
-| `_codacus_parallel_decision` (substrate of this branch) | chat template + sentinel; shared head + per-context tail; suffix + common-prefix split | surface-form TRIE (exact tree <= tree_max else greedy); never generates | `seq_cp` fork, unified KV, `--decision-seqs` pool, grouped waves | exact distribution (tree); path-product (greedy) | any decoder LLM |
-| `exclusive classifier` (separate experimental service) | framed state + per-question suffix ending `Answer:` | single-token LETTERS + selected-head projection + softmax; `confidence=1-H/logK` | shared-prefix KV, cross-Q dedup, bounded-SWA reclaim, exclusive suspend/restore | none (T=1.0); concentration only | Gemma-4 only, GPU only, merged adapter |
-| reflex (transformers + SGLang) | ChatML evidence prefix + `# Criterion/# Options/Respond with only letter` | single-token letters, restricted softmax/T | prefix LRU + packed mask (attn-only) or batched SGLang fanout (`token_ids_logprob`) | per-primitive T (post-hoc); 2-permutation averaging | frozen Qwen 4B/27B |
-| decider (custom CUDA + vLLM check) | plain `Context:/Question/Options/Answer:(` | slot hidden state x `lm_head[letter_ids]`, `A-J` narrow / `A-Z+AA..` wide to 255 | `score_shared` LCP-once + `reorder_cache` fork; micro-batched graphs | CE fine-tune + T=1.30 + RL consistency | trained Mapika 2B/35B |
-| SemIf (`semif_phase1`, torch/MLX/llamacpp) | system + JSON `{evidence,criterion,options[{letter,desc}]}` | full-vocab last-pos logits, gather A-P slots | serial save/restore; shared prefill + batched suffixes | offline per-workload T only | Qwen3.5 + GGUF verify |
-| Nimble (MLX/CUDA) | JSON `{context,schema}` + `Requested field` | single-token codes, union-label FP32 projection | 1 prefill + `broadcast_cache` fork + one batched suffix call | T=1.0 unfitted, contract hash | trained 2k ctx |
-| openjev-sglang | state passthrough + `...answer with only its label` + UUID marker | SGLang 1-token generate, per-label logprob lookup | warmup-prefill + asyncio branches (sem 64) | T=1.0, entropy confidence | SGLang + radix required |
+Every limit is owned by one constant; the validator and this table read the
+same value.
 
-Key consensus across all seven: single next-token readout over verified
-alphabetic labels; shared-state prefix prefill once; per-question suffix
-branches; `softmax(logits/T)`; entropy-based confidence labeled
-non-calibrated; assemble-by-code; never truncate (reject over-limit).
+| Limit | Owner |
+|---|---|
+| questions per request | `DECISION_MIN_QUESTIONS`-`DECISION_MAX_QUESTIONS` |
+| `noul` options | fixed 2 |
+| `choice` options per question | `DECISION_MIN_OPTIONS`-`DECISION_MAX_CHOICE_OPTIONS` |
+| `score` levels per question | `DECISION_MIN_OPTIONS`-`DECISION_MAX_SCORE_LEVELS` |
+| order-de-bias passes | 1 default, capped at `DECISION_MAX_PERMUTATIONS` |
+| contexts per generic request | `DECISION_MAX_CONTEXTS` |
+| answer-label pool | `LABEL_POOL_CAP` (equal to `DECISION_MAX_CHOICE_OPTIONS`) |
+| request body | `LLAMA_DECISION_MAX_BODY` (default 2 MiB) |
+| concurrent decisions | `LLAMA_DECISION_MAX_QUEUE` (default 4), then 429/529 |
+| trie fields / values per field | 1-32 fields, 1-255 values |
 
----
-
-## 6. Selected implementation (locked) and high-quality alternatives
-
-### 6.1 Selected: llama.cpp dual-readout + hybrid fork + optional adapters
-
-This is what the branch implements. Every bullet below is as-built.
-
-* Prompt (Section 2): `apply_chat_template(add_generation_prompt=true,
-  enable_thinking=false)`; raw fallback `system + "\nContext:\n" + state`.
-  Assert marker survival; reject if template ate it. The assistant-answer
-  boundary is architecture-specific: make it a parameter, assert the EXACT
-  token ids for the production template tail, and use a synthetic tail in
-  model-independent tests.
-* Labels: pool `A-Z,AA-ZZ`; a label is the single token the model emits after
-  the framed answer tail, resolved at that boundary (so `add_space_prefix`
-  tokenizers are supported); keep iff single, non-special and unique; cap 64.
-  Boundary check per branch: `encode(full_prompt + label) == ids + [label]`;
-  hard error otherwise. (Numeric labels break at `>=10`; never use them.)
-* Readout A (Jev types, <=64 opts): letter logits -> `softmax(logits/T_type)`.
-* Readout B (generic flat JSON, <=32 fields, <=255 values): codacus trie -
-  `suffix = '  "name": ' + common-char-prefix`, candidates = remainders,
-  tokenize `suffix+candidate`, split at longest common token prefix, score
-  divergence nodes in round 1 (tree) or follow-up rounds (greedy). Numeric
-  `aggregate: mode|median|mean` + `interval_p10_p90`.
-* KV: one shared-prefix prefill; per-question fork via `seq_cp` when the
-  architecture supports copies; whole-sequence `llama_state_seq_get_data /
-  set_data` + `seq_rm` fallback for hybrid/recurrent state (Qwen3.5, Gemma),
-  exactly as `SemIf/src/semif_phase1/llamacpp_backend.py` does
-  (`n_seq_max=1, n_outputs_max=1`, 512-token decode chunks,
-  logits-on-last-token-only). Never mutate the cached prefix; single-question
-  requests skip the fork path (measured slower with it).
-* Batching: exact-token dedup + common-prefix hoist (>=32 tokens); waves of
-  `<= parallel` leaves fitting `n_ctx`; group by length bucket; right-pad
-  AFTER the scored position; per-row last-valid gather; logits at selected
-  positions only; semaphore-bounded concurrency; cooperative yield + atomic
-  cancel.
-* Head fast path (implemented): a classifier-only context stops the graph after
-  the final normalization layer, and `llama_model_classifier_rows` dequantizes
-  only the K answer rows, scored with a host-side dot product (re-applying the
-  logit softcap where the architecture has one). The head is used when the
-  architecture supports the classifier stop and the hidden state and answer
-  rows match; on any arch/head/layout mismatch it falls back to full-logits +
-  gather, so an unavailable head never changes an answer. An explicit
-  `head: "selected"` on an unavailable head is a client error (400). The row
-  table is cached per model. `option_logits` and probabilities are both
-  exposed; full-vocab probabilities never are.
-* Order de-bias: `permutations` (default 1, capped 8), identity plus seeded
-  distinct shuffles, per-order softmax then mean by option key. Default 1 is
-  byte-identical to a request without the field.
-* Admission and cancellation: body cap (413), concurrent-request cap
-  (429/529 + `Retry-After`), 499 on client disconnect, and a cancel flag that
-  is checked at entry, between waves, and before every `llama_decode` so the
-  compute actually stops. The decision runs inside a cooperative yield so
-  metrics and slot reads stay responsive while it computes.
-* Contract and audit: a contract hash over tokenizer, template, label code and
-  prompt version is logged and returned as `diagnostics.contract_hash`, and
-  `--decision-contract` refuses a mismatch with 501. Every answer carries the
-  additive audit fields (Section 0.5).
-* Adapters (optional): merged LoRA/finetune MAY be used; LoRA/specialized
-  serving paths MUST NOT be required. When the fast head path is explicitly
-  requested with incompatible adapters/speculative settings, return 400 with a
-  plain message rather than silently degrading.
-* Adapter scope (stated behavior change): the decision decode always answers
-  for the BASE model. Before every decision decode the server detaches the
-  adapters from the serving context; the next chat batch re-applies its own
-  set, so chat is unaffected. With adapters configured on the server (any
-  registered adapter with a non-zero scale), the answer head cannot serve the
-  adapted model, so `head: "selected"` returns 400, the default `head` reads
-  full logits on the base scope and reports why it fell back, and
-  `head: "full"` is unchanged. `diagnostics` reports `adapters_configured` and
-  `adapter_scope: "base"` on every decision answer. Without adapters the
-  behavior is byte-identical to the head selection described above.
-* Tokenizer gates (from SemIf `llamacpp_backend.py:186-207`): GGUF
-  tokenization MUST equal the reference encoding (`encode_verified`), plus a
-  startup vocabulary probe (all label letters single shared tokens).
-  Reference-tokenizer prompt hash (`prompt_sha256`, `prompt_version`) travels
-  with every result for audit.
-* Chat coexistence: default shares one weight allocation; decision pass runs
-  on the context thread with cooperative yield points; NO exclusive eviction
-  by default. Cache behavior is surfaced in `usage` (`cached_tokens`,
-  `state_cache_hit`) and the timing counters ride along in the engine metrics.
-
-### 6.2 Alternatives implementers may choose (all Jev-compatible)
-
-1. SGLang logprob fanout (openjev-sglang): warmup-prefill to prime radix
-   cache, then parallel 1-token `/generate` with `return_logprob +
-   token_ids_logprob=labels`; require exactly 1 completion token; per-label
-   lookup + softmax. Requires radix + CUDA graphs; reject
-   `--disable-radix-cache` etc. Simplest correct server/GPU path.
-2. Transformers selected-logits (reflex/SemIf-torch): `logits_to_keep=1`
-   (single) or selected positions (shared); `reorder_cache`/`deepcopy` fork;
-   right-pad + per-row gather; `torch.compile + FP8` optional. Best for
-   research rigs and CPU/MPS fallback (MPS: looped batch-1 suffixes).
-3. Native selected-head engine (decider/Nimble): `hidden @ lm_head[labels]`
-   in a custom CUDA/MLX kernel; schema-first prefix KV; per-`(batch,len)`
-   suffix graphs. Fastest at scale (ms/req graphs, 7-19x shared speedups)
-   but most engineering.
-4. Reranker cross-encoder (SemIf `reranker.py`): per-option
-   `logit(yes)-logit(no)` log-odds then cross-option softmax. Order-invariant
-   but empirically weaker as a decider (0.498 in cited test); use for
-   retrieval relevance, not for Jev answers.
-5. Serial state-restore on CPU (SemIf `llamacpp_backend.py:309-405`):
-   `clear/prefill/save_state` once, then `restore_state + branch_logits` per
-   question. The minimal correct llama.cpp CPU implementation; add batching
-   later.
-
-### 6.3 What NOT to do
-
-* No free-text generation + parsing (breaks the 100% schema-validity
-  guarantee and the `output_tokens:0` contract).
-* No multi-token option decoding in letter mode (unrepresentable in one
-  slot; use trie mode instead).
-* No truncation on over-limit (reject with 413/422).
-* No `qid` leakage into prompts; no cross-question conditioning in the
-  default path.
-* No presenting `confidence` as accuracy; no fitted global T claimed to
-  transfer across quant/backend swaps.
-* No arch-gated or GPU-gated hard requirements in the default path; no
-  per-request weight loading.
+The protocol option cap is `DECISION_MAX_CHOICE_OPTIONS` (64); the label-pool
+cap is `LABEL_POOL_CAP` (64), equal so every option can get a label. The
+REALIZED label pool is model-dependent: the tokenizer must resolve each label
+as one non-special token at the answer boundary, so a model may yield fewer
+than 64. The realized size is reported as `diagnostics.label_pool_size` and
+recorded in the calibration ledger. A request whose widest question needs more
+labels than the realized pool is a 422, never a truncated option set.
 
 ---
 
-## 7. Calibration, robustness, and acceptance
+## 6. Calibration and acceptance
 
 Two axes, never conflated:
 - CONFIDENCE (producer self-doubt): `certainty`, `allowed_token_mass`,
@@ -713,18 +409,16 @@ Rules:
   PROVENANCE (model hash, quantization, template hash, backend flags) and is
   refused on mismatch. Temperature is argmax-invariant: it changes
   probabilities/thresholds, not winners. Provide an offline refit script
-  (NLL/Brier per primitive on own traffic). Expect NVFP4/backend swaps to
-  move ECE +0.02-0.09; refit per deployment.
-* Order bias: offer `permutations=2` (seeded `(seed,qid)` distinct shuffle,
-  mean by semantic key). Measured: ~1.1x tokens, roughly halves pooled ECE,
-  +2-3pp hard accuracy in reflex tests. Default stays 1.
-* Expect close-call flips across dtype/batch (SemIf 5-6/777; Nimble up to
-  1.8pp deltas). Acceptance compares with TOLERANCE, never bit-equality.
-  Pin `tokenizer + template + label code` in a contract/startup hash and
-  refuse on mismatch (`prompt_code_sha256` pattern). Every parity/calibration
-  claim inherits the frozen backend flag set recorded at baseline (FA type,
-  K/V cache types, `kv_unified`, `swa_full`, `n_ubatch`, threads); changing
-  flags invalidates the claim.
+  (NLL/Brier per primitive on own traffic). Expect quant/backend swaps to move
+  ECE; refit per deployment.
+* Order bias: `permutations` is a seeded distinct shuffle with the mean taken
+  by semantic key. Default stays 1.
+* Expect close-call flips across dtype/batch. Acceptance compares with
+  TOLERANCE, never bit-equality. Pin `tokenizer + template + label code` in a
+  contract/startup hash and refuse on mismatch. Every parity/calibration claim
+  inherits the frozen backend flag set recorded at baseline (FA type, K/V
+  cache types, `kv_unified`, `swa_full`, `n_ubatch`, threads); changing flags
+  invalidates the claim.
 * Prompt-injection corpus for `safe_data`: `<|turn>`, `{REASON:`, `__media__`,
   backticks, and nested arrays/objects.
 * Diagnostics to log per request: `allowed_token_mass`
@@ -733,64 +427,30 @@ Rules:
   `queue_ms`. These catch prompt-drift and head-mismatch before users do.
 * Policy: the model's `confidence`/`certainty` NEVER gates admission,
   caching, routing, or persistence.
-* Benchmarks to report: JevBench easy/std/hard + ECE per primitive;
-  warm/cold latency at 1/8/64 questions; cache-hit rate; argmax-flip rate
-  across quant/backend. Reference points: reflex-4B frozen ~0.917 std /
-  0.685 hard ECE ~0.08; reflex-27B hard 0.766; decider-35B std 0.972;
-  codacus-style 137-prompt + 14-row batch ~100 ms warm on Gemma-12B/3060.
 
 ---
 
-## 8. Minimal implementation checklist (any back-end)
+## 7. Glossary
 
-Status: items 1-7 and 9, 11, 12 are implemented;
-item 8 is implemented except the optional latency headers; item 10 ships the
-permutation option but not an offline refit script.
-
-1. Strict validator: state non-empty; 1-256 questions; `instructions`
-   required and non-null; choice 2-64 options, score 2-10 levels; unique
-   IDs/keys; `bool`/`scale` aliases accepted; over-limit rejects.
-2. Prompt renderer + marker-survival assert + `safe_data` escaping + exact
-   assistant-boundary id assertion.
-3. Label pool builder (single-token + round-trip + unique + non-special)
-   + per-branch boundary check.
-4. Shared-prefix prefill + per-question branch fork (native copy OR
-   save/restore; never mutate prefix).
-5. Single-token readout: gather K logits, `softmax(logits/T_type)`,
-   `noul=P(true)`, `choice=argmax`, `score=sum i*p_i`,
-   `confidence=1-H/logK`, `certainty=max_p`.
-6. (If generic schemas:) trie scorer with `tree_max`/greedy fallback +
-   numeric aggregates.
-7. Assembler (code, not decode) + canonical answer envelope + `legend`
-   with string keys + `usage{input_tokens,output_tokens:0}`; the extra
-   counters (`cached_tokens`, `state_cache_hit`, `head_mode`) and the
-   additive fields appear only with `diagnostics: true`.
-8. Errors (400/401/403/404/413/422/429/499/500/501/503/529), `Retry-After`,
-   abort-on-cancel, latency headers.
-9. Tokenizer/vocab gates + `prompt_sha256` audit + contract hash.
-10. Offline temperature-refit script + order-permutation option.
-11. Chat-coexistence test: interleaved `/v1/chat/completions` +
-    `/v1/decision` with KV integrity asserted.
-12. Tolerance-based golden tests (no exact-logit assertions).
-
----
-
-## 9. Red-team notes (why this shape)
-
-* Closed-world overconfidence is inherent: probabilities condition on the
-  supplied options even when all are wrong. Mitigated by contract language,
-  `allowed_token_mass` telemetry, and never calling `confidence` accuracy.
-* Single-token bottleneck forces prompt discipline (bare label output).
-  Mitigated by dual readout and boundary verification.
-* Hybrid KV cannot use copy-or-mask tricks (reflex `packed` mask fails on
-  recurrent state). Mitigated by the save/restore fallback proven in
-  `llamacpp_backend.py`.
-* Exclusive-mode and GPU-only designs (winnow) buy peak speed at the cost
-  of generality and chat disruption. Default stays shared and portable;
-  exclusivity is an operator opt-in.
-* Cross-field conditioning (codacus "fields mutually blind") and multi-hop
-  reasoning are out of scope for the scoring pass; callers compose them with
-  multiple decision calls or a chat call. Document, do not smuggle CoT into
-  the readout.
-* Sequence ids are partitioned (slots vs decision); the prefix LRU is bounded
-  and in-memory; cancellation reaches compute, not just the wait.
+- **state**: the evidence document; opaque to the server, treated as DATA.
+- **question**: one typed decision over a `state`; identified by an opaque
+  `qid` that is never shown to the model.
+- **option / candidate**: one allowed answer value for a question.
+- **label**: a single-token letter (`A`, `B`, ... up to `BL`) the model emits
+  instead of the option text; probability comes from that token's logit.
+- **readout**: how option probabilities are extracted. Letter readout uses one
+  label token per option; trie readout scores the model's own token paths for
+  surface-form values.
+- **branch / trunk / prefix**: one KV sequence per scored path; a trunk is
+  `shared prefix + context`; the prefix is the cacheable head.
+- **producer confidence vs task value**: two DIFFERENT axes (Section 6). Never
+  use a confidence number to gate caching/admission/correctness.
+- **closed-world probabilities**: `probabilities` are conditional on the
+  supplied options; they do not measure the chance that all options are wrong.
+- **contract hash**: a hash over the tokenizer identity, the framed prompt
+  template, and the label code. If it changes, any earlier calibration is
+  stale. Logged at startup and returned as `diagnostics.contract_hash`.
+- **audit fields**: additive per-answer telemetry (`allowed_token_mass`,
+  `full_vocab_argmax_id`, `answer_token_ids`, `option_logits`,
+  `prompt_sha256`, `prompt_version`, `probability_status`). For inspection
+  only; they never change an answer.

@@ -1,5 +1,6 @@
 #include "letter_readout.h"
 
+#include "../../src/llama-ext.h"  // staging API: classifier answer-head predicate and row reader
 #include "chat.h"
 #include "common.h"
 
@@ -365,6 +366,10 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
     // the row table is a pure function of (model, labels), so the cache builds it once
     const classifier_head & head = head_cache.for_labels(model, labels);
 
+    // compile the plan once on the full engine (the readout_sources contract guarantees it is
+    // non-null); the head choice below and the scoring share this one plan.
+    const compiled_fields plan = sources.full->compile_fields(fields, readout_opt);
+
     engine * chosen = sources.full;
     std::string fallback_reason;
     if (req.head != "full") {
@@ -377,7 +382,6 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
             // one plan, one predicate: the engine owns both, so the server and the readout cannot
             // disagree on whether the fast path can run for these candidates.
             readout_opt.head = &head;
-            const compiled_fields plan = sources.classifier->compile_fields(fields, readout_opt);
             if (sources.classifier->select_scoring_head(plan, readout_opt, &fallback_reason)) {
                 chosen = sources.classifier;
             } else {
@@ -386,7 +390,7 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
         }
     }
 
-    const auto b = chosen->decide_batch(split.first, { render_state(req.state) }, fields, readout_opt);
+    const auto b = chosen->decide_batch(plan, split.first, { render_state(req.state) }, readout_opt);
 
     if (metrics) {
         metrics->cache_hit      = b.cache_hit;
@@ -404,6 +408,7 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
         metrics->suffix_tokens        = b.suffix_tokens;
         metrics->common_suffix_tokens = b.common_suffix_tokens;
         metrics->leaf_suffix_tokens   = b.leaf_suffix_tokens;
+        metrics->label_pool_size      = labels.size();
     }
 
     std::vector<std::vector<float>> probs;

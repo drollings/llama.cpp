@@ -330,7 +330,8 @@ void engine::load_seq(const saved_state & state, llama_seq_id seq) const {
         throw std::runtime_error("cannot load an empty decision sequence state");
     }
     // The format belongs to the value: the device flag is never substituted for the host flag or
-    // the other way around, so a stale engine flag cannot misread the bytes.
+    // the other way around, so a stale engine flag cannot misread the bytes. A failed device load is
+    // fatal because the host bytes are not present to fall back to.
     const size_t n = llama_state_seq_set_data_ext(ctx, state.bytes.data(), state.bytes.size(), seq,
                                                   state_load_flags(state.on_device));
     if (n == 0) {
@@ -855,11 +856,21 @@ compiled_fields engine::compile_fields(const std::vector<field_input> & inputs, 
 
 batch_result engine::decide_batch(const std::string & shared_text, const std::vector<std::string> & contexts,
                                   const std::vector<field_input> & inputs, const options & opt) {
+    return decide_batch(compile_fields(inputs, opt), shared_text, contexts, opt);
+}
+
+batch_result engine::decide_batch(const compiled_fields &          plan,
+                                  const std::string &              shared_text,
+                                  const std::vector<std::string> & contexts,
+                                  const options &                  opt) {
     if (opt.mode != "auto" && opt.mode != "tree" && opt.mode != "greedy") {
         throw std::invalid_argument("mode must be auto, tree or greedy");
     }
     if (contexts.empty()) {
         throw std::invalid_argument("a decision needs at least one context");
+    }
+    if (plan.p == nullptr) {
+        throw std::runtime_error("the decision plan is empty");
     }
     select_fork(opt.fork);
     stop_  = opt.should_stop;
@@ -876,10 +887,6 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
         }
     }
 
-    compiled_fields plan = compile_fields(inputs, opt);
-    if (plan.p == nullptr) {
-        throw std::runtime_error("the decision plan is empty");
-    }
     const std::vector<decision_field> & fields          = plan.p->fields;
     const std::vector<size_t> &         field_first     = plan.p->field_first;
     const tokens_t &                    plan_common     = plan.p->plan_common;

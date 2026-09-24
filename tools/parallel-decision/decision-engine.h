@@ -194,6 +194,14 @@ class engine {
     batch_result decide_batch(const std::string & shared_text, const std::vector<std::string> & contexts,
                               const std::vector<field_input> & fields, const options & opt);
 
+    // Same as above, but scores a plan the caller already compiled. This is the entry point for a
+    // caller that needs the plan before choosing the context (for example to decide the answer
+    // head), so the fields are compiled once instead of twice. A null plan is a caller error.
+    batch_result decide_batch(const compiled_fields &          plan,
+                              const std::string &              shared_text,
+                              const std::vector<std::string> & contexts,
+                              const options &                  opt);
+
     // Remove every cell of `count` sequences starting at `first` in this engine's memory.
     void clear_seqs(llama_seq_id first, int count);
 
@@ -221,9 +229,10 @@ class engine {
 
     enum class fork_kind { copy, restore };
 
-    // The device and host formats are distinct and the flag travels with the bytes, so a load
-    // never guesses. The device format stages tensor bytes in the context staging buffer (valid
-    // only until something saves over it); host format outlives the request. Empty state is invalid.
+    // The device and host formats are distinct and the flag travels with the bytes, so a load never
+    // guesses. The device format stages tensor bytes in the context staging buffer and is not
+    // self-contained: it is valid only until something saves over that buffer. The host format is
+    // self-contained and outlives the request. Empty state is invalid.
     struct saved_state {
         std::vector<uint8_t> bytes;
         bool                 on_device = false;
@@ -256,8 +265,10 @@ class engine {
     // LRU entries are host format so they outlive the saves that reuse the device staging buffer
     saved_state         prefix_state_;
 
-    // one-way capability: device staging is used while it works and is abandoned for the process
-    // lifetime when a save or load fails; it selects the save format, never a content check
+    // One-way capability: device staging is used while a device save works. A device save failure
+    // retires it for the process and falls back to the self-contained host format. A device load
+    // failure is fatal, because the host bytes are not present to fall back to. The flag selects the
+    // save format; it is never a content check.
     mutable bool device_capable_ = true;
 
     struct prefix_entry {

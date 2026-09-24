@@ -3,18 +3,17 @@
 #define private public
 #include "decision-engine.h"
 #undef private
-#include "decision-protocol.h"
-#include "labels.h"
-#include "letter_readout.h"
-
+#include "../src/llama-ext.h"  // staging API: classifier answer-head predicate and row reader
 #include "chat.h"
 #include "common.h"
+#include "decision-protocol.h"
+#include "ggml-backend.h"
 #include "json.h"
+#include "labels.h"
+#include "letter_readout.h"
 #include "llama.h"
 #include "speculative.h"
 #include "testing.h"
-
-#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cctype>
@@ -605,6 +604,36 @@ static void test_temperature_effect(testing & t) {
     });
 }
 
+// confidence and certainty are two axes: normalized inverse entropy and the winner's share. Pin
+// both against hand-computed literals so a rename cannot quietly swap them.
+static void test_confidence_certainty_axes(testing & t) {
+    t.test("confidence is inverse entropy and certainty is the winner share", [](testing & t) {
+        auto req        = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
+        req.diagnostics = true;
+        const std::vector<std::vector<float>> probs = {
+            { 0.2f, 0.8f }, // noul: neither axis is emitted
+            { 0.6f, 0.3f, 0.1f }, // choice
+            { 0.9f, 0.1f, 0.0f }, // score
+        };
+        common_json usage      = common_json::object();
+        usage["output_tokens"] = 0;
+        const common_json out  = llama_decision::assemble_decision_response(req, probs, "m", usage);
+
+        const auto & dept = out.at("answers").at("dept");
+        assert_close(t, "choice confidence is 1 - H/log 3 for (0.6,0.3,0.1)", 0.182654578,
+                     dept.at("confidence").get<double>(), 1e-6);
+        assert_close(t, "choice certainty is max(p) = 0.6", 0.6, dept.at("certainty").get<double>(), 1e-6);
+
+        const auto & urg = out.at("answers").at("urgency");
+        assert_close(t, "score confidence is 1 - H/log 3 for (0.9,0.1,0.0)", 0.704096726,
+                     urg.at("confidence").get<double>(), 1e-6);
+        assert_close(t, "score certainty is max(p) = 0.9", 0.9, urg.at("certainty").get<double>(), 1e-6);
+
+        t.assert_true("noul carries no confidence", !out.at("answers").at("refund").contains("confidence"));
+        t.assert_true("noul carries no certainty", !out.at("answers").at("refund").contains("certainty"));
+    });
+}
+
 static void test_temperature_profile(testing & t) {
     t.test("temperature provenance is enforced only for non-default values", [](testing & t) {
         const common_json doc = common_json::parse(R"({
@@ -887,13 +916,13 @@ struct test_engine {
         }
     }
 
-    bool make_ctx(bool classifier_only, int n_batch = 512) {
+    bool make_ctx(bool classifier_only, int n_batch = 512, int n_seq_max = 10) {
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx                 = 8192;
         cp.n_batch               = n_batch;
         cp.n_ubatch              = n_batch;
-        cp.n_seq_max             = 10;
-        cp.n_outputs_max         = 10;
+        cp.n_seq_max             = n_seq_max;
+        cp.n_outputs_max         = n_seq_max;
         cp.n_outputs_max_per_seq = 1;
         cp.kv_unified            = true;
         cp.swa_full              = false;
@@ -904,12 +933,12 @@ struct test_engine {
         return ctx != nullptr;
     }
 
-    bool load(const char * path) {
+    bool load(const char * path, int n_seq_max = 10) {
         if (!shared_model().load(path)) {
             return false;
         }
         model = shared_model().model;
-        return make_ctx(false);
+        return make_ctx(false, 512, n_seq_max);
     }
 };
 
@@ -955,7 +984,12 @@ struct cpu_test_engine {
         }
     }
 
-    bool load(const std::string & path, int n_ctx = 256, bool classifier_only = false, bool embeddings = false, int n_batch = 128) {
+    bool load(const std::string & path,
+              int                 n_ctx           = 256,
+              bool                classifier_only = false,
+              bool                embeddings      = false,
+              int                 n_batch         = 128,
+              int                 n_seq_max       = 10) {
         if (path.empty()) {
             return false;
         }
@@ -970,8 +1004,8 @@ struct cpu_test_engine {
         cp.n_ctx                 = n_ctx;
         cp.n_batch               = n_batch;
         cp.n_ubatch              = n_batch;
-        cp.n_seq_max             = 10;
-        cp.n_outputs_max         = 10;
+        cp.n_seq_max             = n_seq_max;
+        cp.n_outputs_max         = n_seq_max;
         cp.n_outputs_max_per_seq = 1;
         cp.kv_unified            = true;
         cp.swa_full              = false;
@@ -1362,6 +1396,38 @@ static void test_letter_suffix(testing & t) {
         }
         t.assert_true("three-option question needs three labels", threw);
         llama_decision::validate_label_capacity(req, 3); // must not throw
+    });
+
+    t.test("label capacity rejects above the realized pool and accepts at it", [](testing & t) {
+        auto make_choice_request = [](size_t n) {
+            common_json body =
+                common_json::parse(R"({"state":"s","questions":{"q":{"type":"choice","instructions":"pick"}}})");
+            common_json crit = common_json::object();
+            for (size_t i = 0; i < n; ++i) {
+                crit["k" + std::to_string(i)] = "d";
+            }
+            body["questions"]["q"]["criteria"] = crit;
+            return llama_decision::parse_decision_request(body);
+        };
+
+        // control group: a single-letter vocabulary yields only the 26 single-letter labels
+        const fake_vocab small      = make_fake_vocab(false);
+        const auto       small_pool = llama_decision::build_label_pool(small, "", 64);
+        t.assert_equal("the control pool is the 26 single letters", (size_t) 26, small_pool.size());
+        llama_decision::validate_label_capacity(make_choice_request(26), small_pool.size());  // must not throw
+        bool over = false;
+        try {
+            llama_decision::validate_label_capacity(make_choice_request(27), small_pool.size());
+        } catch (const llama_decision::semantic_error &) {
+            over = true;
+        }
+        t.assert_true("one option above the control pool is rejected", over);
+
+        // positive group: a double-letter vocabulary fills the cap, and the cap itself is accepted
+        const fake_vocab full      = make_fake_vocab(true);
+        const auto       full_pool = llama_decision::build_label_pool(full, "", llama_decision::LABEL_POOL_CAP);
+        t.assert_equal("the positive pool reaches the cap", llama_decision::LABEL_POOL_CAP, full_pool.size());
+        llama_decision::validate_label_capacity(make_choice_request(llama_decision::LABEL_POOL_CAP), full_pool.size());
     });
 }
 
@@ -2326,6 +2392,158 @@ static void test_recurrent_multi_range_device_save(testing & t) {
     });
 }
 
+// Device state round-trip when the cache layout changes between save and restore. The save stages
+// tensor bytes in the context staging buffer; a changed layout can push the reader from the 1:1
+// chunked copy to the byte-cursor path, and the restored state must still equal the saved one. A
+// missing backend synchronize would leave the restore half-applied, so the host dump catches it.
+static void device_layout_mutation_round_trip(testing &           t,
+                                              llama_context *     ctx,
+                                              llama_model *       model,
+                                              const std::string & lane) {
+    const llama_vocab *            vocab = llama_model_get_vocab(model);
+    const std::vector<llama_token> toks  = common_tokenize(vocab, "layout mutation decision state", false, true);
+    if (toks.empty()) {
+        t.skip("the model has no usable tokens");
+        return;
+    }
+    const llama_memory_t mem = llama_get_memory(ctx);
+    const llama_pos      n   = (llama_pos) toks.size();
+
+    auto decode_seq = [&](llama_seq_id seq, llama_pos pos0, const std::vector<llama_token> & ids) {
+        llama_batch batch = llama_batch_init((int) ids.size(), 0, 1);
+        for (size_t i = 0; i < ids.size(); ++i) {
+            common_batch_add(batch, ids[i], pos0 + (llama_pos) i, { seq }, i + 1 == ids.size());
+        }
+        const int rc = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        return rc == 0;
+    };
+    auto host_dump = [&]() {
+        std::vector<uint8_t> buf(llama_state_seq_get_size(ctx, 0));
+        const size_t         got = llama_state_seq_get_data(ctx, buf.data(), buf.size(), 0);
+        buf.resize(got);
+        return buf;
+    };
+
+    if (!decode_seq(0, 0, toks)) {
+        t.assert_true(lane + ": the prefix decodes", false);
+        return;
+    }
+    llama_synchronize(ctx);
+
+    const std::vector<uint8_t> before = host_dump();
+    if (!t.assert_true(lane + ": the host state is non-empty", !before.empty())) {
+        return;
+    }
+    const size_t dev_size = llama_state_seq_get_size_ext(ctx, 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+    if (!t.assert_true(lane + ": the device state has a size", dev_size > 0)) {
+        return;
+    }
+    std::vector<uint8_t> dev(dev_size);
+    if (!t.assert_equal(
+            lane + ": the full device state is written", dev_size,
+            llama_state_seq_get_data_ext(ctx, dev.data(), dev.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE))) {
+        return;
+    }
+
+    // Mutate, restore the one saved device state, and require the host dump to return to `before`.
+    auto mutate_and_restore = [&](const std::string & name, auto && mutate) {
+        if (!mutate()) {
+            printf("layout mutation not run (%s): the cache refused it\n", name.c_str());
+            return;
+        }
+        const size_t nset =
+            llama_state_seq_set_data_ext(ctx, dev.data(), dev.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+        if (!t.assert_equal(lane + ": " + name + " restores in full", dev_size, nset)) {
+            return;
+        }
+        t.assert_true(lane + ": " + name + " equals the saved state", before == host_dump());
+    };
+
+    // other sequences come and go around the saved one
+    mutate_and_restore("other sequences", [&]() {
+        if (!decode_seq(1, 0, toks) || !decode_seq(2, 0, toks)) {
+            return false;
+        }
+        llama_synchronize(ctx);
+        const bool r1 = llama_memory_seq_rm(mem, 1, -1, -1);
+        const bool r2 = llama_memory_seq_rm(mem, 2, -1, -1);
+        llama_synchronize(ctx);
+        return r1 && r2;
+    });
+
+    // trim the tail of the saved sequence and re-decode it, so its cells may move
+    mutate_and_restore("trim and re-decode", [&]() {
+        const llama_pos k = std::min<llama_pos>(1, n - 1);
+        if (k <= 0 || !llama_memory_seq_rm(mem, 0, n - k, -1)) {
+            return false;
+        }
+        const std::vector<llama_token> tail(toks.end() - k, toks.end());
+        return decode_seq(0, n - k, tail);
+    });
+
+    // rebuild the sequence from scratch, relocating its cells
+    mutate_and_restore("clear and rebuild", [&]() {
+        llama_memory_clear(mem, true);
+        return decode_seq(0, 0, toks);
+    });
+
+    // interleave a foreign sequence into the saved sequence's cells, then re-decode the moved tail:
+    // this fragments the saved sequence so the reader must re-chunk across ranges
+    mutate_and_restore("fragmented rebuild", [&]() {
+        const llama_pos half = n / 2;
+        if (half <= 0 || !llama_memory_seq_rm(mem, 0, half, -1)) {
+            return false;
+        }
+        const std::vector<llama_token> tail(toks.begin() + half, toks.end());
+        if (!decode_seq(1, 0, tail)) {
+            return false;
+        }
+        if (!decode_seq(0, half, tail)) {
+            return false;
+        }
+        llama_memory_seq_rm(mem, 1, -1, -1);
+        llama_synchronize(ctx);
+        return true;
+    });
+}
+
+static void test_device_layout_mutation_round_trip(testing & t) {
+    t.test("a device state round-trips across cache layout mutations on the CPU backend", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path, 512, false, false)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            device_layout_mutation_round_trip(t, te.ctx, te.model, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU layout mutation round trip: ") + e.what(), false);
+        }
+    });
+
+    t.test("a device state round-trips across cache layout mutations on a GPU backend", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            device_layout_mutation_round_trip(t, te.ctx, te.model, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU layout mutation round trip: ") + e.what(), false);
+        }
+    });
+}
 
 // The engine refuses a save that has nothing to copy and a load that has nothing to restore. A
 // silent empty state would let a failed prefix save continue with wrong offsets and score garbage.
@@ -2587,6 +2805,130 @@ static void test_bounded_decision_context(testing & t) {
     });
 }
 
+// A restore-fork group with more than one trunk per wave. Each context is staged as its own saved
+// state and every branch restores from its own parent, so independent contexts must not alias, and
+// the chat sequences that share the context must be untouched.
+static void multi_trunk_restore_round_trip(testing &           t,
+                                           llama_context *     ctx,
+                                           llama_model *       model,
+                                           const std::string & lane) {
+    const llama_vocab *            vocab = llama_model_get_vocab(model);
+    const std::vector<llama_token> chat  = common_tokenize(vocab, "a chat turn on the shared context", false, true);
+    if (chat.empty()) {
+        t.skip("the model has no usable tokens");
+        return;
+    }
+    {
+        llama_batch batch = llama_batch_init((int) chat.size(), 0, 1);
+        for (size_t i = 0; i < chat.size(); ++i) {
+            common_batch_add(batch, chat[i], (llama_pos) i, { 0 }, i + 1 == chat.size());
+        }
+        const int rc = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        if (rc != 0) {
+            t.assert_true(lane + ": the chat prefix decodes", false);
+            return;
+        }
+    }
+    llama_synchronize(ctx);
+    const auto chat_dump = [&]() {
+        std::vector<uint8_t> buf(llama_state_seq_get_size(ctx, 0));
+        const size_t         n = llama_state_seq_get_data(ctx, buf.data(), buf.size(), 0);
+        buf.resize(n);
+        return buf;
+    };
+    const std::vector<uint8_t> chat_before = chat_dump();
+    t.assert_true(lane + ": the chat sequence has state", !chat_before.empty());
+
+    llama_decision::engine                         eng(ctx, 2, 16);
+    const std::vector<std::string>                 contexts = { "alpha", "beta", "alpha" };
+    const std::vector<llama_decision::field_input> fields   = {
+        { "  \"a\": ", { "1", "2" } },
+        { "  \"b\": ", { "x", "y" } },
+    };
+    llama_decision::options o;
+    o.mode        = "tree";
+    o.fork        = "restore";
+    o.allow_cache = false;
+
+    const auto   plan      = eng.compile_fields(fields, o);
+    const size_t per_group = std::clamp<size_t>((size_t) eng.n_pool / (1 + plan.branches), 1, contexts.size());
+    t.assert_true(lane + ": the batch groups more than one trunk per wave", per_group >= 2);
+
+    const auto batch = eng.decide_batch("system", contexts, fields, o);
+    t.assert_equal(lane + ": every context is returned", contexts.size(), batch.items.size());
+
+    // the same context twice in one wave must not alias: identical inputs must score identically
+    bool twins = batch.items[0].fields.size() == batch.items[2].fields.size();
+    for (size_t f = 0; twins && f < fields.size(); ++f) {
+        const auto & p0 = batch.items[0].fields[f].probs;
+        const auto & p2 = batch.items[2].fields[f].probs;
+        twins           = batch.items[0].fields[f].winner == batch.items[2].fields[f].winner && p0.size() == p2.size();
+        for (size_t k = 0; twins && k < p0.size(); ++k) {
+            twins = std::fabs(p0[k] - p2[k]) < 1e-4;
+        }
+    }
+    t.assert_true(lane + ": the repeated context scores identically in one wave", twins);
+
+    // each context keeps its own winner, the task-value outcome, against a single-context run
+    for (size_t c = 0; c < contexts.size(); ++c) {
+        const auto single  = eng.decide_batch("system", { contexts[c] }, fields, o);
+        bool       winners = batch.items[c].fields.size() == single.items[0].fields.size();
+        for (size_t f = 0; winners && f < fields.size(); ++f) {
+            winners = batch.items[c].fields[f].winner == single.items[0].fields[f].winner;
+        }
+        t.assert_true(lane + ": context " + std::to_string(c) + " keeps its winner", winners);
+    }
+
+    const std::vector<uint8_t> chat_after = chat_dump();
+    t.assert_true(lane + ": the chat sequence is untouched", chat_before == chat_after);
+}
+
+static void test_multi_trunk_restore(testing & t) {
+    t.test("a multi-trunk restore keeps contexts independent and chat untouched on the CPU backend", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path, 512, false, false, 128, 18)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            multi_trunk_restore_round_trip(t, te.ctx, te.model, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU multi-trunk restore: ") + e.what(), false);
+        }
+    });
+
+    t.test("a multi-trunk restore keeps contexts independent and chat untouched on a recurrent GPU backend",
+           [](testing & t) {
+               const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+               if (!gpu_model_ready(t, path)) {
+                   return;
+               }
+               test_engine te;
+               if (!te.load(path, 18)) {
+                   t.assert_true("the GPU decision scaffold loads the model", false);
+                   return;
+               }
+               if (!llama_model_is_recurrent(te.model) && !llama_model_is_hybrid(te.model)) {
+                   t.skip("the model is neither recurrent nor hybrid; the restore-fork multi-trunk path needs one");
+                   return;
+               }
+               if (weak_quant_gpu_oracle(path)) {
+                   t.skip("weak-quant GPU numerics move a winner here; the aliasing check is skipped, not xfail");
+                   return;
+               }
+               try {
+                   multi_trunk_restore_round_trip(t, te.ctx, te.model, "gpu");
+               } catch (const std::exception & e) {
+                   t.assert_true(std::string("the GPU multi-trunk restore: ") + e.what(), false);
+               }
+           });
+}
 
 // A failed decision must leave the pool sequences empty: a mid-wave decode failure forks pool
 // sequences first, and residue in the shared cache would starve the next chat decode.
@@ -3561,6 +3903,58 @@ static void test_compile_fields_plan(testing & t) {
     });
 }
 
+// The plan overload and the inputs wrapper must score the same plan the same way, so the wrapper
+// can stay a thin shim while a caller that needs the plan up front compiles it once.
+static void test_decide_batch_plan_overload(testing & t) {
+    t.test("the plan overload and the inputs wrapper score identically", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path, 512, false, false)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        const std::string                        suffix     = "\nAnswer:\n";
+        const std::vector<std::string>           candidates = { "AAAAA", "BBBBB", "CCCCC" };
+        std::vector<llama_decision::field_input> fields     = {
+            { suffix, candidates, 1.0f }
+        };
+
+        llama_decision::engine  eng(te.ctx, 2, 8);
+        llama_decision::options opt;
+        opt.mode        = "tree";
+        opt.allow_cache = false;  // isolate the arithmetic from prefix-cache reuse
+
+        const llama_decision::compiled_fields plan    = eng.compile_fields(fields, opt);
+        const llama_decision::batch_result    wrapped = eng.decide_batch("", { "state" }, fields, opt);
+        const llama_decision::batch_result    planned = eng.decide_batch(plan, "", { "state" }, opt);
+
+        t.assert_equal("the overload keeps the item count", wrapped.items.size(), planned.items.size());
+        t.assert_equal("the overload keeps the batch rows", wrapped.rows, planned.rows);
+        t.assert_equal("the overload keeps the suffix accounting", wrapped.suffix_tokens, planned.suffix_tokens);
+        t.assert_equal("the overload keeps head_active", wrapped.head_active, planned.head_active);
+
+        bool same = wrapped.items.size() == planned.items.size();
+        for (size_t i = 0; same && i < wrapped.items.size(); ++i) {
+            const auto & a = wrapped.items[i];
+            const auto & b = planned.items[i];
+            same           = a.fields.size() == b.fields.size();
+            for (size_t f = 0; same && f < a.fields.size(); ++f) {
+                same = a.fields[f].winner == b.fields[f].winner && a.fields[f].tree == b.fields[f].tree &&
+                       a.fields[f].scored_nodes == b.fields[f].scored_nodes &&
+                       a.fields[f].probs.size() == b.fields[f].probs.size();
+                for (size_t k = 0; same && k < a.fields[f].probs.size(); ++k) {
+                    same = std::fabs(a.fields[f].probs[k] - b.fields[f].probs[k]) <= 1e-6f;
+                }
+            }
+        }
+        t.assert_true("the overload returns identical scored fields", same);
+    });
+}
+
 // select_scoring_head is the one head-usability rule: classifier context plus full candidate
 // coverage, otherwise false with a reason. The server and the readout both go through it.
 static void test_select_scoring_head(testing & t) {
@@ -4340,11 +4734,19 @@ static void test_gemma4_softcap(testing & t) {
 }
 
 static void test_docs_errors(testing & t) {
-    t.test("every decision error code is documented", [](testing & t) {
-        const std::string readme = read_file(std::string(DECISION_TEST_SOURCE_DIR) + "/README.md");
-        t.assert_true("the readme is present", !readme.empty());
-        for (const char * code : { "400", "401", "413", "422", "429", "499", "500", "501", "529" }) {
-            t.assert_true(std::string("docs list HTTP ") + code, readme.find(code) != std::string::npos);
+    t.test("the normative doc lists the full error set and the owned limits", [](testing & t) {
+        const std::string root = std::string(DECISION_TEST_SOURCE_DIR) + "/../..";
+        const std::string doc  = read_file(root + "/docs/decision/API.md");
+        t.assert_true("the normative decision doc is present", !doc.empty());
+        for (const char * code :
+             { "400", "401", "403", "404", "413", "415", "422", "429", "499", "500", "501", "503", "529" }) {
+            t.assert_true(std::string("the normative doc lists HTTP ") + code, doc.find(code) != std::string::npos);
+        }
+        for (const char * name : { "DECISION_MIN_QUESTIONS", "DECISION_MAX_QUESTIONS", "DECISION_MAX_CONTEXTS",
+                                   "DECISION_MIN_OPTIONS", "DECISION_MAX_CHOICE_OPTIONS", "DECISION_MAX_SCORE_LEVELS",
+                                   "DECISION_MAX_PERMUTATIONS", "LABEL_POOL_CAP" }) {
+            t.assert_true(std::string("the normative doc names the owner constant ") + name,
+                          doc.find(name) != std::string::npos);
         }
     });
 }
@@ -4393,6 +4795,25 @@ static void test_policy_confidence(testing & t) {
             default_ok = false;
         }
         t.assert_true("a default temperature needs no provenance", default_ok);
+    });
+
+    t.test("the classifier answer-head API lives in the staging header, not the installed header", [](testing & t) {
+        // DECISION_TEST_SOURCE_DIR points at tools/parallel-decision, two levels below the root.
+        const std::string root      = std::string(DECISION_TEST_SOURCE_DIR) + "/../..";
+        const std::string installed = read_file(root + "/include/llama.h");
+        const std::string staging   = read_file(root + "/src/llama-ext.h");
+
+        t.assert_true("the installed header drops the supported predicate",
+                      installed.find("llama_model_classifier_supported") == std::string::npos);
+        t.assert_true("the installed header drops the row reader",
+                      installed.find("llama_model_classifier_rows") == std::string::npos);
+        t.assert_true("the staging header owns the supported predicate",
+                      staging.find("llama_model_classifier_supported") != std::string::npos);
+        t.assert_true("the staging header owns the row reader",
+                      staging.find("llama_model_classifier_rows") != std::string::npos);
+        // the symbols were exported with C linkage from the installed header, so the move must keep
+        // that linkage or the dynamic symbol name changes
+        t.assert_true("the staging declarations keep C linkage", staging.find("extern \"C\"") != std::string::npos);
     });
 }
 
@@ -4625,17 +5046,15 @@ static void test_selected_equivalence_lfm(testing & t) {
             t.assert_true("selected and full pick the same winner", winners_match);
 
             // The full path runs a quantized weight matmul that also quantizes the activations,
-            // while the head dequantizes the rows and dots in FP32. The gap is quantization noise:
-            // small on a fine quant, larger on a coarse one, so the bound is a tolerance and the
-            // winner agreement above is the real gate. On the weak-quant oracle the noise exceeds
-            // the bound; that is a task-value failure for the producer's numerics, so it is skipped
-            // there with a reason, never xfail.
-            determinism_check(t, weak_quant_gpu_oracle(path),
-                              "selected and full agree within 5e-2 total variation (weak-quant GPU quantization noise)",
-                              [&](testing & t) {
-                const double tv = total_variation(pf, ph);
+            // while the head dequantizes the rows and dots in FP32. Winner agreement above is the
+            // task-value gate. Total variation is producer confidence: it is always reported, and
+            // asserted only where the producer is already calibrated. On the weak-quant oracle the
+            // noise exceeds the bound, so the number is recorded, never asserted, and never xfail.
+            const double tv = total_variation(pf, ph);
+            printf("head vs full total variation: %.6f (weak_quant=%d)\n", tv, weak_quant_gpu_oracle(path) ? 1 : 0);
+            if (!weak_quant_gpu_oracle(path)) {
                 t.assert_true("selected and full agree within 5e-2 total variation (TV=" + std::to_string(tv) + ")", tv <= 5e-2);
-            });
+            }
         } catch (const std::exception & e) {
             t.assert_true(std::string("selected equivalence: ") + e.what(), false);
         }
@@ -5315,6 +5734,7 @@ static void test_letter_audit_real(testing & t) {
             t.assert_equal("prompt version is set", std::string(llama_decision::LETTER_PROMPT_VERSION), audit.prompt_version);
             t.assert_true("probability status is set", !audit.probability_status.empty());
             t.assert_equal("audit size matches questions", req.questions.size(), audit.allowed_token_mass.size());
+            t.assert_equal("the readout reports the realized label pool", pool.size(), metrics.label_pool_size);
 
             const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(te.model));
             bool ok = true;
@@ -5335,6 +5755,70 @@ static void test_letter_audit_real(testing & t) {
         } catch (const std::exception & e) {
             t.assert_true(std::string("audit run: ") + e.what(), false);
         }
+    });
+}
+
+// The audit sink is observability only: collecting it must not move a single score, so a caller
+// can leave it off without changing the answer.
+static void test_audit_does_not_move_probs(testing & t) {
+    t.test("a null audit sink yields the same readout probabilities", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path, 512, false, false)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        auto                   vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
+        const auto             pool  = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
+        llama_decision::engine eng(te.ctx, 2, 8);
+        const auto             req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
+
+        auto run = [&](llama_decision::answer_audit * audit, double * scoring_ms) {
+            llama_decision::options opt;
+            opt.cache_tag   = "audit-property";
+            opt.allow_cache = false;
+            llama_decision::letter_metrics    metrics;
+            llama_decision::answer_head_cache head_cache;
+            auto probs = llama_decision::letter_readout(eng, head_cache, *vocab, nullptr, false, req, pool, opt,
+                                                        &metrics, audit);
+            if (scoring_ms != nullptr) {
+                *scoring_ms = metrics.scoring_ms;
+            }
+            return probs;
+        };
+
+        const auto                   without = run(nullptr, nullptr);
+        llama_decision::answer_audit audit;
+        const auto                   with = run(&audit, nullptr);
+
+        t.assert_equal("the readout returns the same question count", without.size(), with.size());
+        bool same = without.size() == with.size();
+        for (size_t q = 0; same && q < without.size(); ++q) {
+            same = without[q].size() == with[q].size();
+            for (size_t i = 0; same && i < without[q].size(); ++i) {
+                same = without[q][i] == with[q][i];  // bit-identical: the sink must not perturb the math
+            }
+        }
+        t.assert_true("the audit sink does not move any probability", same);
+        t.assert_true("the audit sink was filled", !audit.prompt_sha256.empty());
+
+        // record the collection cost: min of a few runs so warm-up noise does not dominate the delta
+        auto best_of = [&](llama_decision::answer_audit * sink) {
+            double best = std::numeric_limits<double>::max();
+            for (int i = 0; i < 3; ++i) {
+                double ms = 0.0;
+                (void) run(sink, &ms);
+                best = std::min(best, ms);
+            }
+            return best;
+        };
+        const double off_ms = best_of(nullptr);
+        const double on_ms  = best_of(&audit);
+        printf("readout audit scoring_ms: off=%.3f on=%.3f delta=%.3f\n", off_ms, on_ms, on_ms - off_ms);
     });
 }
 
@@ -6009,6 +6493,42 @@ static common_json calibration_model_measurement(const char * path) {
     // temperature changes the distribution shape but keeps the winner; NLL(winner) is recorded
     auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
     const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
+    out["label_pool_size"] = (long long) pool.size();
+
+    // head-vs-full: the selected head and the full logits are two producers of the same decision.
+    // Winner agreement is task value; total variation is producer confidence and is only recorded.
+    out["head_vs_full_available"]    = false;
+    out["head_vs_full_winner_agree"] = false;
+    out["head_vs_full_tv"]           = 0.0;
+    {
+        test_engine te_head;
+        te_head.model = te.model;
+        if (te_head.make_ctx(true)) {
+            auto hreq = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
+            llama_decision::engine e_head(te_head.ctx, 2, 8);
+            hreq.head = "selected";
+            llama_decision::options hopt;
+            hopt.cache_tag = "cal-head";
+            llama_decision::letter_metrics hm;
+            const auto ph = llama_decision::letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, hreq,
+                                                           pool, hopt, &hm, nullptr);
+            hreq.head     = "full";
+            llama_decision::options fopt;
+            fopt.cache_tag = "cal-full";
+            llama_decision::letter_metrics fm;
+            const auto pf = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, hreq, pool,
+                                                           fopt, &fm, nullptr);
+            out["head_vs_full_available"] = hm.head_active;
+            if (hm.head_active && pf.size() == ph.size()) {
+                bool agree = true;
+                for (size_t qi = 0; qi < pf.size(); ++qi) {
+                    agree = agree && pf[qi].size() == ph[qi].size() && argmax(pf[qi]) == argmax(ph[qi]);
+                }
+                out["head_vs_full_winner_agree"] = agree;
+                out["head_vs_full_tv"]           = total_variation(pf, ph);
+            }
+        }
+    }
     auto readout = [&](double temp) {
         common_json body = common_json::parse(decision_valid_body());
         body["temperature"] = temp;
@@ -6345,6 +6865,24 @@ static common_json calibration_rows() {
         rows["head_context_selector"] = r;
     }
     {
+        auto r = calibration_row(
+            "head vs full producer equivalence", "task-value", { "whether the selected-head fast path may run" },
+            { "admission", "caching", "routing", "persistence" },
+            "winner equality between the selected head and full logits is the task-value gate; total variation is "
+            "producer confidence, recorded per model in model_measurements, never a gate; a family that flips a winner "
+            "is refused statically in the classifier predicate, never by a runtime confidence threshold");
+        common_json g        = control_group({
+            control_case("selected head available on the model", "used"),
+            control_case("selected head unavailable", "falls back to full logits"),
+            control_case("winner disagrees on a family", "that family is refused statically"),
+        });
+        g["winner_axis"]     = "task-value";
+        g["tv_axis"]         = "producer confidence (recorded, never asserted as a gate)";
+        g["tv_bound"]        = 0.05;
+        r["control_group"]   = g;
+        rows["head_vs_full"] = r;
+    }
+    {
         auto r = calibration_row("adapter scope (base model only)", "task-value",
                                  { "which model identity answers" },
                                  { "no-adapter head selection", "admission", "caching", "routing", "persistence" },
@@ -6440,6 +6978,23 @@ static common_json calibration_rows() {
         g["max_options"] = 64;
         r["control_group"] = g;
         rows["choice_option_limits"] = r;
+    }
+    {
+        auto r = calibration_row("realized answer-label pool size", "task-value",
+                                 { "whether a question's option set can be represented" },
+                                 { "answers", "admission", "caching" },
+                                 "the protocol cap is 64 (LABEL_POOL_CAP, equal to DECISION_MAX_CHOICE_OPTIONS); the "
+                                 "realized pool is model-dependent and may be smaller; a request whose widest question "
+                                 "needs more labels than the realized pool is a 422");
+        common_json g               = control_group({
+            control_case("a question at the realized pool size", "accepted"),
+            control_case("a question one above the realized pool", "422"),
+            control_case("a double-letter vocabulary at the cap", "realized pool reaches 64"),
+        });
+        g["protocol_cap"]           = 64;
+        g["realized_source"]        = "diagnostics.label_pool_size; recorded per model in model_measurements";
+        r["control_group"]          = g;
+        rows["label_pool_capacity"] = r;
     }
     {
         auto r = calibration_row("score level count limits", "task-value",
@@ -6990,6 +7545,235 @@ static int write_decision_golden(const char * model_path) {
     return 0;
 }
 
+// Reproducibility recording of the committed decision corpus. The deterministic core (per-question
+// probabilities, winners, head mode, label-pool size) is the frozen contract later refactors must
+// not move; the timing block is recorded for context and excluded from the byte diff because it
+// moves every run.
+static std::string readout_baseline_path(const std::string & backend) {
+    return std::string(DECISION_TEST_BASELINE_DIR) + "/readout_" + backend + "_baseline.json";
+}
+
+// Runs the committed corpus once and returns the readout core plus its timing block. `gpu` selects
+// the shared GPU model; otherwise the model loads with no offload so the CPU lane can record and
+// check it.
+static common_json readout_capture(const std::string & path, bool gpu) {
+    const std::string tail = test_letter_tail();
+
+    common_json out = common_json::object();
+    out["backend"]  = gpu ? "gpu" : "cpu";
+    out["model"]    = model_identity(path);
+
+    auto run = [&](llama_model * model, llama_context * ctx) {
+        auto                    vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(model));
+        const auto              pool  = llama_decision::build_label_pool(*vocab, tail, 64);
+        llama_decision::engine  eng(ctx, 2, 8);
+        const auto              req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
+        llama_decision::options opt;
+        opt.cache_tag = "readout-baseline";
+        llama_decision::letter_metrics    metrics;
+        llama_decision::answer_head_cache head_cache;
+        const auto                        probs =
+            llama_decision::letter_readout(eng, head_cache, *vocab, nullptr, false, req, pool, opt, &metrics);
+
+        common_json core        = oracle_readout(metrics, probs);
+        core["head_mode"]       = metrics.head_active ? "selected" : "full";
+        core["label_pool_size"] = (long long) pool.size();
+        out["readout"]          = core;
+
+        common_json timing   = common_json::object();
+        timing["prefill_ms"] = metrics.prefill_ms;
+        timing["scoring_ms"] = metrics.scoring_ms;
+        out["timings"]       = timing;
+    };
+
+    if (gpu) {
+        test_engine te;
+        if (!te.load(path.c_str())) {
+            throw std::runtime_error("the GPU test model failed to load: " + path);
+        }
+        run(te.model, te.ctx);
+    } else {
+        cpu_test_engine te;
+        if (!te.load(path, 4096, false, false, 512)) {
+            throw std::runtime_error("the CPU test model failed to load: " + path);
+        }
+        run(te.model, te.ctx);
+    }
+    return out;
+}
+
+// The first serialized line that differs, for a compact mismatch report instead of dumping both
+// trees.
+static std::string first_line_difference(const std::string & a, const std::string & b) {
+    std::istringstream ra(a);
+    std::istringstream rb(b);
+    std::string        la;
+    std::string        lb;
+    int                line = 0;
+    while (true) {
+        const bool oka = (bool) std::getline(ra, la);
+        const bool okb = (bool) std::getline(rb, lb);
+        if (!oka && !okb) {
+            break;
+        }
+        ++line;
+        if (la != lb) {
+            return "line " + std::to_string(line) + "\n  baseline: " + la + "\n  current : " + lb;
+        }
+    }
+    return "the serialized lengths differ";
+}
+
+static bool readout_core_equal(const common_json & expected, const common_json & actual, std::string * difference) {
+    common_json e = expected;
+    common_json a = actual;
+    e.erase("timings");
+    a.erase("timings");
+    e.erase("note");
+    a.erase("note");
+    const std::string es = e.dump(1);
+    const std::string as = a.dump(1);
+    if (es == as) {
+        return true;
+    }
+    if (difference != nullptr) {
+        *difference = first_line_difference(es, as);
+    }
+    return false;
+}
+
+// The model a baseline section was recorded on, or empty when the file or section is absent.
+static std::string readout_baseline_model(const std::string & backend) {
+    const std::string path = readout_baseline_path(backend);
+    if (!file_exists(path)) {
+        return std::string();
+    }
+    try {
+        return common_json::parse(read_file(path)).value("model", std::string());
+    } catch (const std::exception &) {
+        return std::string();
+    }
+}
+
+static int write_readout_baseline(const std::string & backend) {
+    const bool  gpu = backend == "gpu";
+    std::string path;
+    if (gpu) {
+        const char * env = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (env == nullptr || env[0] == '\0') {
+            fprintf(stderr, "set LLAMA_DECISION_TEST_MODEL to record the GPU readout baseline\n");
+            return 2;
+        }
+        path = env;
+    } else {
+        path = decision_cpu_model_path();
+        if (path.empty()) {
+            fprintf(stderr, "the CPU readout baseline needs the generated model\n");
+            return 2;
+        }
+    }
+    try {
+        common_json rec = readout_capture(path, gpu);
+        rec["note"] =
+            "Frozen readout of the committed decision corpus. The deterministic core "
+            "(probabilities, winners, head mode, label-pool size) is a contract; the "
+            "timing block is recorded for context and excluded from the byte diff.";
+        write_file(readout_baseline_path(backend), rec.dump(1) + "\n");
+    } catch (const std::exception & e) {
+        fprintf(stderr, "failed to record the %s readout baseline: %s\n", backend.c_str(), e.what());
+        return 2;
+    }
+    return 0;
+}
+
+// Diff command: recompute the readout and fail on any deterministic byte change. Returns 0 on a
+// match, 1 on drift, 2 when the baseline or its model is unavailable.
+static int check_readout_baseline(const std::string & backend) {
+    const bool        gpu  = backend == "gpu";
+    const std::string file = readout_baseline_path(backend);
+    if (!file_exists(file)) {
+        fprintf(stderr, "no %s readout baseline at %s\n", backend.c_str(), file.c_str());
+        return 2;
+    }
+    std::string path;
+    if (gpu) {
+        const char * env = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (env == nullptr || env[0] == '\0') {
+            fprintf(stderr, "set LLAMA_DECISION_TEST_MODEL to check the GPU readout baseline\n");
+            return 2;
+        }
+        path = env;
+    } else {
+        path = decision_cpu_model_path();
+        if (path.empty()) {
+            fprintf(stderr, "the CPU readout baseline needs the generated model\n");
+            return 2;
+        }
+    }
+
+    const common_json expected = common_json::parse(read_file(file));
+    if (expected.value("model", std::string()) != model_identity(path)) {
+        fprintf(stderr, "the loaded model (%s) is not the recorded %s baseline model (%s)\n",
+                model_identity(path).c_str(), backend.c_str(), expected.value("model", std::string()).c_str());
+        return 2;
+    }
+
+    std::string difference;
+    try {
+        const common_json actual = readout_capture(path, gpu);
+        if (readout_core_equal(expected, actual, &difference)) {
+            printf("the %s readout matches the frozen baseline\n", backend.c_str());
+            return 0;
+        }
+    } catch (const std::exception & e) {
+        fprintf(stderr, "failed to recompute the %s readout: %s\n", backend.c_str(), e.what());
+        return 2;
+    }
+    fprintf(stderr, "the %s readout drifted from the frozen baseline:\n%s\n", backend.c_str(), difference.c_str());
+    return 1;
+}
+
+// The suite gate: check whichever frozen baseline matches the model available in this lane.
+static void test_readout_baseline(testing & t) {
+    t.test("the readout matches the frozen reproducibility baseline", [](testing & t) {
+        const char * env = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (env != nullptr && env[0] != '\0' && decision_gpu_available() &&
+            readout_baseline_model("gpu") == model_identity(env)) {
+            try {
+                const common_json expected = common_json::parse(read_file(readout_baseline_path("gpu")));
+                const common_json actual   = readout_capture(env, true);
+                std::string       difference;
+                if (!readout_core_equal(expected, actual, &difference)) {
+                    t.assert_true("the gpu readout core matches the frozen baseline: " + difference, false);
+                    return;
+                }
+                t.assert_true("the gpu readout core matches the frozen baseline", true);
+            } catch (const std::exception & e) {
+                t.assert_true(std::string("the gpu readout baseline runs: ") + e.what(), false);
+            }
+            return;
+        }
+
+        const std::string path = decision_cpu_model_path();
+        if (path.empty() || readout_baseline_model("cpu") != model_identity(path)) {
+            t.skip("no frozen readout baseline matches the available model");
+            return;
+        }
+        try {
+            const common_json expected = common_json::parse(read_file(readout_baseline_path("cpu")));
+            const common_json actual   = readout_capture(path, false);
+            std::string       difference;
+            if (!readout_core_equal(expected, actual, &difference)) {
+                t.assert_true("the cpu readout core matches the frozen baseline: " + difference, false);
+                return;
+            }
+            t.assert_true("the cpu readout core matches the frozen baseline", true);
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the cpu readout baseline runs: ") + e.what(), false);
+        }
+    });
+}
+
 int main(int argc, char ** argv) {
     if (argc > 1 && std::string(argv[1]) == "--write-golden") {
         return write_goldens();
@@ -7008,6 +7792,22 @@ int main(int argc, char ** argv) {
     }
     if (argc > 1 && std::string(argv[1]) == "--write-calibration-rows") {
         return write_calibration_rows();
+    }
+    if (argc > 2 && std::string(argv[1]) == "--record-readout") {
+        const std::string backend = argv[2];
+        if (backend != "cpu" && backend != "gpu") {
+            fprintf(stderr, "--record-readout needs a backend: cpu or gpu\n");
+            return 2;
+        }
+        return write_readout_baseline(backend);
+    }
+    if (argc > 2 && std::string(argv[1]) == "--check-readout") {
+        const std::string backend = argv[2];
+        if (backend != "cpu" && backend != "gpu") {
+            fprintf(stderr, "--check-readout needs a backend: cpu or gpu\n");
+            return 2;
+        }
+        return check_readout_baseline(backend);
     }
 
     testing t;
@@ -7038,6 +7838,7 @@ int main(int argc, char ** argv) {
         test_prefix_tag(t);
         test_question_temperature(t);
         test_temperature_effect(t);
+        test_confidence_certainty_axes(t);
         test_temperature_profile(t);
         test_confidence_never_gates(t);
         test_letter_suffix(t);
@@ -7055,9 +7856,11 @@ int main(int argc, char ** argv) {
         test_device_state_round_trip(t);
         test_device_async_staging(t);
         test_recurrent_multi_range_device_save(t);
+        test_device_layout_mutation_round_trip(t);
         test_prefix_cache_cost(t);
         test_classifier_head_unbiased(t);
         test_bounded_decision_context(t);
+        test_multi_trunk_restore(t);
         test_pool_seq_lifecycle(t);
         test_context_params_append(t);
         test_classifier_only_hidden_state(t);
@@ -7067,7 +7870,9 @@ int main(int argc, char ** argv) {
         test_classifier_rows_width_contract(t);
         test_classifier_support_predicate(t);
         test_decision_cpu_oracle(t);
+        test_readout_baseline(t);
         test_compile_fields_plan(t);
+        test_decide_batch_plan_overload(t);
         test_select_scoring_head(t);
         test_classifier_ctx_requires_head(t);
         test_prefix_cache_coherence(t);
@@ -7104,6 +7909,7 @@ int main(int argc, char ** argv) {
         test_confidence_never_gates_envelope(t);
         test_verify_letter_request(t);
         test_letter_audit_real(t);
+        test_audit_does_not_move_probs(t);
         test_sequence_partition(t);
         test_calibration_hoist(t);
         test_calibration_dedup(t);

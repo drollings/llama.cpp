@@ -177,34 +177,13 @@ alias for the same handler; use `/v1/decision`. `model` is optional and echoed b
 
 ### Limits and errors
 
-| limit | value |
-|---|---|
-| questions per request | `DECISION_MIN_QUESTIONS`-`DECISION_MAX_QUESTIONS` (1-256) |
-| `instructions` per question | required and non-null |
-| choice options per question | `DECISION_MIN_OPTIONS`-`DECISION_MAX_CHOICE_OPTIONS` (2-64) |
-| score levels per question | `DECISION_MIN_OPTIONS`-`DECISION_MAX_SCORE_LEVELS` (2-10) |
-| permutations (order de-bias passes) | 1 by default, capped at `DECISION_MAX_PERMUTATIONS` (8) |
-| answer-label pool | `LABEL_POOL_CAP` (64) |
-| `contexts` per legacy request | `DECISION_MAX_CONTEXTS` (256) |
-| request body | `decision_max_body` default 2 MiB (override `LLAMA_DECISION_MAX_BODY`) |
-| concurrent decision requests | `decision_max_queue` default 4 (override `LLAMA_DECISION_MAX_QUEUE`), then 429/529 |
-
-Error responses use `{"error": {"code", "message", "type"}}` and map to HTTP status:
-
-| status | type | when |
-|---|---|---|
-| 400 | `invalid_request_error` | malformed JSON, bad `head` value, invalid value type |
-| 401 | `authentication_error` | missing or wrong API key |
-| 413 | `payload_too_large` | body over the configured cap |
-| 415 | `unsupported_media_type` | `Content-Type` is not `application/json` |
-| 422 | `invalid_request_error` | valid JSON, invalid semantics (empty state, unknown field inside a question, missing/non-null `instructions`, too many options, label/tokenizer mismatch, request past the decision context budget) |
-| 429 | `rate_limit_error` | decision queue full; `Retry-After: 1` |
-| 499 | `client_closed_request` | the client disconnected before the answer was ready |
-| 500 | `server_error` | unexpected internal failure |
-| 501 | `not_supported_error` | the running model cannot serve decisions (no usable labels, contract mismatch) |
-| 529 | `overloaded_error` | server overloaded; `Retry-After: 1` |
-
-The decision path never truncates: an over-limit request is rejected, never silently clipped.
+The full contract lives in `docs/decision/API.md` (Sections 4 and 5); the
+validator and that document read the same `DECISION_*`/`LABEL_POOL_CAP`
+constants. In short: 422 for semantic errors (empty state, unknown field
+inside a question, missing/non-null `instructions`, over-limit options),
+413 for the body cap, 429/529 with `Retry-After` for the queue cap, 499 on
+client disconnect, and 501 when the model cannot serve decisions. The path
+never truncates: an over-limit request is rejected, never silently clipped.
 
 ### Prefix cache
 

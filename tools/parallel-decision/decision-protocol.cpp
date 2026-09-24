@@ -239,7 +239,9 @@ decision_question parse_question(const std::string & id, const common_json & spe
     return q;
 }
 
-double entropy_certainty(const std::vector<float> & p) {
+// Normalized inverse entropy, 1 - H/log K. The producer's self-doubt axis: it measures how
+// concentrated the distribution is, never whether the winner is correct.
+double inverse_entropy_confidence(const std::vector<float> & p) {
     const double k = (double) p.size();
     if (k <= 1.0) {
         return 1.0;
@@ -252,6 +254,12 @@ double entropy_certainty(const std::vector<float> & p) {
     }
     const double v = 1.0 - h / std::log(k);
     return std::min(1.0, std::max(0.0, v));
+}
+
+// The winner's share, max(p). A separate axis from the entropy confidence: two distributions can
+// share a winner share but differ in shape.
+double winner_share(const std::vector<float> & p) {
+    return p.empty() ? 0.0 : (double) *std::max_element(p.begin(), p.end());
 }
 
 } // namespace
@@ -503,9 +511,9 @@ common_json assemble_decision_response(const decision_request & req,
                     best = i;
                 }
             }
-            a["confidence"] = entropy_certainty(p); // 1 - H/log K (Jev reference)
+            a["confidence"] = inverse_entropy_confidence(p);  // 1 - H/log K (Jev reference)
             if (req.diagnostics) {
-                a["certainty"] = (double) p[best]; // winner's share, max(p); additive
+                a["certainty"] = winner_share(p);             // max(p); additive
             }
 
             if (q.type == "choice") {

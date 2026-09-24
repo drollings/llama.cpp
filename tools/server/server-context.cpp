@@ -1,37 +1,38 @@
 #include "server-context.h"
+
+#include "../../src/llama-ext.h"  // staging API: classifier answer-head predicate and row reader
+#include "build-info.h"
+#include "common.h"
+#include "decision-engine.h"
+#include "decision-protocol.h"
+#include "fit.h"
+#include "labels.h"
+#include "letter_readout.h"
+#include "llama.h"
+#include "log.h"
+#include "mtmd-helper.h"
+#include "mtmd.h"
+#include "sampling.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-decision-state.h"
 #include "server-http.h"
-#include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
-
-#include "build-info.h"
-#include "common.h"
-#include "fit.h"
-#include "llama.h"
-#include "log.h"
-#include "sampling.h"
+#include "server-task.h"
 #include "speculative.h"
-#include "mtmd.h"
-#include "mtmd-helper.h"
-#include "decision-engine.h"
-#include "decision-protocol.h"
-#include "labels.h"
-#include "letter_readout.h"
-#include "server-decision-state.h"
 
 #include <algorithm>
-#include <cstddef>
 #include <cinttypes>
+#include <cstddef>
 #include <exception>
-#include <memory>
 #include <filesystem>
+#include <fstream>
+#include <memory>
 #include <random>
 #include <thread>
 #include <utility>
-#include <fstream>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -2444,6 +2445,9 @@ private:
         // verified letter labels, sharing one framed state prefix across all questions.
         if (llama_decision::is_decision_request(body)) {
             llama_decision::decision_request req = llama_decision::parse_decision_request(body);
+            // the audit trail and the additive diagnostics object are opt-in; the default envelope
+            // must stay the strict Jev shape and must not pay to collect them
+            const bool                              want_audit = req.diagnostics;
             // An explicit request for an unavailable fast path is the only head case that errors;
             // the default path always falls back to full logits.
             const llama_decision::head_capability & head_cap =
@@ -2494,6 +2498,8 @@ private:
                     const std::string tail = llama_decision::letter_answer_tail(parts.second);
                     decision.decision_labels = llama_decision::build_label_pool(*decision.decision_label_vocab, tail);
                     llama_decision::verify_label_pool(*decision.decision_label_vocab, decision.decision_labels, tail);
+                    SRV_INF("decision label pool: %zu labels (cap %zu)\n", decision.decision_labels.size(),
+                            llama_decision::LABEL_POOL_CAP);
                     const std::string template_hash = llama_decision::make_prefix_tag(
                         parts.first, parts.second, llama_decision::LETTER_PROMPT_VERSION);
                     decision.decision_contract = llama_decision::decision_contract_hash(
@@ -2561,9 +2567,9 @@ private:
                 // the readout decodes on whichever context the plan picks; both are scoped to the base model
                 decision_scope_base_adapters();
                 probs = llama_decision::letter_readout(sources, decision.decision_head_cache,
-                                                       *decision.decision_label_vocab,
-                                                       chat_params.tmpls.get(), chat_params.use_jinja,
-                                                       req, decision.decision_labels, jopt, &metrics, &audit);
+                                                       *decision.decision_label_vocab, chat_params.tmpls.get(),
+                                                       chat_params.use_jinja, req, decision.decision_labels, jopt,
+                                                       &metrics, want_audit ? &audit : nullptr);
             });
 
             json usage = json::object();
@@ -2575,7 +2581,7 @@ private:
 
             const std::string echo = req.model.empty() ? model_name : req.model;
             json decision_diagnostics = json::object();
-            {
+            if (want_audit) {
                 // the fast path is optional; report how the answer was actually read out
                 const bool head_fallback = req.head != "full" && !metrics.head_active;
                 decision_diagnostics["head"] = json::object();
@@ -2595,6 +2601,7 @@ private:
                 decision_diagnostics["diagnostics"]["scoring_ms"]     = metrics.scoring_ms;
                 decision_diagnostics["diagnostics"]["suffix_tokens"]        = (long long) metrics.suffix_tokens;
                 decision_diagnostics["diagnostics"]["common_suffix_tokens"] = (long long) metrics.common_suffix_tokens;
+                decision_diagnostics["diagnostics"]["label_pool_size"]      = (long long) metrics.label_pool_size;
                 decision_diagnostics["diagnostics"]["adapters_configured"] = adapters_on;
                 decision_diagnostics["diagnostics"]["adapter_scope"]       = "base";
                 const llama_decision::temperature_provenance prov =
@@ -2605,7 +2612,8 @@ private:
                 decision_diagnostics["diagnostics"]["template_hash"]  = prov.template_hash;
                 decision_diagnostics["diagnostics"]["backend_flags"]  = prov.backend_flags;
             }
-            json out = llama_decision::assemble_decision_response(req, probs, echo, usage, &audit, &decision_diagnostics);
+            json out = llama_decision::assemble_decision_response(
+                req, probs, echo, usage, want_audit ? &audit : nullptr, want_audit ? &decision_diagnostics : nullptr);
             return out;
         }
         // one decision per context; all contexts share the schema, the instructions and the cached prefix

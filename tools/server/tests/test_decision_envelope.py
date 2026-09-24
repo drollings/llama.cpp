@@ -153,6 +153,10 @@ def run_checks(server, captured):
     check("diagnostics" not in body, "default response has no additive diagnostics object")
     check("certainty" not in answers["dept"], "default response has no additive certainty")
     check("allowed_token_mass" not in answers["dept"], "default response has no additive audit fields")
+    # the audit trail is opt-in only: a default response must not carry any of its keys
+    for audit_key in ("probability_status", "prompt_sha256", "prompt_version", "answer_token_ids", "option_logits"):
+        check(audit_key not in answers["dept"], f"default response has no audit field {audit_key}")
+        check(audit_key not in answers["refund"], f"default response has no audit field {audit_key} on noul")
 
     # 1a. diagnostics opt-in restores the additive envelope and the audit fields
     # compare against a warm repeat so a cold-vs-warm fp difference cannot mask a real change
@@ -201,6 +205,11 @@ def run_checks(server, captured):
     check("input_tokens" in diag_body["usage"], "usage reports input_tokens")
     check("cached_tokens" in diag_body["usage"], "usage reports a cached_tokens split")
     check(diag_body["usage"]["input_tokens"] >= diag_body["usage"]["cached_tokens"], "cached tokens are part of the input")
+
+    # the realized answer-label pool is reported and covers every option the request used
+    pool_size = diag_body["diagnostics"].get("label_pool_size")
+    check(isinstance(pool_size, int) and 2 <= pool_size <= 64, f"label_pool_size is a bounded count: {pool_size!r}")
+    check(pool_size >= 3, f"the realized pool covers the widest question in the request: {pool_size}")
 
     # additive audit fields: prompt identity + per-answer tokenizer/vocabulary diagnostics
     expected_ids = {"refund": 2, "dept": 2, "urgency": 3}

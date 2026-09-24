@@ -293,7 +293,12 @@ int main(int argc, char ** argv) {
         backend["gpu_layers"] = -1; // loaded::load offloads every layer to the GPU backend
         backend["flash_attn"] = false;
         env["backend_flags"] = backend;
-        env["template_hash"] = "letter-v1";
+        // one source for the prompt identity: the same prefix tag the readout stamps into the
+        // cache key, so the report cannot drift from the version it was measured against
+        env["template_hash"]  = llama_decision::make_prefix_tag(
+            llama_decision::letter_system_text(),
+            llama_decision::render_letter_prompt(nullptr, false, llama_decision::letter_system_text()).second,
+            llama_decision::LETTER_PROMPT_VERSION);
         // git rev of this branch and of the decision baseline it is compared against
         auto git_rev_of = [](const char * ref) {
             std::string rev = "unknown";
@@ -312,7 +317,6 @@ int main(int argc, char ** argv) {
         };
         const std::string rev = git_rev_of("HEAD");
         env["git_rev"]           = rev;
-        env["git_rev_synthesis"] = rev;
         env["git_rev_decision"]  = git_rev_of("_decision");
 
         common_json report = common_json::object();

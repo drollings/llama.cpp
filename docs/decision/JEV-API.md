@@ -1,5 +1,8 @@
 # Jev API Reference (TypeSafe "System One" evaluation endpoint)
 
+> Reference only: the normative contract for this server is
+> `docs/decision/API.md`.
+
 Reference for replicating the wire shape of the Jev API. Compiled from https://docs.typesafe.ai/api and its linked pages (see [Sources](#sources)), current as of 2026-09-24, model `jev-1.13.0`.
 
 Conventions in this document:

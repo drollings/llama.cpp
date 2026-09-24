@@ -171,6 +171,26 @@ def supports_letter_labels(server):
     raise AssertionError(f"letter support probe unexpected status {status}: {text}")
 
 
+def preflight(server):
+    # A healthy server does not prove the endpoint is wired. Assert the decision route exists
+    # before any assertion runs, so a build without it fails instead of passing open.
+    status, _, _ = http("GET", f"http://127.0.0.1:{server.port}/health")
+    check(status == 200, f"preflight: /health is {status}")
+    status, _, text = server.post(json.dumps(DECISION_VALID))
+    check(status != 404, f"preflight: the decision route exists (status {status}: {text[:120]})")
+
+
+def check_shutdown(server):
+    # After stop the decision route must be gone: a clean connection refusal (or a 503 while the
+    # process drains), never a 200. A 200 here would mean the route outlives its model.
+    status = None
+    try:
+        status, _, _ = server.post(json.dumps(DECISION_VALID))
+    except Exception:  # noqa: BLE001
+        status = None
+    check(status != 200, f"a stopped server never answers the decision route with 200 (status {status})")
+
+
 def run_checks(server):
     # 1. body over the configured cap is rejected before any decode
     big = dict(DECISION_VALID)
@@ -480,15 +500,54 @@ def run_chat_decision_integrity(model):
         srv.stop()
 
 
+def run_recurrent_kv_integrity(model):
+    # Recurrent/hybrid models keep their state in a fixed RS buffer; a decision that forks the
+    # context must not disturb a chat turn. Two identical chat completions around a decision must
+    # match byte-for-byte. This is the KV-integrity guarantee the docs claim for coexistence. The
+    # gate runs this with a recurrent SERVER_MODEL; on a dense model it still checks the same
+    # sequential ordering, so it is never skipped for the model kind.
+    srv = Server(model, ["--seed", "42"])
+    srv.start()
+    try:
+        if not supports_letter_labels(srv):
+            return "skip"
+        url = f"http://127.0.0.1:{srv.port}/v1/chat/completions"
+        chat_body = {
+            "messages": [{"role": "user", "content": "Write a short paragraph about spring weather."}],
+            "max_tokens": 24,
+            "seed": 42,
+        }
+
+        status, _, first = http("POST", url, json.dumps(chat_body))
+        check(status == 200, f"chat before the decision: {status} {first[:120]}")
+
+        status, _, dtext = srv.post(json.dumps(DECISION_VALID))
+        check(status == 200, f"decision between the chats: {status} {dtext[:120]}")
+
+        status, _, second = http("POST", url, json.dumps(chat_body))
+        check(status == 200, f"chat after the decision: {status} {second[:120]}")
+
+        a = json.loads(first)["choices"][0]["message"]["content"]
+        b = json.loads(second)["choices"][0]["message"]["content"]
+        check(a == b, "the identical chat is byte-identical around a decision on a recurrent model")
+        return "pass"
+    finally:
+        srv.stop()
+
+
 def main():
     if not os.path.isfile(SERVER_BIN):
-        print(f"SKIP: server binary not found at {SERVER_BIN}")
-        return 0
+        print(f"FAIL: server binary not found at {SERVER_BIN}")
+        return 1
 
+    allow_skip = bool(os.environ.get("LLAMA_SERVER_TEST_ALLOW_SKIP"))
     candidates = [m for m in MODEL_CANDIDATES if m and os.path.isfile(m)]
     if not candidates:
-        print("SKIP: no test model; set LLAMA_SERVER_TEST_MODEL")
-        return 0
+        if allow_skip:
+            print("SKIP: no test model asset; set LLAMA_SERVER_TEST_MODEL (LLAMA_SERVER_TEST_ALLOW_SKIP set)")
+            return 0
+        print("FAIL: no test model asset; set LLAMA_SERVER_TEST_MODEL or LLAMA_SERVER_TEST_ALLOW_SKIP")
+        return 1
 
     for model in candidates:
         server = Server(model)
@@ -496,8 +555,14 @@ def main():
             server.start()
         except Exception as e:  # noqa: BLE001
             server.stop()
-            print(f"skip {os.path.basename(model)}: {e}")
-            continue
+            print(f"FAIL: server did not start on {os.path.basename(model)}: {e}")
+            return 1
+        try:
+            preflight(server)
+        except Exception as e:  # noqa: BLE001
+            server.stop()
+            print(f"FAIL: preflight: {e}")
+            return 1
         if not supports_letter_labels(server):
             server.stop()
             print(f"skip {os.path.basename(model)}: no usable answer labels")
@@ -509,6 +574,7 @@ def main():
             print(f"FAIL: {e}")
             return 1
         server.stop()
+        check_shutdown(server)
 
         # bounded-context sweep: a request past the budget is rejected, never truncated
         try:
@@ -532,11 +598,25 @@ def main():
         else:
             print("chat/decision integrity passed")
 
+        # recurrent KV integrity: chat, decision, identical chat
+        try:
+            recurrent = run_recurrent_kv_integrity(model)
+        except Exception as e:  # noqa: BLE001
+            print(f"FAIL: recurrent chat/decision integrity: {e}")
+            return 1
+        if recurrent == "skip":
+            print("SKIP: recurrent KV integrity (no usable answer labels)")
+        else:
+            print("recurrent chat/decision integrity passed")
+
         print("decision admission checks passed")
         return 0
 
-    print("SKIP: no candidate model supports letter labels; set LLAMA_SERVER_TEST_MODEL")
-    return 0
+    if allow_skip:
+        print("SKIP: no candidate model supports letter labels (LLAMA_SERVER_TEST_ALLOW_SKIP set)")
+        return 0
+    print("FAIL: no candidate model supports letter labels; set LLAMA_SERVER_TEST_MODEL")
+    return 1
 
 
 if __name__ == "__main__":
