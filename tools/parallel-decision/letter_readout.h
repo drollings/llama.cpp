@@ -17,7 +17,7 @@ struct common_params;
 namespace llama_decision {
 
 // Bump when the letter prompt layout changes; it is part of the prefix cache identity.
-inline constexpr const char * LETTER_PROMPT_VERSION = "letter-v1";
+inline constexpr const char * LETTER_PROMPT_VERSION = "letter-v2";
 
 // Identity of the decision readout contract: the tokenizer identity, the framed prompt template,
 // and the label code. A template edit or a version bump changes it, so a mismatched expected hash
@@ -69,6 +69,11 @@ std::pair<std::string, std::string> render_letter_prompt(const common_chat_templ
 // The per-question branch text, ending just before the label is generated.
 std::string format_letter_suffix(const decision_question & q, const std::vector<label> & labels,
                                  const std::string & after);
+
+// The one option-line formatter (`label: key`, plus ` - description` only when the rendered
+// description is non-empty). The framer builds every scored option line through this, so the
+// prompt layout has a single source and an empty description never leaves a trailing separator.
+std::string format_option_line(const label & l, const decision_option & opt);
 
 // Throws semantic_error when a question needs more labels than the pool provides.
 void validate_label_capacity(const decision_request & req, size_t label_count);
@@ -143,6 +148,29 @@ void verify_letter_request(const label_vocab & vocab, const std::string & tail,
 // semantic_error when a question needs more labels than the pool provides.
 // When `audit` is non-null the per-question diagnostics are filled in.
 std::vector<std::vector<float>> letter_readout(engine & eng,
+                                               answer_head_cache & head_cache,
+                                               const label_vocab & vocab,
+                                               const common_chat_templates * tmpls, bool use_jinja,
+                                               const decision_request & req,
+                                               const std::vector<label> & labels,
+                                               const options & opt,
+                                               letter_metrics * metrics = nullptr,
+                                               answer_audit * audit = nullptr);
+
+// The contexts a letter request may run on: the classifier-only fast path and the shared
+// full-logits fallback. The readout picks the classifier engine when the request's compiled plan
+// is covered by the head, otherwise the full engine, and reports why. Either engine may be null
+// when its context is not available; `full` must always be set.
+struct readout_sources {
+    engine *    classifier = nullptr;  // classifier-only context (hidden states + answer rows)
+    engine *    full       = nullptr;  // shared context (full-vocabulary logits)
+    std::string classifier_unavailable; // reason the classifier context is not usable, when null
+};
+
+// The layered readout: one scoring-source decision made from the compiled plan, so the server does
+// not duplicate the head-usability rule. The single-engine overload above is a thin wrapper that
+// treats a classifier-only engine as the classifier source.
+std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
                                                answer_head_cache & head_cache,
                                                const label_vocab & vocab,
                                                const common_chat_templates * tmpls, bool use_jinja,

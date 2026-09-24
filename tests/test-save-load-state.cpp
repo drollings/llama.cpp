@@ -503,7 +503,78 @@ static bool test_state_roundtrip(struct llama_model * model, const struct common
         return false;
     }
 
-LOG("\nPASS\n");
+    LOG("\nPASS\n");
+    return true;
+}
+
+// Test 9: format separation
+// - save the same sequence as a device blob and then as a host blob
+// - each blob must restore to its own content from a cleared cache
+// a state whose format is tracked by the value, not by a stale global flag, cannot mix the two
+static bool test_format_separation(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_ctx      = 256;
+    params_ctx.n_seq_max  = 2;
+    params_ctx.kv_unified = true;
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+
+    LOG("\n=== Test 9: format separation ===\n");
+
+    if (llama_decode(ctx.get(), llama_batch_get_one(const_cast<llama_token *>(tokens.data()), (int32_t) tokens.size()))) {
+        LOG_ERR("\n%s: failed to decode prompt\n", __func__);
+        return false;
+    }
+
+    const auto read_host = [&]() {
+        std::vector<uint8_t> buf(llama_state_seq_get_size(ctx.get(), 0));
+        const size_t n = llama_state_seq_get_data(ctx.get(), buf.data(), buf.size(), 0);
+        buf.resize(n);
+        return buf;
+    };
+    const std::vector<uint8_t> reference = read_host();
+    if (reference.empty()) {
+        LOG_ERR("\n%s: the host state is empty\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> device_blob(llama_state_seq_get_size_ext(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
+    if (device_blob.empty() ||
+        llama_state_seq_get_data_ext(ctx.get(), device_blob.data(), device_blob.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != device_blob.size()) {
+        LOG_ERR("\n%s: failed to save the device format\n", __func__);
+        return false;
+    }
+
+    // a host save after a device save must still write the host format
+    std::vector<uint8_t> host_blob(llama_state_seq_get_size(ctx.get(), 0));
+    if (host_blob.empty() || llama_state_seq_get_data(ctx.get(), host_blob.data(), host_blob.size(), 0) != host_blob.size()) {
+        LOG_ERR("\n%s: failed to save the host format\n", __func__);
+        return false;
+    }
+
+    const auto restore_and_compare = [&](const std::vector<uint8_t> & blob, llama_state_seq_flags flags, const char * what) {
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
+        const size_t nset = flags == LLAMA_STATE_SEQ_FLAGS_ON_DEVICE
+            ? llama_state_seq_set_data_ext(ctx.get(), blob.data(), blob.size(), 0, flags)
+            : llama_state_seq_set_data(ctx.get(), blob.data(), blob.size(), 0);
+        if (nset != blob.size()) {
+            LOG_ERR("\n%s: %s restore wrote %zu of %zu bytes\n", __func__, what, nset, blob.size());
+            return false;
+        }
+        if (read_host() != reference) {
+            LOG_ERR("\n%s: %s restore does not reproduce the saved state\n", __func__, what);
+            return false;
+        }
+        return true;
+    };
+
+    if (!restore_and_compare(device_blob, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE, "device")) {
+        return false;
+    }
+    if (!restore_and_compare(host_blob, LLAMA_STATE_SEQ_FLAGS_NONE, "host")) {
+        return false;
+    }
+
+    LOG("\nPASS\n");
     return true;
 }
 
@@ -585,79 +656,7 @@ static bool test_device_byte_cursor(struct llama_model * model, const struct com
     return true;
 }
 
-// Test 9: format separation
-// - save the same sequence as a device blob and then as a host blob
-// - each blob must restore to its own content from a cleared cache
-// a state whose format is tracked by the value, not by a stale global flag, cannot mix the two
-static bool test_format_separation(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
-    auto params_ctx = common_context_params_to_llama(params);
-    params_ctx.n_ctx      = 256;
-    params_ctx.n_seq_max  = 2;
-    params_ctx.kv_unified = true;
-    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
-
-    LOG("\n=== Test 9: format separation ===\n");
-
-    if (llama_decode(ctx.get(), llama_batch_get_one(const_cast<llama_token *>(tokens.data()), (int32_t) tokens.size()))) {
-        LOG_ERR("\n%s: failed to decode prompt\n", __func__);
-        return false;
-    }
-
-    const auto read_host = [&]() {
-        std::vector<uint8_t> buf(llama_state_seq_get_size(ctx.get(), 0));
-        const size_t n = llama_state_seq_get_data(ctx.get(), buf.data(), buf.size(), 0);
-        buf.resize(n);
-        return buf;
-    };
-    const std::vector<uint8_t> reference = read_host();
-    if (reference.empty()) {
-        LOG_ERR("\n%s: the host state is empty\n", __func__);
-        return false;
-    }
-
-    std::vector<uint8_t> device_blob(llama_state_seq_get_size_ext(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
-    if (device_blob.empty() ||
-        llama_state_seq_get_data_ext(ctx.get(), device_blob.data(), device_blob.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != device_blob.size()) {
-        LOG_ERR("\n%s: failed to save the device format\n", __func__);
-        return false;
-    }
-
-    // a host save after a device save must still write the host format
-    std::vector<uint8_t> host_blob(llama_state_seq_get_size(ctx.get(), 0));
-    if (host_blob.empty() || llama_state_seq_get_data(ctx.get(), host_blob.data(), host_blob.size(), 0) != host_blob.size()) {
-        LOG_ERR("\n%s: failed to save the host format\n", __func__);
-        return false;
-    }
-
-    const auto restore_and_compare = [&](const std::vector<uint8_t> & blob, llama_state_seq_flags flags, const char * what) {
-        llama_memory_clear(llama_get_memory(ctx.get()), true);
-        const size_t nset = flags == LLAMA_STATE_SEQ_FLAGS_ON_DEVICE
-            ? llama_state_seq_set_data_ext(ctx.get(), blob.data(), blob.size(), 0, flags)
-            : llama_state_seq_set_data(ctx.get(), blob.data(), blob.size(), 0);
-        if (nset != blob.size()) {
-            LOG_ERR("\n%s: %s restore wrote %zu of %zu bytes\n", __func__, what, nset, blob.size());
-            return false;
-        }
-        if (read_host() != reference) {
-            LOG_ERR("\n%s: %s restore does not reproduce the saved state\n", __func__, what);
-            return false;
-        }
-        return true;
-    };
-
-    if (!restore_and_compare(device_blob, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE, "device")) {
-        return false;
-    }
-    if (!restore_and_compare(host_blob, LLAMA_STATE_SEQ_FLAGS_NONE, "host")) {
-        return false;
-    }
-
-    LOG("\nPASS\n");
-    return true;
-}
-
-
-// Run the full save/load test suite (tests 1-9) for a single model.
+// Run the full save/load test suite (tests 1-10) for a single model.
 // Returns true if all tests pass, false otherwise.
 static bool run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     struct common_params params = base_params;

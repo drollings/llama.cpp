@@ -84,6 +84,36 @@ std::string canonical_type(const std::string & t) {
     return t;
 }
 
+// Validates a "temperatures" object: known keys only, each a number > 0. When `out` is given the
+// parsed values are stored; otherwise the object is only checked. Shared by the request parser and
+// the standalone temperature profile so the two cannot drift.
+void read_temperatures(const common_json & temps, std::map<std::string, double> * out) {
+    if (!temps.is_object()) {
+        throw semantic_error("temperatures must be an object");
+    }
+    for (const auto & e : temps.items()) {
+        if (e.key() != "noul" && e.key() != "choice" && e.key() != "score") {
+            throw semantic_error("temperatures: unknown field \"" + e.key() + "\"");
+        }
+        if (!e.value().is_number() || !(e.value().get<double>() > 0.0)) {
+            throw semantic_error("temperatures." + e.key() + " must be a number > 0");
+        }
+        if (out != nullptr) {
+            (*out)[e.key()] = e.value().get<double>();
+        }
+    }
+}
+
+// A score is an expected zero-based index, so the level count is the number of criteria entries.
+// Shared by the array and legend-object forms; 2 is the smallest meaningful scale and 10 bounds the
+// answer-row fan-out.
+void check_score_levels(const std::string & id, size_t levels) {
+    if (levels < DECISION_MIN_OPTIONS || levels > DECISION_MAX_SCORE_LEVELS) {
+        throw semantic_error("question \"" + id + "\": score needs " + std::to_string(DECISION_MIN_OPTIONS) +
+                             "-" + std::to_string(DECISION_MAX_SCORE_LEVELS) + " levels");
+    }
+}
+
 void validate_state(const common_json & s) {
     if (s.is_string()) {
         if (s.get<std::string>().empty()) {
@@ -156,8 +186,9 @@ decision_question parse_question(const std::string & id, const common_json & spe
             throw semantic_error("question \"" + id + "\": choice needs an object \"criteria\"");
         }
         const common_json & crit = spec.at("criteria");
-        if (crit.size() < 2 || crit.size() > 64) {
-            throw semantic_error("question \"" + id + "\": choice needs 2-64 options");
+        if (crit.size() < DECISION_MIN_OPTIONS || crit.size() > DECISION_MAX_CHOICE_OPTIONS) {
+            throw semantic_error("question \"" + id + "\": choice needs " + std::to_string(DECISION_MIN_OPTIONS) +
+                                 "-" + std::to_string(DECISION_MAX_CHOICE_OPTIONS) + " options");
         }
         for (const auto & e : crit.items()) {
             if (e.key().empty()) {
@@ -175,9 +206,7 @@ decision_question parse_question(const std::string & id, const common_json & spe
         }
         const common_json & crit = spec.at("criteria");
         if (crit.is_array()) {
-            if (crit.size() < 2 || crit.size() > 64) {
-                throw semantic_error("question \"" + id + "\": score needs 2-64 levels");
-            }
+            check_score_levels(id, crit.size());
             for (size_t i = 0; i < crit.size(); ++i) {
                 decision_option o;
                 o.key         = std::to_string(i);
@@ -186,9 +215,7 @@ decision_question parse_question(const std::string & id, const common_json & spe
                 q.options.push_back(o);
             }
         } else if (crit.is_object()) {
-            if (crit.size() < 2 || crit.size() > 64) {
-                throw semantic_error("question \"" + id + "\": score needs 2-64 levels");
-            }
+            check_score_levels(id, crit.size());
             size_t i = 0;
             for (const auto & e : crit.items()) {
                 if (e.key() != std::to_string(i)) {
@@ -206,8 +233,8 @@ decision_question parse_question(const std::string & id, const common_json & spe
         }
     }
 
-    if (!q.has_criteria && (!spec.contains("instructions") || spec.at("instructions").is_null())) {
-        throw semantic_error("question \"" + id + "\": needs instructions or criteria");
+    if (!spec.contains("instructions") || spec.at("instructions").is_null()) {
+        throw semantic_error("question \"" + id + "\": instructions are required");
     }
     return q;
 }
@@ -258,19 +285,7 @@ temperature_profile parse_temperature_profile(const common_json & doc) {
         read("backend_flags", profile.provenance.backend_flags);
     }
     if (doc.contains("temperatures")) {
-        const common_json & temps = doc.at("temperatures");
-        if (!temps.is_object()) {
-            throw semantic_error("temperatures must be an object");
-        }
-        for (const auto & e : temps.items()) {
-            if (e.key() != "noul" && e.key() != "choice" && e.key() != "score") {
-                throw semantic_error("temperatures: unknown field \"" + e.key() + "\"");
-            }
-            if (!e.value().is_number() || !(e.value().get<double>() > 0.0)) {
-                throw semantic_error("temperatures." + e.key() + " must be a number > 0");
-            }
-            profile.temperatures[e.key()] = e.value().get<double>();
-        }
+        read_temperatures(doc.at("temperatures"), &profile.temperatures);
     }
     return profile;
 }
@@ -308,7 +323,8 @@ decision_request parse_decision_request(const common_json & body) {
     if (!body.is_object()) {
         throw semantic_error("request must be an object");
     }
-    check_allowed_keys(body, { "model", "state", "questions", "temperature", "temperatures", "permutations", "head" }, "request");
+    // Unknown top-level fields are tolerated for Jev compatibility; unknown fields inside a
+    // question are still refused by parse_question.
 
     decision_request req;
 
@@ -329,8 +345,9 @@ decision_request parse_decision_request(const common_json & body) {
         throw semantic_error("questions must be an object");
     }
     const common_json & qs = body.at("questions");
-    if (qs.size() < 1 || qs.size() > 256) {
-        throw semantic_error("questions must hold 1-256 entries");
+    if (qs.size() < DECISION_MIN_QUESTIONS || qs.size() > DECISION_MAX_QUESTIONS) {
+        throw semantic_error("questions must hold " + std::to_string(DECISION_MIN_QUESTIONS) + "-" +
+                             std::to_string(DECISION_MAX_QUESTIONS) + " entries");
     }
     for (const auto & e : qs.items()) {
         req.questions.push_back(parse_question(e.key(), e.value()));
@@ -347,19 +364,8 @@ decision_request parse_decision_request(const common_json & body) {
     }
 
     if (body.contains("temperatures") && !body.at("temperatures").is_null()) {
-        const common_json & temps = body.at("temperatures");
-        if (!temps.is_object()) {
-            throw semantic_error("temperatures must be an object");
-        }
-        for (const auto & e : temps.items()) {
-            if (e.key() != "noul" && e.key() != "choice" && e.key() != "score") {
-                throw semantic_error("temperatures: unknown field \"" + e.key() + "\"");
-            }
-            if (!e.value().is_number() || !(e.value().get<double>() > 0.0)) {
-                throw semantic_error("temperatures." + e.key() + " must be a number > 0");
-            }
-        }
-        req.temperatures = temps;
+        read_temperatures(body.at("temperatures"), nullptr);
+        req.temperatures = body.at("temperatures");
     }
 
     if (body.contains("permutations") && !body.at("permutations").is_null()) {
@@ -371,8 +377,8 @@ decision_request parse_decision_request(const common_json & body) {
         if (req.permutations < 1) {
             throw semantic_error("permutations must be >= 1");
         }
-        if (req.permutations > 8) {
-            req.permutations = 8; // accepted but capped: more passes only add cost
+        if (req.permutations > DECISION_MAX_PERMUTATIONS) {
+            req.permutations = DECISION_MAX_PERMUTATIONS; // accepted but capped: more passes only add cost
         }
     }
 
@@ -384,6 +390,13 @@ decision_request parse_decision_request(const common_json & body) {
         if (req.head != "auto" && req.head != "selected" && req.head != "full") {
             throw semantic_error("head must be auto, selected or full");
         }
+    }
+
+    if (body.contains("diagnostics") && !body.at("diagnostics").is_null()) {
+        if (!body.at("diagnostics").is_boolean()) {
+            throw semantic_error("diagnostics must be a boolean");
+        }
+        req.diagnostics = body.at("diagnostics").get<bool>();
     }
 
     return req;
@@ -458,7 +471,8 @@ common_json assemble_decision_response(const decision_request & req,
                                   const std::vector<std::vector<float>> & probs,
                                   const std::string & model,
                                   const common_json & usage,
-                                  const answer_audit * audit) {
+                                  const answer_audit * audit,
+                                  const common_json * diagnostics) {
     const auto uniform = uniform_probs(req);
 
     common_json answers = common_json::object();
@@ -489,8 +503,10 @@ common_json assemble_decision_response(const decision_request & req,
                     best = i;
                 }
             }
-            a["confidence"] = (double) p[best];
-            a["certainty"]  = entropy_certainty(p);
+            a["confidence"] = entropy_certainty(p); // 1 - H/log K (Jev reference)
+            if (req.diagnostics) {
+                a["certainty"] = (double) p[best]; // winner's share, max(p); additive
+            }
 
             if (q.type == "choice") {
                 a["choice"]        = q.options[best].key;
@@ -507,17 +523,19 @@ common_json assemble_decision_response(const decision_request & req,
                 a["legend"]        = legend;
             }
         }
-        if (audit != nullptr) {
+        if (req.diagnostics && audit != nullptr) {
             a["probability_status"] = audit->probability_status;
             a["prompt_sha256"]      = audit->prompt_sha256;
             a["prompt_version"]     = audit->prompt_version;
             if (qi < audit->answer_token_ids.size()) {
                 a["answer_token_ids"] = audit->answer_token_ids[qi];
             }
-            if (qi < audit->allowed_token_mass.size()) {
+            // under the selected head the full-vocabulary mass and argmax are not measurable, so do
+            // not emit the 1.0 / -1 placeholders as if they were real measurements
+            if (audit->full_vocab_audit && qi < audit->allowed_token_mass.size()) {
                 a["allowed_token_mass"] = (double) audit->allowed_token_mass[qi];
             }
-            if (qi < audit->full_vocab_argmax_id.size()) {
+            if (audit->full_vocab_audit && qi < audit->full_vocab_argmax_id.size()) {
                 a["full_vocab_argmax_id"] = audit->full_vocab_argmax_id[qi];
             }
             if (qi < audit->option_logits.size()) {
@@ -530,7 +548,28 @@ common_json assemble_decision_response(const decision_request & req,
     common_json out = common_json::object();
     out["model"]   = model;
     out["answers"] = answers;
-    out["usage"]   = usage;
+    // The strict Jev envelope carries only input/output tokens. The extra counters are additive
+    // diagnostics, so drop them unless the caller opted in.
+    if (req.diagnostics) {
+        out["usage"] = usage;
+    } else {
+        common_json jev_usage = common_json::object();
+        if (usage.contains("input_tokens")) {
+            jev_usage["input_tokens"] = usage.at("input_tokens");
+        }
+        if (usage.contains("output_tokens")) {
+            jev_usage["output_tokens"] = usage.at("output_tokens");
+        }
+        out["usage"] = jev_usage;
+    }
+    // The head and diagnostics objects are additive too; the caller hands over a ready payload and
+    // this assembler is the only place that decides whether the default or diagnostics envelope is
+    // emitted, so default and diagnostics responses cannot drift apart.
+    if (req.diagnostics && diagnostics != nullptr) {
+        for (auto it = diagnostics->begin(); it != diagnostics->end(); ++it) {
+            out[it.key()] = it.value();
+        }
+    }
     return out;
 }
 

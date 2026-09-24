@@ -3358,32 +3358,69 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
     return (uint32_t) nelements;
 }
 
-int32_t llama_model_classifier_rows(const llama_model * model, const llama_token * ids, int32_t count, float * dst, size_t dst_count, float * softcap, float * bias_dst) {
-    if (!model || !ids || !dst || !softcap || count < 1 || count > 64 ||
-            !llm_arch_supports_classifier(model->arch) || !model->output || model->output_s) return 0;
-    const auto * tensor = model->output;
-    const auto width = tensor->ne[0];
-    if (width != model->hparams.n_embd || dst_count != size_t(count) * size_t(width) ||
-            !ggml_is_contiguous(tensor)) return 0;
-    const auto * traits = ggml_get_type_traits(tensor->type);
-    if (tensor->type != GGML_TYPE_F32 && !traits->to_float) return 0;
-
+bool llama_model_classifier_supported(const llama_model * model, const char ** reason) {
+    const auto refuse = [reason](const char * why) {
+        if (reason != nullptr) {
+            *reason = why;
+        }
+        return false;
+    };
+    if (reason != nullptr) {
+        *reason = nullptr;
+    }
+    if (model == nullptr) {
+        return refuse("no model is loaded");
+    }
+    if (!llm_arch_supports_classifier(model->arch)) {
+        return refuse("the architecture does not support the answer head");
+    }
+    if (model->output == nullptr) {
+        return refuse("the model has no output table");
+    }
+    if (model->output_s != nullptr) {
+        return refuse("the model output is split across tensors");
+    }
+    const ggml_tensor * tensor = model->output;
+    if (tensor->ne[0] != model->hparams.n_embd_out()) {
+        // this refuses qwen4exp, whose hyper-connection output width (hc_mult * n_embd) differs
+        // from its plain output table; the fast path is unavailable there and callers fall back.
+        return refuse("the answer-row width does not match the hidden state width");
+    }
+    if (!ggml_is_contiguous(tensor)) {
+        return refuse("the model output tensor is not contiguous");
+    }
+    if (tensor->type != GGML_TYPE_F32) {
+        const ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
+        if (traits == nullptr || traits->to_float == nullptr) {
+            return refuse("the model output tensor type cannot be dequantized");
+        }
+    }
     // a per-id output bias must be readable element-wise whenever the model has one, else every
-    // score would silently drop it; validate it regardless of whether the caller wants the values.
-    // Only a float (or element-wise dequantizable, e.g. F16/BF16) contiguous bias is supported: a
-    // block-quantized 1-D bias is refused (0 -> caller falls back to full logits) because its rows
-    // are block-granular, not per-element addressable.
+    // score would silently drop it. Only a float (or element-wise dequantizable, e.g. F16/BF16)
+    // contiguous bias is supported: a block-quantized 1-D bias is refused because its rows are
+    // block-granular, not per-element addressable.
     const ggml_tensor * bias = model->output_b;
-    const ggml_type_traits * bias_traits = nullptr;
     if (bias != nullptr) {
-        bias_traits = ggml_get_type_traits(bias->type);
+        const ggml_type_traits * bias_traits = ggml_get_type_traits(bias->type);
         const bool elementwise = bias->type == GGML_TYPE_F32 ||
             (bias_traits && bias_traits->to_float && ggml_row_size(bias->type, 1) == ggml_type_size(bias->type));
         if (!ggml_is_contiguous(bias) || bias->ne[0] != tensor->ne[1] || !elementwise) {
-            return 0;
+            return refuse("the output bias is not a readable per-token vector");
         }
     }
+    return true;
+}
+
+int32_t llama_model_classifier_rows(const llama_model * model, const llama_token * ids, int32_t count, float * dst, size_t dst_count, float * softcap, float * bias_dst) {
+    if (!model || !ids || !dst || !softcap || count < 1 || count > 64) return 0;
+    if (!llama_model_classifier_supported(model, nullptr)) return 0;
+    const auto * tensor = model->output;
+    const auto width = tensor->ne[0];
+    if (dst_count != size_t(count) * size_t(width)) return 0;
     for (int i = 0; i < count; ++i) if (ids[i] < 0 || ids[i] >= tensor->ne[1]) return 0;
+    const auto * traits = ggml_get_type_traits(tensor->type);
+    const ggml_tensor * bias = model->output_b;
+    const ggml_type_traits * bias_traits = bias != nullptr ? ggml_get_type_traits(bias->type) : nullptr;
     try {
         const size_t bytes = ggml_row_size(tensor->type, width);
         std::vector<uint8_t> row(bytes);

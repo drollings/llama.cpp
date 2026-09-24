@@ -14,6 +14,7 @@
 #include "json.h"
 
 #include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -83,6 +84,29 @@ struct options {
 // exact normalization so the legacy path stays bit-identical.
 std::vector<float> softmax(const std::vector<float> & logits, float temperature = 1.0f);
 
+// The compiled scoring plan for one request: every field's token trie, deduplicated, with a shared
+// suffix head hoisted onto the trunk. Opaque: the trie layout is private. It is a pure function of
+// (inputs, options) and the vocabulary, so the head fast path can be decided from the plan before
+// a context is chosen, and scoring then reuses the same plan instead of re-deriving the fields.
+struct compiled_fields {
+    compiled_fields();
+    ~compiled_fields();
+    compiled_fields(compiled_fields &&) noexcept;
+    compiled_fields & operator=(compiled_fields &&) noexcept;
+    compiled_fields(const compiled_fields &) = delete;
+    compiled_fields & operator=(const compiled_fields &) = delete;
+
+    size_t field_count          = 0; // unique fields after dedup
+    size_t suffix_tokens        = 0; // per-field suffix tokens before the shared head is hoisted
+    size_t common_suffix_tokens = 0; // suffix head hoisted onto every trunk
+    size_t leaf_suffix_tokens   = 0; // what each branch decodes after the hoist
+    int    rows                 = 0; // batch rows the plan needs
+    int    branches             = 0; // round-1 branches of one context
+
+    struct impl;
+    std::unique_ptr<impl> p;
+};
+
 // Deterministic identity of a rendered static prefix: prompt version + chat template
 // shape + the prefix text. Used to reject a cache hit produced under a different prompt.
 std::string make_prefix_tag(const std::string & system_text, const std::string & after,
@@ -151,6 +175,17 @@ class engine {
     size_t token_cache_size() const { return token_cache_.size(); }
     size_t token_cache_hits() const { return token_cache_hits_; }
 
+    // True when this engine's context stops the graph at the post-norm hidden state.
+    bool classifier_only() const;
+
+    // Compiles field inputs into the scoring plan. Pure: it tokenizes (through the per-engine
+    // cache) and lays out the trie, but never touches the context or the KV cache.
+    compiled_fields compile_fields(const std::vector<field_input> & inputs, const options & opt) const;
+
+    // The one head-usability predicate: true when `opt.head` can score every candidate in the plan
+    // on this engine's context. `reason` is set with why when it returns false.
+    bool select_scoring_head(const compiled_fields & plan, const options & opt, std::string * reason) const;
+
     result decide(const std::string & shared_text, const std::string & context_text,
                   const std::vector<field_input> & fields, const options & opt);
 
@@ -158,6 +193,13 @@ class engine {
     // the sequence budget; results keep the order of the contexts.
     batch_result decide_batch(const std::string & shared_text, const std::vector<std::string> & contexts,
                               const std::vector<field_input> & fields, const options & opt);
+
+    // Remove every cell of `count` sequences starting at `first` in this engine's memory.
+    void clear_seqs(llama_seq_id first, int count);
+
+    // Clear the pool sequences branches are forked into. The cached prefix (seq_snap) is never
+    // touched, so prefix cache reuse survives a cleanup.
+    void clear_pool_seqs();
 
   private:
     struct prompt_part {
@@ -240,7 +282,7 @@ class engine {
                                              bool allow_bypass);
 
     void gather_candidates(int out_idx, const tokens_t & cands, branch_score & out);
-    bool head_covers(const tokens_t & cands) const;
+    bool head_covers(const classifier_head & head, const tokens_t & cands) const;
 };
 
 // ---- schema compiler (the C++ counterpart of llama-mojo's tools/prepare_decisions.py)

@@ -174,6 +174,19 @@ struct decision_field {
 
 } // namespace
 
+// The plan's private layout: the deduplicated fields plus the input-to-field map and the suffix
+// head that was hoisted onto the trunk. Hidden here so the trie stays an implementation detail.
+struct compiled_fields::impl {
+    std::vector<decision_field> fields;
+    std::vector<size_t>         field_first; // input field -> scored field (identical fields share one)
+    tokens_t                    plan_common; // shared suffix head hoisted onto every trunk
+};
+
+compiled_fields::compiled_fields() = default;
+compiled_fields::~compiled_fields() = default;
+compiled_fields::compiled_fields(compiled_fields &&) noexcept = default;
+compiled_fields & compiled_fields::operator=(compiled_fields &&) noexcept = default;
+
 std::vector<float> softmax(const std::vector<float> & logits, float temperature) {
     std::vector<float> out(logits.size(), 0.0f);
     if (logits.empty()) {
@@ -281,6 +294,13 @@ llama_state_seq_flags engine::state_load_flags(bool on_device) {
 }
 
 engine::saved_state engine::save_seq(llama_seq_id seq, bool prefer_device) const {
+    // A sequence that was never decoded has no state; saving it must be an error, never a
+    // header-only state that a later load would restore as nothing. Occupancy is authoritative:
+    // the sequence state writer always emits at least a header, so its byte count cannot tell an
+    // empty sequence apart from a decoded one.
+    if (llama_memory_seq_pos_max(mem, seq) < 0) {
+        throw std::runtime_error("failed to save a decision sequence state: no state is available");
+    }
     // The device path stages the tensor bytes in the context staging buffer and returns only a
     // small metadata header on the host, so a saved device state is not self-contained. Prefer it
     // only where the state is consumed before the next save; otherwise use the self-contained host
@@ -296,11 +316,6 @@ engine::saved_state engine::save_seq(llama_seq_id seq, bool prefer_device) const
         device_capable_ = false;
     }
     const size_t size = llama_state_seq_get_size(ctx, seq);
-    if (size == 0) {
-        // A sequence that was never decoded has no state; saving it must be an error, never a
-        // silently-empty state that a later load would restore as nothing.
-        throw std::runtime_error("failed to save a decision sequence state: no state is available");
-    }
     std::vector<uint8_t> buf(size);
     if (llama_state_seq_get_data(ctx, buf.data(), buf.size(), seq) != size) {
         throw std::runtime_error("failed to save a decision sequence state");
@@ -370,6 +385,16 @@ tokens_t engine::tokenize(const std::string & text, bool add_special) const {
     return toks;
 }
 
+void engine::clear_seqs(llama_seq_id first, int count) {
+    for (int i = 0; i < count; ++i) {
+        llama_memory_seq_rm(mem, first + (llama_seq_id) i, -1, -1);
+    }
+}
+
+void engine::clear_pool_seqs() {
+    clear_seqs(seq_pool, n_pool);
+}
+
 // Decode several prompts, each on its own sequence, packed into as few batches as n_batch allows.
 void engine::decode_parts(const std::vector<prompt_part> & parts) {
     const int n_batch = (int) llama_n_batch(ctx);
@@ -402,17 +427,16 @@ bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache, const std
     if (allow_cache && !shared.empty() && active_fork_ == fork_kind::restore && !tag.empty()) {
         for (size_t i = 0; i < prefix_lru_.size(); ++i) {
             if (prefix_lru_[i].tag == tag) {
-                prefix_entry entry = prefix_lru_[i];
+                prefix_entry entry = std::move(prefix_lru_[i]);
                 prefix_lru_.erase(prefix_lru_.begin() + (long) i);
-                prefix_lru_.insert(prefix_lru_.begin(), entry);
-                for (llama_seq_id s = seq_snap; s < seq_pool + n_pool; ++s) {
-                    llama_memory_seq_rm(mem, s, -1, -1);
-                }
+                clear_seqs(seq_snap, n_pool + 1); // the state moves to seq_snap, so everything resets
                 // the LRU entry is host format; refresh the device copy for the current request only
                 load_seq(entry.state, seq_snap);
                 prefix_state_ = save_seq(seq_snap, true);
                 cached        = shared;
                 cached_tag    = tag;
+                // move the entry back to the front; the state bytes are not copied
+                prefix_lru_.insert(prefix_lru_.begin(), std::move(entry));
                 return true;
             }
         }
@@ -424,9 +448,7 @@ bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache, const std
         }
     }
 
-    for (llama_seq_id s = seq_snap; s < seq_pool + n_pool; ++s) {
-        llama_memory_seq_rm(mem, s, -1, -1);
-    }
+    clear_seqs(seq_snap, n_pool + 1);
     cached.clear();
     cached_tag.clear();
     prefix_state_ = saved_state{};
@@ -485,7 +507,7 @@ std::vector<engine::branch_score> engine::score_branches(const std::vector<branc
     // Only bypass when the branch fits one batch; an oversize branch falls through to the chunked
     // path, which rejects it as a capacity error instead of overflowing llama_decode.
     if (allow_bypass && branches.size() == 1 && active_fork_ == fork_kind::copy &&
-        (int) branches[0].toks.size() <= llama_n_batch(ctx)) {
+        branches[0].toks.size() <= (size_t) llama_n_batch(ctx)) {
         const llama_seq_id seq  = branches[0].trunk;
         const auto &       toks = branches[0].toks;
         llama_batch batch = llama_batch_init((int) toks.size(), 0, 1);
@@ -517,7 +539,52 @@ std::vector<engine::branch_score> engine::score_branches(const std::vector<branc
             ++end;
         }
         if (end == start) {
-            throw capacity_error("a decision suffix exceeds the batch size");
+            // One branch is larger than a single batch: decode it alone in chunks within its own
+            // sequence. A suffix is teacher-forced, so splitting it across decodes keeps the same
+            // state and the final chunk yields the scored position.
+            const size_t b = start;
+            const llama_seq_id seq = first;
+            if (active_fork_ == fork_kind::restore) {
+                if (parent_states == nullptr) {
+                    throw capacity_error("a restore fork needs parent states");
+                }
+                const size_t idx = (size_t) (branches[b].trunk - seq_pool);
+                if (idx >= parent_states->size()) {
+                    throw capacity_error("missing parent state for a decision branch");
+                }
+                llama_memory_seq_rm(mem, seq, -1, -1);
+                load_seq((*parent_states)[idx], seq);
+            } else {
+                fork_into(branches[b].trunk, seq, nullptr);
+            }
+            const auto & toks = branches[b].toks;
+            for (size_t i = 0; i < toks.size(); i += (size_t) max_rows) {
+                const size_t n = std::min((size_t) max_rows, toks.size() - i);
+                llama_batch batch = llama_batch_init((int) n, 0, 1);
+                int out_idx = -1;
+                for (size_t j = 0; j < n; ++j) {
+                    const bool last = i + j + 1 == toks.size();
+                    if (last) {
+                        out_idx = batch.n_tokens;
+                    }
+                    common_batch_add(batch, toks[i + j], branches[b].pos0 + (llama_pos) (i + j), { seq }, last);
+                }
+                check_cancel();
+                const int rc = llama_decode(ctx, batch);
+                llama_batch_free(batch);
+                if (rc != 0) {
+                    throw capacity_error(rc == 1 ? "no free KV cache space for the decision branch"
+                                                 : "llama_decode failed on the decision branch (" + std::to_string(rc) + ")");
+                }
+                if (out_idx >= 0) {
+                    llama_synchronize(ctx);
+                    gather_candidates(out_idx, branches[b].cands, result[b]);
+                }
+            }
+            clear_seqs(first, 1);
+            llama_synchronize(ctx);
+            ++start;
+            continue;
         }
         llama_batch batch = llama_batch_init(rows, 0, 1);
         std::vector<int> out_idx;
@@ -555,18 +622,75 @@ std::vector<engine::branch_score> engine::score_branches(const std::vector<branc
         llama_synchronize(ctx); // the scored rows are on the host only after the async decode drains
         for (size_t b = start; b < end; ++b) {
             gather_candidates(out_idx[b - start], branches[b].cands, result[b]);
-            llama_memory_seq_rm(mem, first + (llama_seq_id) (b - start), -1, -1);
         }
+        clear_seqs(first, (int) (end - start));
         llama_synchronize(ctx);
         start = end;
     }
     return result;
 }
 
-bool engine::head_covers(const tokens_t & cands) const {
+bool engine::head_covers(const classifier_head & head, const tokens_t & cands) const {
     for (llama_token t : cands) {
-        if (head_->index_of(t) < 0) {
+        if (head.index_of(t) < 0) {
             return false;
+        }
+    }
+    return true;
+}
+
+bool engine::classifier_only() const {
+    return llama_context_classifier_only(ctx);
+}
+
+bool engine::select_scoring_head(const compiled_fields & plan, const options & opt, std::string * reason) const {
+    if (reason != nullptr) {
+        reason->clear();
+    }
+    const classifier_head * head = opt.head;
+    if (head == nullptr) {
+        return false;
+    }
+    if (!head->available()) {
+        if (reason != nullptr) {
+            *reason = head->reason.empty() ? "the selected answer head is unavailable" : head->reason;
+        }
+        return false;
+    }
+    if (!llama_context_classifier_only(ctx)) {
+        if (reason != nullptr) {
+            *reason = "the decision context does not expose hidden states";
+        }
+        return false;
+    }
+    if (llama_model_n_embd_out(model) != (int32_t) head->width) {
+        if (reason != nullptr) {
+            *reason = "the answer-row width does not match the hidden state width";
+        }
+        return false;
+    }
+    if (plan.p == nullptr) {
+        return true;
+    }
+    for (const auto & fd : plan.p->fields) {
+        if (fd.use_tree) {
+            for (const auto & opts : fd.node_options) {
+                if (!head_covers(*head, opts)) {
+                    if (reason != nullptr) {
+                        *reason = "the answer head does not cover every candidate token";
+                    }
+                    return false;
+                }
+            }
+        } else {
+            for (const auto & p : fd.paths) {
+                if (!head_covers(*head, p)) {
+                    if (reason != nullptr) {
+                        *reason = "the answer head does not cover every candidate token";
+                    }
+                    return false;
+                }
+            }
         }
     }
     return true;
@@ -610,32 +734,12 @@ result engine::decide(const std::string & shared_text, const std::string & conte
     return r;
 }
 
-batch_result engine::decide_batch(const std::string & shared_text, const std::vector<std::string> & contexts,
-                                  const std::vector<field_input> & inputs, const options & opt) {
-    if (opt.mode != "auto" && opt.mode != "tree" && opt.mode != "greedy") {
-        throw std::invalid_argument("mode must be auto, tree or greedy");
-    }
-    if (contexts.empty()) {
-        throw std::invalid_argument("a decision needs at least one context");
-    }
-    select_fork(opt.fork);
-    stop_  = opt.should_stop;
-    yield_ = opt.yield;
-    audit_ = opt.audit;
-    llama_synchronize(ctx); // drain any work left by the previous decision before reusing sequences
-    check_cancel();
-    const tokens_t shared = tokenize(shared_text, true);
-    std::vector<tokens_t> prefixes;
-    for (const auto & text : contexts) {
-        prefixes.push_back(tokenize(text, shared.empty()));
-        if (prefixes.back().empty()) {
-            throw std::invalid_argument("the decision context must not be empty");
-        }
-    }
+compiled_fields engine::compile_fields(const std::vector<field_input> & inputs, const options & opt) const {
+    compiled_fields plan;
+    plan.p = std::make_unique<compiled_fields::impl>();
+    std::vector<decision_field> & fields      = plan.p->fields;
+    std::vector<size_t> &         field_first = plan.p->field_first;
 
-    std::vector<decision_field> fields;
-    std::vector<size_t> field_first; // input field -> scored field (identical fields share one)
-    int total    = 0;
     int branches = 0; // round-1 branches of one context
     for (const auto & in : inputs) {
         const size_t n = in.candidates.size();
@@ -673,9 +777,7 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
         if (suffix.empty()) {
             throw std::invalid_argument("a field suffix must not be empty");
         }
-        size_t max_path = 0;
         for (size_t a = 0; a < paths.size(); ++a) {
-            max_path = std::max(max_path, paths[a].size());
             for (size_t b = 0; b < a; ++b) {
                 const size_t m = std::min(paths[a].size(), paths[b].size());
                 if (std::equal(paths[a].begin(), paths[a].begin() + m, paths[b].begin())) {
@@ -697,7 +799,6 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
             }
         }
         if (canon == fields.size()) {
-            total    += field.use_tree ? field.tree_rows() : (int) (suffix.size() + max_path);
             branches += field.use_tree ? (int) field.node_prefix.size() : 1;
             fields.push_back(std::move(field));
         }
@@ -732,11 +833,9 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
         }
     }
     size_t leaf_suffix_tokens = 0;
+    int    total              = 0;
     for (const auto & fd : fields) {
         leaf_suffix_tokens += fd.suffix.size();
-    }
-    total = 0;
-    for (const auto & fd : fields) {
         size_t max_path = 0;
         for (const auto & p : fd.paths) {
             max_path = std::max(max_path, p.size());
@@ -744,46 +843,64 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
         total += fd.use_tree ? fd.tree_rows() : (int) (fd.suffix.size() + max_path);
     }
 
+    plan.field_count          = fields.size();
+    plan.suffix_tokens        = suffix_tokens;
+    plan.common_suffix_tokens = plan_common.size();
+    plan.leaf_suffix_tokens   = leaf_suffix_tokens;
+    plan.rows                 = total;
+    plan.branches             = branches;
+    plan.p->plan_common       = std::move(plan_common);
+    return plan;
+}
+
+batch_result engine::decide_batch(const std::string & shared_text, const std::vector<std::string> & contexts,
+                                  const std::vector<field_input> & inputs, const options & opt) {
+    if (opt.mode != "auto" && opt.mode != "tree" && opt.mode != "greedy") {
+        throw std::invalid_argument("mode must be auto, tree or greedy");
+    }
+    if (contexts.empty()) {
+        throw std::invalid_argument("a decision needs at least one context");
+    }
+    select_fork(opt.fork);
+    stop_  = opt.should_stop;
+    yield_ = opt.yield;
+    audit_ = opt.audit;
+    llama_synchronize(ctx); // drain any work left by the previous decision before reusing sequences
+    check_cancel();
+    const tokens_t shared = tokenize(shared_text, true);
+    std::vector<tokens_t> prefixes;
+    for (const auto & text : contexts) {
+        prefixes.push_back(tokenize(text, shared.empty()));
+        if (prefixes.back().empty()) {
+            throw std::invalid_argument("the decision context must not be empty");
+        }
+    }
+
+    compiled_fields plan = compile_fields(inputs, opt);
+    if (plan.p == nullptr) {
+        throw std::runtime_error("the decision plan is empty");
+    }
+    const std::vector<decision_field> & fields          = plan.p->fields;
+    const std::vector<size_t> &         field_first     = plan.p->field_first;
+    const tokens_t &                    plan_common     = plan.p->plan_common;
+    const int                           total           = plan.rows;
+    const int                           branches        = plan.branches;
+    const size_t                        suffix_tokens   = plan.suffix_tokens;
+    const size_t                        leaf_suffix_tokens = plan.leaf_suffix_tokens;
+
     head_        = opt.head;
     head_active_ = false;
     head_reason_.clear();
-    if (head_ != nullptr) {
-        if (!head_->available()) {
-            head_reason_ = head_->reason.empty() ? "the selected answer head is unavailable" : head_->reason;
-        } else if (!llama_context_classifier_only(ctx)) {
-            head_reason_ = "the decision context does not expose hidden states";
-        } else if (llama_model_n_embd_out(model) != (uint32_t) head_->width) {
-            head_reason_ = "the answer-row width does not match the hidden state width";
-        } else {
-            // Only the tokens the scorer actually reads need a row: the tree's divergence nodes,
-            // or every token a greedy walk can land on.
-            bool covers = true;
-            for (const auto & fd : fields) {
-                if (fd.use_tree) {
-                    for (const auto & opts : fd.node_options) {
-                        if (!head_covers(opts)) {
-                            covers = false;
-                            break;
-                        }
-                    }
-                } else {
-                    for (const auto & p : fd.paths) {
-                        if (!head_covers(p)) {
-                            covers = false;
-                            break;
-                        }
-                    }
-                }
-                if (!covers) {
-                    break;
-                }
-            }
-            if (covers) {
-                head_active_ = true;
-            } else {
-                head_reason_ = "the answer head does not cover every candidate token";
-            }
+    if (opt.head != nullptr) {
+        if (select_scoring_head(plan, opt, &head_reason_)) {
+            head_active_ = true;
         }
+    }
+    // A classifier-only context produces hidden states, not logits, so scoring needs an answer
+    // head that covers every candidate. Reaching here without one is a caller error; fail before
+    // any decode instead of letting gather_candidates read a null logits buffer.
+    if (llama_context_classifier_only(ctx) && !head_active_) {
+        throw unsupported_error("a classifier-only decision context requires an answer head that covers every candidate");
     }
 
     // every trunk decodes its context plus the hoisted suffix head; branches start after it
@@ -836,6 +953,14 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
     const auto t0 = std::chrono::steady_clock::now();
     out.cache_hit = prepare_prefix(shared, opt.allow_cache, opt.cache_tag);
     out.prefill_ms += ms_since(t0);
+
+    // Every exit from here must leave the pool sequences empty: a failed or cancelled decision
+    // must not leave cells in the shared cache to starve chat decodes. The cached prefix on
+    // seq_snap is kept, so prefix cache reuse survives.
+    struct pool_cleanup {
+        engine * e;
+        ~pool_cleanup() { e->clear_pool_seqs(); }
+    } cleanup{this};
 
     // each context in a group holds one trunk sequence; the rest of the pool scores branches
     for (size_t g0 = 0; g0 < contexts.size(); g0 += per_group) {
@@ -947,8 +1072,8 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
             }
             first = false;
         }
+        clear_seqs(seq_pool, (int) n_group);
         for (size_t i = 0; i < n_group; ++i) {
-            llama_memory_seq_rm(mem, seq_pool + (llama_seq_id) i, -1, -1);
             result & r = out.items[g0 + i];
             r.context_tokens = prefixes[g0 + i].size();
             r.rows           = total;

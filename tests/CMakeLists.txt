@@ -201,7 +201,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         test-llama-archs
         NAME test-generate-models
         LABEL main
-        ARGS -o "${MODEL_DIR}"
+        ARGS -s 1234 -o "${MODEL_DIR}"
     )
     set_tests_properties(test-generate-models PROPERTIES
         FIXTURES_SETUP generate-models

@@ -1,5 +1,6 @@
 #include "decision-engine.h"
 #include "letter_readout.h"
+#include "decision-file-utils.h"
 
 #include "common.h"
 #include "json.h"
@@ -11,21 +12,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
-#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
 
-static std::string read_file(const std::string & path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        throw std::runtime_error("cannot read " + path);
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
-}
+using decision_file::read_file;
 
 static common_json load_fixture(const std::string & path) {
     return common_json::parse(read_file(path));

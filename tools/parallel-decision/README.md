@@ -155,34 +155,49 @@ distribution per question, with `output_tokens` always 0:
 ```json
 {"answers": {"refund": {"type": "noul", "noul": 0.99},
              "dept": {"type": "choice", "choice": "billing", "probabilities": {"billing": 0.9, "support": 0.1},
-                      "confidence": 0.9, "certainty": 0.53},
+                      "confidence": 0.53},
              "urgency": {"type": "score", "score": 1.6, "probabilities": {"0": 0.05, "1": 0.3, "2": 0.65},
                          "legend": {"0": "low", "1": "medium", "2": "high"},
-                         "confidence": 0.65, "certainty": 0.31}}}
+                         "confidence": 0.28}}}
 ```
 
+`instructions` is required and non-null on every question; choice keys and score levels keep object
+order, and each option line sent to the model is rendered by `format_option_line` (one function) as
+`label: <key> - <description>`, dropping the ` - ` and the description when the rendered description
+is empty. Unknown top-level request fields are ignored; unknown fields inside a question object are a 422.
+
+By default the response is the strict Jev envelope: `answers` plus
+`usage{input_tokens,output_tokens:0}`. Pass `"diagnostics": true` to additionally get `certainty`,
+the per-answer audit fields, the `head` and `diagnostics` objects, and the extra usage counters
+(`cached_tokens`, `state_cache_hit`, `head_mode`). The answers themselves are identical either way.
+
 Both shapes are served by `POST /v1/decision`, the canonical route. `POST /decision` is a deprecated
-alias for the same handler; use `/v1/decision`.
+alias for the same handler; use `/v1/decision`. `model` is optional and echoed back verbatim;
+`GET /v1/models` keeps the OpenAI list shape, not Jev's.
 
 ### Limits and errors
 
 | limit | value |
 |---|---|
-| questions per request | 1-256 |
-| options / levels per question | 2-64 |
-| `contexts` per legacy request | 1-256 |
-| request body | 2 MiB (override `LLAMA_DECISION_MAX_BODY`) |
-| concurrent decision requests | 4 (override `LLAMA_DECISION_MAX_QUEUE`), then 429/529 |
+| questions per request | `DECISION_MIN_QUESTIONS`-`DECISION_MAX_QUESTIONS` (1-256) |
+| `instructions` per question | required and non-null |
+| choice options per question | `DECISION_MIN_OPTIONS`-`DECISION_MAX_CHOICE_OPTIONS` (2-64) |
+| score levels per question | `DECISION_MIN_OPTIONS`-`DECISION_MAX_SCORE_LEVELS` (2-10) |
+| permutations (order de-bias passes) | 1 by default, capped at `DECISION_MAX_PERMUTATIONS` (8) |
+| answer-label pool | `LABEL_POOL_CAP` (64) |
+| `contexts` per legacy request | `DECISION_MAX_CONTEXTS` (256) |
+| request body | `decision_max_body` default 2 MiB (override `LLAMA_DECISION_MAX_BODY`) |
+| concurrent decision requests | `decision_max_queue` default 4 (override `LLAMA_DECISION_MAX_QUEUE`), then 429/529 |
 
 Error responses use `{"error": {"code", "message", "type"}}` and map to HTTP status:
 
 | status | type | when |
 |---|---|---|
-| 400 | `invalid_request_error` | malformed JSON, unknown field, bad `head` value, invalid type |
+| 400 | `invalid_request_error` | malformed JSON, bad `head` value, invalid value type |
 | 401 | `authentication_error` | missing or wrong API key |
 | 413 | `payload_too_large` | body over the configured cap |
 | 415 | `unsupported_media_type` | `Content-Type` is not `application/json` |
-| 422 | `invalid_request_error` | valid JSON, invalid semantics (empty state, too many options, label/tokenizer mismatch, request past the decision context budget) |
+| 422 | `invalid_request_error` | valid JSON, invalid semantics (empty state, unknown field inside a question, missing/non-null `instructions`, too many options, label/tokenizer mismatch, request past the decision context budget) |
 | 429 | `rate_limit_error` | decision queue full; `Retry-After: 1` |
 | 499 | `client_closed_request` | the client disconnected before the answer was ready |
 | 500 | `server_error` | unexpected internal failure |
@@ -205,7 +220,8 @@ The letter readout can score answer rows from the model's output table instead o
 whole vocabulary (`head: "selected"`, or `"auto"` to use it when available). It runs on a
 classifier-only context that shares the weights and stops at the post-norm hidden state. An arch is
 eligible only when its graph can stop there and its output table is a plain contiguous matrix
-(`llm_arch_supports_classifier`). If the model also carries a per-id output bias, that bias must be
+(`llama_model_classifier_supported`, the one capability predicate shared by the context guard, the
+row reader and this probe). If the model also carries a per-id output bias, that bias must be
 readable as a contiguous 1-D vector over the vocabulary; an unreadable bias makes the head
 unavailable instead of silently scoring without it. A zero bias is kept and adds zero; it is not
 treated as "no bias". `head: "auto"` falls back to full logits when the head is unavailable; an
@@ -213,12 +229,19 @@ explicit `head: "selected"` on an incompatible model is a 400.
 
 ### Usage and audit
 
-`usage` reports `input_tokens` (state + cached prefix), `output_tokens` (always 0, nothing is
-generated), `cached_tokens`, `state_cache_hit`, and `head_mode`. Every answer also carries additive
-audit fields: `answer_token_ids`, `option_logits`, `allowed_token_mass`,
-`full_vocab_argmax_id`, `prompt_sha256`, `prompt_version`, and `probability_status`. These are for
-inspection only; they never change an answer. The response also carries `diagnostics.contract_hash`
-(see below) and a `head` object describing the readout path.
+`usage` always reports `input_tokens` (state + cached prefix) and `output_tokens` (always 0, nothing
+is generated). With `"diagnostics": true` it also reports `cached_tokens`, `state_cache_hit`, and
+`head_mode`; every answer additionally carries the audit fields `answer_token_ids`,
+`option_logits`, `allowed_token_mass`, `full_vocab_argmax_id`, `prompt_sha256`, `prompt_version`,
+`probability_status`, and `certainty`, and the response carries `diagnostics.contract_hash` (see
+below) and a `head` object describing the readout path. These are for inspection only; they never
+change an answer, and they are omitted from the default envelope.
+
+`allowed_token_mass` and `full_vocab_argmax_id` are full-vocabulary measurements. When the answer
+head is selected (`head_mode: "selected"`), only the K answer rows are read, so those two fields are
+not measurable and are omitted instead of emitted as placeholder `1.0`/`-1` values. The answer-row
+fields (`option_logits`, `answer_token_ids`, `probability_status`) stay available in both modes;
+`head_mode` in `usage` says which one ran.
 
 ### Contract hash and diagnostics
 
@@ -239,12 +262,14 @@ Every parity and calibration claim is only valid under the backend flag set reco
 softmax. Temperature never changes the winner; it only changes how sharply the distribution
 is concentrated.
 
-`confidence` is `max(p)` and `certainty` is `1 - H/log(K)`. Both measure how concentrated the
-answer is. They are **not** calibrated correctness, and they are **not** accuracy. The
-probabilities are conditional on the options you supplied: if the right answer is not among
-them, the distribution still sums to 1 over the wrong set. Never gate admission, caching,
-routing or persistence on `confidence` or `certainty`, and never present them as probability
-of being correct.
+`confidence` is `1 - H/log(K)` (normalized inverse entropy) and `certainty` is `max(p)` (the
+winner's share). The entropy formula is a deliberate local choice, not Jev's documented shape
+(Jev derives Choice confidence from the winner's share, `(N*p_max - 1)/(N - 1)`), so do not claim
+parity for it. Both values measure how concentrated the answer is. They are **not**
+calibrated correctness, and they are **not** accuracy. The probabilities are conditional on the
+options you supplied: if the right answer is not among them, the distribution still sums to 1
+over the wrong set. Never gate admission, caching, routing or persistence on `confidence` or
+`certainty`, and never present them as probability of being correct.
 
 Admission is not part of this axis. `--decision-ctx-size` bounds the classifier context by token
 cells, and each request is accepted or rejected by its token footprint alone, never by
@@ -279,7 +304,7 @@ task: single-pass decision / classification over a supplied state
 readout: letter labels resolved at the framed answer tail (SentencePiece and BPE), or token-path trie (schema)
 context: shared prefix + one state per request; branches forked on a unified KV cache
 output: probability distributions only, output_tokens always 0, closed over the supplied options
-confidence: max(p) and 1 - H/log(K); concentration, NOT calibrated accuracy
+confidence: 1 - H/log(K); certainty: max(p); concentration, NOT calibrated accuracy
 calibration: deployment-specific; valid only under the recorded model, quantization, template hash and backend flags
 ```
 
@@ -287,6 +312,19 @@ calibration: deployment-specific; valid only under the recorded model, quantizat
 
 `llama-parallel-decision` runs the same engine from a worker process (stdin/stdout protocol, one JSON request per
 line). Environment: `DECIDE_TREE`, `DECIDE_TREE_MAX`, `DECIDE_NSEQ`, `DECIDE_SPLIT_BOUNDARY`.
+It is a developer tool and is off by default; build it with `-DLLAMA_BUILD_DECISION_CLI=ON`.
+
+## Developer benchmarks
+
+`bench-decision` is also a developer tool (off by default; `-DLLAMA_BUILD_DECISION_BENCH=ON`).
+A local timing run with your own model looks like this:
+
+```bash
+cmake -B build -DLLAMA_BUILD_DECISION_BENCH=ON && cmake --build build --target bench-decision -j
+./build/bin/bench-decision --model <your-model.gguf> \
+  --fixture tests/fixtures/decision/contexts_schema.request.json \
+  --mode auto,tree,greedy --allow_cache true,false --json
+```
 
 ## A UI for it
 

@@ -1,6 +1,6 @@
-## What the _decision_synthesis_2 branch is really trying to do:
+## What the /v1/decision endpoint is really trying to do:
 
-At its core, the branch adds a new kind of query to llama-server:
+At its core, this work adds a new kind of query to llama-server:
 /v1/decision, which is not "generate text" but "pick an answer from a fixed
 list." Instead of asking the model to produce a sentence, you hand it a JSON
 object — a state (the situation being judged) and a set of questions, each
@@ -10,8 +10,9 @@ returns probabilities, e.g.  "this ticket is 92% a refund question."
 
 The request has two mutually exclusive shapes (a body using both is a 422).
 The primary "state + questions" shape carries a `state` and a `questions`
-map; each question is typed `noul` (true/false), `choice` (pick one of 2-64
-options), or `score` (pick a 0..K-1 level), and the server scores one
+map; each question carries required `instructions` and is typed `noul`
+(true/false), `choice` (pick one of 2-64 options), or `score` (pick a 0..K-1
+level on a 2-10 scale), and the server scores one
 next-token choice over verified single-token letter labels, sharing one
 framed state prefix across all questions.  The legacy "contexts + schema"
 shape supplies a JSON Schema and a list of contexts and walks the schema's
@@ -21,7 +22,7 @@ so no one fixed ordering biases the scores.
 
 This is classification-style work — routing, triage, RAG ranking, structured
 extraction — where you care about which option wins, not about fluent prose. 
-The whole branch is an attempt to make that cheap and deterministic, in
+The whole feature is an attempt to make that cheap and deterministic, in
 three ways:
 
 1.  One batched forward pass instead of many.  The engine lays out every
@@ -65,10 +66,16 @@ and is only honored when the file's recorded provenance (model, quantization,
 template hash, backend flags) matches the running configuration — a stale
 profile is a server configuration error, never silently applied.  The
 contract identity can be pinned with `--decision-contract HASH`; a mismatch
-refuses the decision path.  Every response carries additive `diagnostics`
-(contract_hash, prompt_version, timings, and the provenance of the readout)
-and, when enabled, an audit trail, so callers can see exactly how an answer
-was produced.  The classifier-only context can be bounded with
+refuses the decision path.  The default response is the strict Jev envelope
+(`model`, `answers`, `usage` with only input/output tokens); passing
+`"diagnostics": true` adds the `head` object, the `diagnostics` identity
+(contract_hash, prompt_version, timings, and the provenance of the readout),
+`certainty`, and the per-answer audit trail, so callers can see exactly how an
+answer was produced without changing the answers themselves.  Because the
+selected answer head reads only the K answer rows, the full-vocabulary audit
+fields `allowed_token_mass` and `full_vocab_argmax_id` are omitted under
+`head_mode: "selected"` rather than reported as placeholder values; the
+answer-row fields stay available.  The classifier-only context can be bounded with
 `--decision-ctx-size N`; a request whose peak KV use does not fit is rejected
 with 422 before anything is decoded.
 
@@ -86,14 +93,17 @@ like this:
 - A dedicated snapshot sequence holds the static prefix (system prompt +
 chat template up to the question).  It persists across requests, so a repeat
 request with the same prefix is a cache hit: the prefix is never re-decoded. 
+
 - Each trunk sequence forks off the snapshot (shares its cells) and decodes
-one context (the state) plus a common suffix head.  - Each branch sequence
-forks off its trunk and decodes only its own unique tail — the few tokens
-that distinguish one candidate answer from another — writing only those new
-cells into the shared pool.  - At the scored position, the engine reads one
-output row per branch, so the whole request is served by: one prefix decode
-(on first use), one decode per context, and one batched decode for the
-branch tails.
+one context (the state) plus a common suffix head.
+
+- Each branch sequence forks off its trunk and decodes only its own unique tail
+  — the few tokens that distinguish one candidate answer from another — writing
+  only those new cells into the shared pool.
+
+- At the scored position, the engine reads one output row per branch, so the
+  whole request is served by: one prefix decode (on first use), one decode per
+  context, and one batched decode for the branch tails.
 
 The classifier-only context used by the letter readout has its own separate
 KV cache, entirely disjoint from the chat context's cache.  Because it has no
@@ -109,16 +119,20 @@ new KV cells, exactly like generation would.  But the branch is careful
 about whose cache it touches and what survives:
 
 - On the classifier-only context, decision KV lives in that dedicated
-context and never touches chat.  - On the shared chat context (the legacy
-path, or the letter readout's fallback), decisions write into the same
-unified pool as chat, but into reserved sequence ids above the chat slots
-(n_parallel ..  n_parallel + n_seq_decision), so chat's slots and their KV
-are never overwritten.  - After scoring, the engine removes the branch and
-trunk sequences (llama_memory_seq_rm), reclaiming their cells.  Only the
-snapshot sequence's prefix survives, so the next matching query can reuse
-it.  - A preflight check estimates peak KV use and returns 422 rather than
-ever partially overwriting the cache, and a cancelled request leaves the
-pool dirty but the next decision clears it before reuse.
+context and never touches chat.
+
+  - On the shared chat context (the legacy path, or the letter readout's
+    fallback), decisions write into the same unified pool as chat, but into
+    reserved sequence ids above the chat slots (n_parallel ..  n_parallel +
+    n_seq_decision), so chat's slots and their KV are never overwritten.
+
+  - After scoring, the engine removes the branch and trunk sequences
+    (llama_memory_seq_rm), reclaiming their cells.  Only the snapshot
+    sequence's prefix survives, so the next matching query can reuse it.
+
+  - A preflight check estimates peak KV use and returns 422 rather than ever
+    partially overwriting the cache, and a cancelled request leaves the pool
+    dirty but the next decision clears it before reuse.
 
 So the short answer: decisions do update the KV cache, but transiently, in a
 reserved range, with a separate cache on the fast path, and with
@@ -152,14 +166,13 @@ reply from the same model would take roughly an order of magnitude longer.
 normal generation;
 
 - the async state restore turns per-tensor synchronous copies into one
-staged stream drain (the branch's commit log claims ~4x on this operation);
-and
+staged stream drain (measured ~4x on this operation); and
 
 - prefix caching removes the prefill cost on repeat calls.
 
-One honest caveat the branch itself documents: these are warm timings with a
+One honest caveat documented with the numbers: these are warm timings with a
 cached prefix, on a specific GPU, and with flash attention disabled on ROCm
 because it is not bit-reproducible.  The low head-vs-full variation and
 matching winners are the meaningful "is the fast path trustworthy?" signal —
 and note that's an outcome-correctness check, separate from the determinism
-caveats the branch's test suite carries on weaker quantized models.
+caveats the test suite carries on weaker quantized models.

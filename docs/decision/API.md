@@ -1,13 +1,11 @@
 # Jev-Compatible Decision API (`/v1/decision`) - Introduction and Specification
 
-Date: 2026-09-22
-
 Audience: a human or AI coder meeting this project for the first time. Read
 Section 0 first: it fixes the endpoint name, defines every term used later,
 and (Section 0.6) introduces the technical challenges of serving this API
 inside llama.cpp. Sections 1 onward are the contract.
 
-Status: implemented on branch `_decision_synthesis_2`. A passage marked
+Status: implemented. A passage marked
 DEFERRED is not built here; nothing is currently deferred.
 
 The endpoint naming is the one deliberate difference from Jev, and it is
@@ -62,11 +60,10 @@ the client dials. The three question primitives are:
 - `score` - a rating on an ordered scale (`score` + `legend` + `probabilities`
   + `confidence`).
 
-### 0.3 What this repository is and which branch this is
+### 0.3 What this repository is and where the feature lives
 
 This is `llama.cpp`, a C/C++ inference engine for GGUF-quantized LLMs. The
-relevant local branch is `_decision_synthesis_2`. The decision feature is these
-files:
+decision feature is these files:
 
 - engine (`tools/parallel-decision/decision-engine.{h,cpp}`, namespace
   `llama_decision`): the fork/score substrate shared by both readouts.
@@ -86,19 +83,19 @@ files:
 - tests: `tests/test-decision-engine.cpp`, `tools/server/tests/test_decision_*.py`,
   and the recorded baselines under `tests/decision-baseline/`.
 
-The `winnow` decision code (its own `/v1/systemone` service, classifier head,
-exclusive mode) is NOT on this branch; it lives on branch `_winnow` and is
-reference material only. Do not assume `tools/server/winnow/` exists.
+A separate experimental decision service (its own `/v1/systemone` route,
+classifier head, exclusive mode) is not part of this work; it is reference
+material only.
 
 ### 0.4 As-built map in one table
 
-What a fresh reader can rely on for this branch:
+What a fresh reader can rely on:
 
-| Area | As built on `_decision_synthesis_2` |
+| Area | As built |
 |---|---|
 | Routes | `POST /v1/decision` canonical; `POST /decision` deprecated alias; no `/v1/systemone` |
 | Request | both shapes: Jev `state` + `questions`, and generic `contexts[]` + `schema` |
-| Response | Jev `{model, answers{qid}, usage}` + additive `head` and `diagnostics`; generic `{object:"decision", results:[...], usage, timings}` |
+| Response | default Jev `{model, answers{qid}, usage{input_tokens, output_tokens}}`; `head`, `diagnostics`, per-answer audit, `certainty`, and extra usage counters only with `diagnostics: true`; generic `{object:"decision", results:[...], usage, timings}` |
 | Readout | dual: letter labels (Jev) and surface-form trie (generic), one engine and one softmax |
 | Errors | full contract in Section 4 (400/401/413/415/422/429/499/500/501/529) |
 | Fork | probe: copy fast path (`llama_memory_seq_cp`) or `llama_state_seq` save/restore on hybrid/recurrent memory; SWA clamp |
@@ -106,7 +103,7 @@ What a fresh reader can rely on for this branch:
 | Temperature | `temperature` + `temperatures{}` with optional provenance; `T=1.0` default |
 | Order de-bias | `permutations` (default 1, capped 8) |
 | Admission | body cap (413), queue cap (429/529 + `Retry-After`), cancel (499), cooperative yield |
-| Audit | `allowed_token_mass`, `full_vocab_argmax_id`, `answer_token_ids`, `option_logits`, `prompt_sha256`, `prompt_version`, `probability_status` |
+| Audit | `allowed_token_mass`, `full_vocab_argmax_id`, `answer_token_ids`, `option_logits`, `prompt_sha256`, `prompt_version`, `probability_status`; emitted only with `diagnostics: true`; the two full-vocab fields are omitted under the selected head (Section 3.1) |
 | Provenance | contract hash (tokenizer + template + label code), logged and returned |
 | Mode | `auto`/`tree`/`greedy`, `tree_max`, `cache_prompt` for the trie path |
 | Head | selected-head fast path (Section 6.1): classifier-only graph + answer-row dot product; `auto`/`selected`/`full`; falls back to full logits unless `selected` is forced and unavailable |
@@ -181,8 +178,8 @@ in the order a newcomer meets them:
 
 5. **Closed-world probabilities, and honesty about them.** The distribution is
    conditional on the options the caller supplied; it does not express the
-   chance that every option is wrong. `confidence = max(p)` and
-   `certainty = 1 - H/log(K)` measure concentration, not accuracy. They are
+   chance that every option is wrong. `confidence = 1 - H/log(K)` and
+   `certainty = max(p)` measure concentration, not accuracy. They are
    never allowed to gate admission, caching, routing, or persistence.
 
 6. **Set it inside a chat server that must keep working.** The same loaded
@@ -249,8 +246,10 @@ corrupt chat KV state; see Section 6.1.
 
 Content-Type: `application/json`. Body limit: 2 MiB default
 (`LLAMA_DECISION_MAX_BODY`; winnow used 32 MiB, 2 MiB matches openjev-sglang
-and is sufficient - raise only deliberately). `extra=forbid` (strict schema):
-reject unknown top-level or per-question fields.
+and is sufficient - raise only deliberately). Unknown top-level fields are
+tolerated and ignored for forward compatibility. Unknown fields inside a
+question object are still rejected (a misspelled `question`/`criteria` must not
+silently default).
 
 ```json
 {
@@ -261,7 +260,8 @@ reject unknown top-level or per-question fields.
   },
   "temperature": 1.0,
   "temperatures": {"noul": 1.0, "choice": 1.0, "score": 1.0},
-  "permutations": 1
+  "permutations": 1,
+  "diagnostics": false
 }
 ```
 
@@ -297,12 +297,24 @@ reject unknown top-level or per-question fields.
   the answer-head fast path (Section 6.1). The default path uses the head when
   it is available and silently falls back to full logits otherwise; an explicit
   `head: "selected"` on an unavailable head is a client error (400).
+* `diagnostics` (optional, bool, default `false`): when `true`, the response
+  additionally carries the `head` object, the `diagnostics` object, per-answer
+  audit fields, `certainty`, and the extra `usage` counters
+  (`cached_tokens`, `state_cache_hit`, `head_mode`). The default `false` keeps
+  the response to the strict Jev envelope (Section 3).
+
+Local-only notes: `model` is optional here and echoed back verbatim; Jev
+requires it. `GET /v1/models` keeps the OpenAI model-list shape
+(`{"object":"list","data":[...]}`), not Jev's `{"models":[...]}` shape.
 
 ### 2.2 Question types (canonical names)
 
 Accept `bool` as an alias for `noul` and `scale` as an alias for `score` on
 INPUT; always emit canonical `noul`/`choice`/`score` on output.
 
+* `instructions` REQUIRED and non-null on all three types (string, object, or
+  array); a question with null or missing `instructions` is a 422 naming
+  `instructions`.
 * `noul`: binary judgment.
   `criteria` optional: `{"true": "desc", "false": "desc"}` (descriptions may
   be strings; treat missing as null desc). Internally two options
@@ -311,17 +323,27 @@ INPUT; always emit canonical `noul`/`choice`/`score` on output.
   `criteria` REQUIRED: object `{key: desc|null}`, 2-64 entries, keys in object
   order. Model sees description, or key when null. Answer uses the KEY.
 * `score`: ordered rating, zero-based.
-  `criteria` REQUIRED: ordered array of 2-64 level descriptions, low -> high
+  `criteria` REQUIRED: ordered array of 2-10 level descriptions, low -> high
   (equivalently `{"0": desc, ...}` legend dict on input). Model sees each
   level; answer is the expected index.
 
-Validation limits: `noul` fixed 2 options; `choice`/`score` 2-64 options
-(letter-mode cap; trie-mode generic schemas allow up to 255 values/field -
-Section 6.1). Option IDs/keys unique. Reject over-limit; NEVER truncate.
-Reject empty `criteria` where required, and `instructions==null && !criteria`.
+Validation limits: `noul` fixed 2 options; `choice`
+`DECISION_MIN_OPTIONS`-`DECISION_MAX_CHOICE_OPTIONS` (2-64); `score`
+`DECISION_MIN_OPTIONS`-`DECISION_MAX_SCORE_LEVELS` (2-10); questions
+`DECISION_MIN_QUESTIONS`-`DECISION_MAX_QUESTIONS` (1-256); permutations capped
+at `DECISION_MAX_PERMUTATIONS` (8); the answer-label pool is `LABEL_POOL_CAP`
+(64). `choice` and `score` limits are the letter-mode caps; trie-mode generic
+schemas allow up to 255 values/field - Section 6.1. Option IDs/keys unique.
+Reject over-limit; NEVER truncate. Reject empty `criteria` where required.
 Structured `instructions`/`criteria` values are rendered into the prompt,
 never silently stringified; `legend` echoes the ORIGINAL structured values so
 they round-trip.
+
+Each option line is rendered by `format_option_line` (one function) as
+`label: <key> - <description>`, where the label is the single letter the model
+answers with; when the rendered description is empty the line is
+`label: <key>` only (no trailing separator). Keys are `false`/`true` for noul,
+the option names for choice, and `"0".."K-1"` for score.
 
 ### 2.3 Generic-schema request (trie mode)
 
@@ -350,6 +372,8 @@ selects the trie readout. Never mix both in one call.
 
 ## 3. Response specification
 
+The default response is exactly the Jev envelope:
+
 ```json
 {
   "model": "<echo>",
@@ -357,11 +381,21 @@ selects the trie readout. Never mix both in one call.
     "<qid>": {"type": "noul", "noul": 0.0-1.0}
             | {"type": "choice", "choice": "<key>",
                "probabilities": {"<key>": p, ...},
-               "confidence": c, "certainty": c}
+               "confidence": c}
             | {"type": "score", "score": 0.0-(K-1),
                "probabilities": {"0": p, ...}, "legend": {"0": "desc", ...},
-               "confidence": c, "certainty": c}
+               "confidence": c}
   },
+  "usage": {"input_tokens": N, "output_tokens": 0}
+}
+```
+
+With `diagnostics: true` the same answers are returned with additive fields:
+`certainty` on choice/score, the per-answer audit fields, the `head` and
+`diagnostics` objects, and the extra `usage` counters:
+
+```json
+{
   "usage": {"input_tokens": N, "output_tokens": 0,
             "cached_tokens": M, "state_cache_hit": true|false,
             "head_mode": "selected"|"full"}
@@ -377,25 +411,39 @@ selects the trie readout. Never mix both in one call.
 * `score.score = sum(i * p_i)` (expected zero-based index, float in
   [0, K-1]); `probabilities` keys are STRINGS `"0".."K-1"`; `legend` echoes
   input criteria in order with string keys.
-* `confidence = max(p)` (decider convention).
-* `certainty = 1 - H(p)/log(K)`, `H = -sum p log p` (reflex/openjev/winnow
-  convention). Return BOTH on `choice` and `score` - this dual field is the
-  compat fix: decider clients read `confidence`, reflex clients read
-  normalized inverse entropy. Clamp to [0,1].
+* `confidence = 1 - H(p)/log(K)`, `H = -sum p log p` (normalized inverse
+  entropy). This is a deliberate LOCAL choice, not Jev's documented
+  distribution shape: Jev's Choice confidence is derived from the winner's
+  share, `(N*p_max - 1)/(N - 1)`, and its Score confidence above 3 levels is
+  undocumented. Do not claim parity for this formula. Clamp to [0,1].
+* `certainty = max(p)` (the winner's share). Both are returned on `choice` and
+  `score` when `diagnostics` is true; `confidence` is always returned. Both
+  measure concentration of the answer distribution; they are not calibrated
+  correctness and never gate admission, caching, routing, or persistence.
 * `probabilities` are CONDITIONAL on the supplied options
   (`probability_status: "conditional option score; uncalibrated as decision
   confidence"`). `confidence`/`certainty` measure CONCENTRATION, not
   correctness. Document this in every model card and API doc.
 * `usage.output_tokens` MUST be 0 (warmup/branch tokens are accounting-only).
   `usage.input_tokens` includes cache hits + warmup and counts a shared prefix
-  ONCE. `cached_tokens` and `state_cache_hit` expose prefix-cache behavior.
-* The response always carries two additive objects beyond the frozen Jev shape.
-  `head` reports how the answer was read out (`mode: selected|full`, `fallback`,
-  and a `reason` when it fell back). `diagnostics` reports the readout identity
-  (`contract_hash`, `prompt_version`, `model`, `quantization`,
-  `template_hash`, `backend_flags`) and timings (`prefill_ms`, `scoring_ms`,
-  `suffix_tokens`, `common_suffix_tokens`). These are additive and never change
-  an answer.
+  ONCE. The default `usage` carries only `input_tokens` and `output_tokens`;
+  with `diagnostics: true` it also carries `cached_tokens` and
+  `state_cache_hit`, which expose prefix-cache behavior, and `head_mode`.
+* When `diagnostics: true`, the response carries two additive objects beyond the
+  frozen Jev shape. `head` reports how the answer was read out
+  (`mode: selected|full`, `fallback`, and a `reason` when it fell back).
+  `diagnostics` reports the readout identity (`contract_hash`, `prompt_version`,
+  `model`, `quantization`, `template_hash`, `backend_flags`), the adapter scope
+  (`adapters_configured`, `adapter_scope`), and timings (`prefill_ms`,
+  `scoring_ms`, `suffix_tokens`, `common_suffix_tokens`). These are additive and
+  never change an answer. The default response omits all of them.
+* Audit availability depends on the readout. `allowed_token_mass` and
+  `full_vocab_argmax_id` are full-vocabulary measurements; under
+  `head_mode: "selected"` only the K answer rows are read, so those two fields
+  are OMITTED (never emitted as placeholder `1.0`/`-1` values). `option_logits`,
+  `answer_token_ids`, and `probability_status` are available under both the
+  selected head and full logits. `usage.head_mode` and the `head` object report
+  which readout ran.
 
 ### 3.2 Worked example
 
@@ -412,7 +460,7 @@ Request:
                "criteria": ["low", "medium", "high"]}}}
 ```
 
-Response:
+Response (default envelope):
 
 ```json
 {"model": "qwen3-4b",
@@ -420,14 +468,30 @@ Response:
    "refund": {"type": "noul", "noul": 0.9995},
    "dept": {"type": "choice", "choice": "billing",
             "probabilities": {"billing": 0.9999, "support": 0.0001},
-            "confidence": 0.9999, "certainty": 0.99},
+            "confidence": 0.999},
    "urgency": {"type": "score", "score": 1.66,
                "probabilities": {"0": 0.08, "1": 0.18, "2": 0.74},
                "legend": {"0": "low", "1": "medium", "2": "high"},
-               "confidence": 0.74, "certainty": 0.35}},
+               "confidence": 0.33}},
+ "usage": {"input_tokens": 412, "output_tokens": 0}}
+```
+
+The same request with `"diagnostics": true` keeps the answers byte-identical
+and adds `certainty`, the audit fields, the `head`/`diagnostics` objects, and
+the extra usage counters:
+
+```json
+{"model": "qwen3-4b",
+ "answers": {
+   "dept": {"type": "choice", "choice": "billing",
+            "probabilities": {"billing": 0.9999, "support": 0.0001},
+            "confidence": 0.999, "certainty": 0.9999,
+            "probability_status": "conditional option score; uncalibrated as decision confidence"}},
  "usage": {"input_tokens": 412, "output_tokens": 0,
            "cached_tokens": 180, "state_cache_hit": false,
-           "head_mode": "selected"}}
+           "head_mode": "selected"},
+ "head": {"mode": "selected", "fallback": false},
+ "diagnostics": {"contract_hash": "...", "adapters_configured": false, "adapter_scope": "base"}}
 ```
 
 ---
@@ -437,10 +501,12 @@ Response:
 `handle_decision` (`tools/server/server-context.cpp`) distinguishes the error
 classes by exception type, and the server maps each through
 `format_error_response` (`tools/server/server-common.cpp`) to an HTTP status.
-Malformed JSON and unknown fields are 400; well-formed but semantically invalid
-decision content is 422; over-limit capacity is 413 or 422; a full queue is 429
-or 529 with `Retry-After`; a cancel or client disconnect is 499; an unavailable
-model (no usable labels, contract mismatch) is 501. The full contract follows.
+Malformed JSON and unusable values/types are 400; well-formed but semantically
+invalid decision content is 422 (including an unknown field inside a question
+object); unknown top-level fields are ignored; over-limit capacity is 413 or
+422; a full queue is 429 or 529 with `Retry-After`; a cancel or client
+disconnect is 499; an unavailable model (no usable labels, contract mismatch)
+is 501. The full contract follows.
 
 ### 4.1 Full target error contract
 
@@ -452,7 +518,7 @@ model (no usable labels, contract mismatch) is 501. The full contract follows.
 | 404 | `not_found_error` | unknown model/route | in router mode the decision route follows the existing proxy behavior, like the other routes |
 | 413 | `payload_too_large` | request body over the configured cap | must reject before decode |
 | 415 | `unsupported_media_type` | `Content-Type` is not `application/json` | enforced by the shared HTTP layer |
-| 422 | `invalid_request_error` (semantic) | valid JSON but invalid decision schema: bad question type, 0/257 questions, 1/65 options, duplicate keys, missing required `criteria`, unknown fields | Jev semantic-failure code; never downgrade to 400 |
+| 422 | `invalid_request_error` (semantic) | valid JSON but invalid decision schema: bad question type, 0/257 questions, 1/65 options, 1 or 11+ score levels, duplicate keys, missing `instructions`, missing required `criteria`, unknown field inside a question | Jev semantic-failure code; never downgrade to 400. Unknown top-level fields are ignored, not rejected |
 | 429 | `rate_limit_error` | decision queue full | include `Retry-After` |
 | 499 | `client_closed_request` | client disconnected / cancelled mid-evaluation | cancel siblings; never report as a normal answer |
 | 500 | `server_error` | inference/engine failure | reset engine state |
@@ -498,7 +564,7 @@ Notes:
 | Approach | Prompt | Readout | Parallelism | Calibration | Model scope |
 |---|---|---|---|---|---|
 | `_codacus_parallel_decision` (substrate of this branch) | chat template + sentinel; shared head + per-context tail; suffix + common-prefix split | surface-form TRIE (exact tree <= tree_max else greedy); never generates | `seq_cp` fork, unified KV, `--decision-seqs` pool, grouped waves | exact distribution (tree); path-product (greedy) | any decoder LLM |
-| `_winnow` (llama.cpp branch) | framed state + per-question suffix ending `Answer:` | single-token LETTERS + selected-head projection + softmax; `confidence=1-H/logK` | shared-prefix KV, cross-Q dedup, bounded-SWA reclaim, exclusive suspend/restore | none (T=1.0); concentration only | Gemma-4 only, GPU only, merged adapter |
+| `exclusive classifier` (separate experimental service) | framed state + per-question suffix ending `Answer:` | single-token LETTERS + selected-head projection + softmax; `confidence=1-H/logK` | shared-prefix KV, cross-Q dedup, bounded-SWA reclaim, exclusive suspend/restore | none (T=1.0); concentration only | Gemma-4 only, GPU only, merged adapter |
 | reflex (transformers + SGLang) | ChatML evidence prefix + `# Criterion/# Options/Respond with only letter` | single-token letters, restricted softmax/T | prefix LRU + packed mask (attn-only) or batched SGLang fanout (`token_ids_logprob`) | per-primitive T (post-hoc); 2-permutation averaging | frozen Qwen 4B/27B |
 | decider (custom CUDA + vLLM check) | plain `Context:/Question/Options/Answer:(` | slot hidden state x `lm_head[letter_ids]`, `A-J` narrow / `A-Z+AA..` wide to 255 | `score_shared` LCP-once + `reorder_cache` fork; micro-batched graphs | CE fine-tune + T=1.30 + RL consistency | trained Mapika 2B/35B |
 | SemIf (`semif_phase1`, torch/MLX/llamacpp) | system + JSON `{evidence,criterion,options[{letter,desc}]}` | full-vocab last-pos logits, gather A-P slots | serial save/restore; shared prefill + batched suffixes | offline per-workload T only | Qwen3.5 + GGUF verify |
@@ -573,6 +639,16 @@ This is what the branch implements. Every bullet below is as-built.
   serving paths MUST NOT be required. When the fast head path is explicitly
   requested with incompatible adapters/speculative settings, return 400 with a
   plain message rather than silently degrading.
+* Adapter scope (stated behavior change): the decision decode always answers
+  for the BASE model. Before every decision decode the server detaches the
+  adapters from the serving context; the next chat batch re-applies its own
+  set, so chat is unaffected. With adapters configured on the server (any
+  registered adapter with a non-zero scale), the answer head cannot serve the
+  adapted model, so `head: "selected"` returns 400, the default `head` reads
+  full logits on the base scope and reports why it fell back, and
+  `head: "full"` is unchanged. `diagnostics` reports `adapters_configured` and
+  `adapter_scope: "base"` on every decision answer. Without adapters the
+  behavior is byte-identical to the head selection described above.
 * Tokenizer gates (from SemIf `llamacpp_backend.py:186-207`): GGUF
   tokenization MUST equal the reference encoding (`encode_verified`), plus a
   startup vocabulary probe (all label letters single shared tokens).
@@ -667,12 +743,13 @@ Rules:
 
 ## 8. Minimal implementation checklist (any back-end)
 
-Status on `_decision_synthesis_2`: items 1-7 and 9, 11, 12 are implemented;
+Status: items 1-7 and 9, 11, 12 are implemented;
 item 8 is implemented except the optional latency headers; item 10 ships the
 permutation option but not an offline refit script.
 
-1. Strict validator: state non-empty; 1-256 questions; 2-64 options;
-   unique IDs/keys; `bool`/`scale` aliases accepted; over-limit rejects.
+1. Strict validator: state non-empty; 1-256 questions; `instructions`
+   required and non-null; choice 2-64 options, score 2-10 levels; unique
+   IDs/keys; `bool`/`scale` aliases accepted; over-limit rejects.
 2. Prompt renderer + marker-survival assert + `safe_data` escaping + exact
    assistant-boundary id assertion.
 3. Label pool builder (single-token + round-trip + unique + non-special)
@@ -681,12 +758,13 @@ permutation option but not an offline refit script.
    save/restore; never mutate prefix).
 5. Single-token readout: gather K logits, `softmax(logits/T_type)`,
    `noul=P(true)`, `choice=argmax`, `score=sum i*p_i`,
-   `confidence=max_p`, `certainty=1-H/logK`.
+   `confidence=1-H/logK`, `certainty=max_p`.
 6. (If generic schemas:) trie scorer with `tree_max`/greedy fallback +
    numeric aggregates.
 7. Assembler (code, not decode) + canonical answer envelope + `legend`
-   with string keys + `usage{input_tokens,output_tokens:0,
-   cached_tokens,state_cache_hit}`.
+   with string keys + `usage{input_tokens,output_tokens:0}`; the extra
+   counters (`cached_tokens`, `state_cache_hit`, `head_mode`) and the
+   additive fields appear only with `diagnostics: true`.
 8. Errors (400/401/403/404/413/422/429/499/500/501/503/529), `Retry-After`,
    abort-on-cancel, latency headers.
 9. Tokenizer/vocab gates + `prompt_sha256` audit + contract hash.

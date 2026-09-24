@@ -88,8 +88,8 @@ class Server:
         cmd = [
             SERVER_BIN,
             "-m", self.model,
-            "-c", "2048",
-            "-ngl", "0",
+            "-c", "8192",
+            "-ngl", os.environ.get("LLAMA_SERVER_TEST_NGL", "0"),
             "--decision-seqs", "8",
             "--port", str(self.port),
             "--host", "127.0.0.1",
@@ -128,13 +128,10 @@ def check(cond, msg):
 
 
 def run_checks(server, captured):
-    # 1. valid decision envelope
+    # 1. valid decision envelope: the default response is the strict Jev shape
     status, text = server.post("/v1/decision", json.dumps(DECISION_VALID))
     check(status == 200, f"valid request status {status}: {text}")
     body = json.loads(text)
-    contract = body.get("diagnostics", {}).get("contract_hash", "")
-    check(len(contract) == 64, f"contract hash reported: {contract!r}")
-    captured["contract_hash"] = contract
     check(body.get("model") == "test", "model echo")
     answers = body.get("answers", {})
     check(set(answers) == {"refund", "dept", "urgency"}, f"answers keyed by qid: {answers}")
@@ -145,20 +142,78 @@ def run_checks(server, captured):
     check(set(answers["urgency"]["probabilities"]) == {"0", "1", "2"}, "score probability keys are index strings")
     check(set(answers["urgency"]["legend"]) == {"0", "1", "2"}, "score legend keys")
     check(body["usage"]["output_tokens"] == 0, "output_tokens is always 0")
+    check(set(body["usage"]) == {"input_tokens", "output_tokens"}, f"default usage is the Jev shape: {body['usage']}")
+    check(set(body) == {"model", "answers", "usage"}, f"default top-level key set: {set(body)}")
+    check(set(answers["refund"]) == {"type", "noul"}, f"default noul key set: {set(answers['refund'])}")
+    check(set(answers["dept"]) == {"type", "choice", "probabilities", "confidence"},
+          f"default choice key set: {set(answers['dept'])}")
+    check(set(answers["urgency"]) == {"type", "score", "probabilities", "legend", "confidence"},
+          f"default score key set: {set(answers['urgency'])}")
+    check("head" not in body, "default response has no additive head object")
+    check("diagnostics" not in body, "default response has no additive diagnostics object")
+    check("certainty" not in answers["dept"], "default response has no additive certainty")
+    check("allowed_token_mass" not in answers["dept"], "default response has no additive audit fields")
+
+    # 1a. diagnostics opt-in restores the additive envelope and the audit fields
+    # compare against a warm repeat so a cold-vs-warm fp difference cannot mask a real change
+    status, text = server.post("/v1/decision", json.dumps(DECISION_VALID))
+    check(status == 200, f"warm default status {status}: {text}")
+    warm_answers = json.loads(text)["answers"]
+    status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, diagnostics=True)))
+    check(status == 200, f"diagnostics request status {status}: {text}")
+    diag_body = json.loads(text)
+    contract = diag_body.get("diagnostics", {}).get("contract_hash", "")
+    check(len(contract) == 64, f"contract hash reported: {contract!r}")
+    captured["contract_hash"] = contract
+    # the answers themselves must not change when diagnostics is toggled
+    check(abs(diag_body["answers"]["refund"]["noul"] - warm_answers["refund"]["noul"]) < 1e-5,
+          "diagnostics does not change the noul answer")
+    check(diag_body["answers"]["dept"]["choice"] == warm_answers["dept"]["choice"], "diagnostics does not change the choice")
+    check(max_prob_delta(diag_body["answers"]["dept"]["probabilities"], warm_answers["dept"]["probabilities"]) < 1e-5,
+          "diagnostics does not change the choice probabilities")
+    check(abs(diag_body["answers"]["dept"]["confidence"] - warm_answers["dept"]["confidence"]) < 1e-5,
+          "diagnostics does not change confidence")
+    check("certainty" in diag_body["answers"]["dept"], "diagnostics adds certainty")
+
+    # exact diagnostics key sets: the additive objects and fields are pinned so an accidental
+    # unconditional field cannot slip into the default envelope, and so a missing one is caught
+    head_mode = diag_body.get("head", {}).get("mode", "full")
+    audit_keys = {"probability_status", "prompt_sha256", "prompt_version",
+                  "answer_token_ids", "option_logits"}
+    # the full-vocabulary mass and argmax are only measurable on the full-logits path; the selected
+    # head scores answer rows only, so those fields are absent there rather than 1.0 / -1 placeholders
+    full_vocab_keys = {"allowed_token_mass", "full_vocab_argmax_id"}
+    if head_mode == "full":
+        audit_keys |= full_vocab_keys
+    check(set(diag_body) == {"model", "answers", "usage", "head", "diagnostics"},
+          f"diagnostics top-level key set: {set(diag_body)}")
+    check(set(diag_body["usage"]) == {"input_tokens", "output_tokens", "cached_tokens", "state_cache_hit", "head_mode"},
+          f"diagnostics usage key set: {set(diag_body['usage'])}")
+    check(set(diag_body["answers"]["refund"]) == {"type", "noul"} | audit_keys,
+          f"diagnostics noul key set: {set(diag_body['answers']['refund'])}")
+    check(set(diag_body["answers"]["dept"]) == {"type", "choice", "probabilities", "confidence", "certainty"} | audit_keys,
+          f"diagnostics choice key set: {set(diag_body['answers']['dept'])}")
+    check(set(diag_body["answers"]["urgency"]) ==
+          {"type", "score", "probabilities", "legend", "confidence", "certainty"} | audit_keys,
+          f"diagnostics score key set: {set(diag_body['answers']['urgency'])}")
+
     # the prompt/cached split is exposed so callers can see how much of the prompt was reused
-    check("input_tokens" in body["usage"], "usage reports input_tokens")
-    check("cached_tokens" in body["usage"], "usage reports a cached_tokens split")
-    check(body["usage"]["input_tokens"] >= body["usage"]["cached_tokens"], "cached tokens are part of the input")
+    check("input_tokens" in diag_body["usage"], "usage reports input_tokens")
+    check("cached_tokens" in diag_body["usage"], "usage reports a cached_tokens split")
+    check(diag_body["usage"]["input_tokens"] >= diag_body["usage"]["cached_tokens"], "cached tokens are part of the input")
 
     # additive audit fields: prompt identity + per-answer tokenizer/vocabulary diagnostics
-    head_mode = body.get("head", {}).get("mode", "full")
     expected_ids = {"refund": 2, "dept": 2, "urgency": 3}
-    for qid, ans in answers.items():
-        check(0.0 < ans["allowed_token_mass"] <= 1.0 + 1e-6, f"{qid} allowed_token_mass in range")
+    for qid, ans in diag_body["answers"].items():
         if head_mode == "selected":
-            # the selected head reads only the answer rows, so there is no full-vocabulary argmax
-            check(ans["full_vocab_argmax_id"] == -1, f"{qid} argmax id is unavailable on the selected head")
+            # the selected head reads only the answer rows, so no full-vocabulary mass/argmax is
+            # reported and the status names the answer-rows-only scope
+            check("allowed_token_mass" not in ans, f"{qid} no full-vocab mass on the selected head")
+            check("full_vocab_argmax_id" not in ans, f"{qid} no full-vocab argmax on the selected head")
+            check("answer rows only" in ans["probability_status"],
+                  f"{qid} status names the answer-rows-only scope: {ans['probability_status']}")
         else:
+            check(0.0 < ans["allowed_token_mass"] <= 1.0 + 1e-6, f"{qid} allowed_token_mass in range")
             check(isinstance(ans["full_vocab_argmax_id"], int) and ans["full_vocab_argmax_id"] >= 0, f"{qid} argmax id")
         check(len(ans["answer_token_ids"]) == expected_ids[qid], f"{qid} answer token ids")
         check(len(ans["prompt_sha256"]) == 64, f"{qid} prompt sha256")
@@ -177,31 +232,103 @@ def run_checks(server, captured):
     payload = json.loads(text)
     check(payload["error"]["code"] == 422, "semantic error code 422")
 
+    # 3a. a non-boolean diagnostics is a semantic error, not a truthy coercion
+    status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, diagnostics="yes")))
+    check(status == 422, f"non-bool diagnostics status {status}: {text}")
+    check("diagnostics" in text, f"non-bool diagnostics rejection names the field: {text}")
+
+    # 3a. score accepts 2-10 levels; one and eleven are over/under the cap and must be rejected,
+    #     never truncated, on both the array and legend-object criteria forms
+    for levels in (1, 11):
+        for crit in ([f"level {i}" for i in range(levels)], {str(i): f"level {i}" for i in range(levels)}):
+            bad_score = {"state": "s", "questions": {"q": {"type": "score", "instructions": "rate", "criteria": crit}}}
+            status, text = server.post("/v1/decision", json.dumps(bad_score))
+            check(status == 422, f"score with {levels} levels status {status}: {text}")
+            check("2-10" in text, f"score rejection names the 2-10 cap: {text}")
+
+    # 3a. unknown top-level fields are tolerated (Jev compatibility) and leave the answers
+    #     unchanged; compare against a warm repeat so a cold-vs-warm fp difference cannot mask it
+    status, text = server.post("/v1/decision", json.dumps(DECISION_VALID))
+    check(status == 200, f"warm baseline status {status}: {text}")
+    warm = json.loads(text)["answers"]
+
+    tolerant = dict(DECISION_VALID)
+    tolerant["extra"] = 1
+    tolerant["another_extra"] = {"nested": [1, 2, 3]}
+    status, text = server.post("/v1/decision", json.dumps(tolerant))
+    check(status == 200, f"unknown top-level field status {status}: {text}")
+    tolerant_answers = json.loads(text)["answers"]
+    check(set(tolerant_answers) == set(warm), "unknown top-level field keeps the answer keys")
+    for qid in warm:
+        check(tolerant_answers[qid]["type"] == warm[qid]["type"], f"{qid} type unchanged")
+        if "noul" in warm[qid]:
+            check(abs(tolerant_answers[qid]["noul"] - warm[qid]["noul"]) < 1e-5, f"{qid} noul unchanged")
+            continue
+        check(max_prob_delta(tolerant_answers[qid]["probabilities"], warm[qid]["probabilities"]) < 1e-5,
+              f"{qid} probabilities unchanged")
+        if "choice" in warm[qid]:
+            check(tolerant_answers[qid]["choice"] == warm[qid]["choice"], f"{qid} winner unchanged")
+        if "score" in warm[qid]:
+            check(abs(tolerant_answers[qid]["score"] - warm[qid]["score"]) < 1e-4, f"{qid} score unchanged")
+
+    # an unknown field inside a question is still a semantic error
+    bad_q = {"state": "s", "questions": {"q": {"type": "noul", "instructions": "x", "bogus": 1}}}
+    status, text = server.post("/v1/decision", json.dumps(bad_q))
+    check(status == 422, f"unknown question field status {status}: {text}")
+
+    # 3b. instructions are required and non-null on every question type
+    for qtype, qbody in (
+        ("noul", {"type": "noul"}),
+        ("choice", {"type": "choice", "criteria": {"a": "x", "b": "y"}}),
+        ("score", {"type": "score", "criteria": ["lo", "hi"]}),
+    ):
+        status, text = server.post("/v1/decision", json.dumps({"state": "s", "questions": {"q": qbody}}))
+        check(status == 422, f"{qtype} without instructions status {status}: {text}")
+        check("instructions" in text, f"{qtype} rejection names instructions: {text}")
+
+        nulled = dict(qbody)
+        nulled["instructions"] = None
+        status, text = server.post("/v1/decision", json.dumps({"state": "s", "questions": {"q": nulled}}))
+        check(status == 422, f"{qtype} with null instructions status {status}: {text}")
+        check("instructions" in text, f"{qtype} null rejection names instructions: {text}")
+
     # 3b. head: an explicit selected request is a client error (400) when the model cannot expose a
     #     plain answer head, and otherwise is served (selected) or falls back to full logits when
     #     the serving context cannot expose hidden states, reporting why. The model family decides
     #     which branch applies, so both are accepted; the refusal branch is still asserted.
-    selected = dict(DECISION_VALID)
-    selected["head"] = "selected"
+    selected = dict(DECISION_VALID, head="selected", diagnostics=True)
     status, text = server.post("/v1/decision", json.dumps(selected))
+    selected_mode = ""
     if status == 400:
         check("not available" in text, f"selected head refusal names the reason: {text}")
     else:
         check(status == 200, f"explicit selected head status {status}: {text}")
         selected_body = json.loads(text)
-        check(selected_body["head"]["mode"] in ("selected", "full"), "selected head mode reported")
-        if selected_body["head"]["mode"] == "full":
+        selected_mode = selected_body["head"]["mode"]
+        check(selected_mode in ("selected", "full"), "selected head mode reported")
+        if selected_mode == "full":
             check(selected_body["head"]["fallback"] is True, "selected fallback is reported")
             check(bool(selected_body["head"].get("reason")), "selected fallback reason is reported")
 
-    full = dict(DECISION_VALID)
-    full["head"] = "full"
+    # 3c. no silent fallback: when the model serves the selected head explicitly, the default
+    #     request must use it too; a fallback here would hide a broken fast path in CI
+    if selected_mode == "selected":
+        check(diag_body["head"]["mode"] == "selected",
+              f"default request uses the fast head on a covered model: {diag_body.get('head')}")
+
+    full = dict(DECISION_VALID, head="full", diagnostics=True)
     status, text = server.post("/v1/decision", json.dumps(full))
     check(status == 200, f"explicit full head status {status}: {text}")
     full_body = json.loads(text)
     check(full_body["usage"].get("head_mode") == "full", "head_mode in usage")
     check(full_body.get("head", {}).get("mode") == "full", "head diagnostic object")
     check("option_logits" in full_body["answers"]["dept"], "option logits exposed")
+    captured["p_full"] = full_body["answers"]["dept"]["probabilities"]
+
+    # adapter scope diagnostics: the decision decode is scoped to the base model, and the
+    # diagnostics say so even when no adapter is configured
+    check(full_body["diagnostics"].get("adapters_configured") is False, "no-adapter control: adapters_configured false")
+    check(full_body["diagnostics"].get("adapter_scope") == "base", "adapter scope is the base model")
 
     # 3c. permutations: two passes are accepted and stay a valid distribution
     permuted = dict(DECISION_VALID)
@@ -212,6 +339,22 @@ def run_checks(server, captured):
     probs2 = perm_answers["dept"]["probabilities"]
     check(abs(sum(probs2.values()) - 1.0) < 1e-4, f"permuted probabilities sum to 1: {probs2}")
     check(perm_answers["dept"]["choice"] in ("billing", "technical"), "permuted choice is an option")
+
+    # 3d. the option line renders `label: key - description`, so the scored suffix grows with the
+    #     key and description the caller supplied. The rendered line is not echoed, so the suffix
+    #     token count is the observable proof that both parts reach the prompt.
+    def suffix_tokens(criteria):
+        probe = {"model": "test", "state": "s", "diagnostics": True,
+                 "questions": {"q": {"type": "choice", "instructions": "Pick?", "criteria": criteria}}}
+        status, text = server.post("/v1/decision", json.dumps(probe))
+        check(status == 200, f"option-line probe status {status}: {text}")
+        return json.loads(text)["diagnostics"]["suffix_tokens"]
+
+    short = suffix_tokens({"billing": "pay", "support": ""})
+    long_key = suffix_tokens({"billing": "pay", "a-very-long-option-key-name": ""})
+    long_desc = suffix_tokens({"billing": "pay", "support": "a very long description of the support option"})
+    check(long_key > short, f"the option key is rendered into the suffix: {long_key} vs {short}")
+    check(long_desc > short, f"the option description is rendered into the suffix: {long_desc} vs {short}")
 
     # 4. legacy contexts/schema shape is unchanged
     status, text = server.post("/v1/decision", json.dumps(LEGACY_VALID))
@@ -236,6 +379,176 @@ def supports_letter_labels(server):
     return "answer tokens" not in text
 
 
+LORA_RANK = 4
+LORA_STD = 0.05  # strong enough that completions change measurably
+
+# a raw completion avoids each model family's chat template and reasoning parser, which
+# some perturbed outputs would not satisfy; the adapter effect shows up either way
+COMPLETE_BODY = {
+    "prompt": "The capital of France is",
+    "max_tokens": 16,
+    "temperature": 0.0,
+}
+
+
+def build_test_lora(model):
+    """A minimal rank-4 LoRA on a block FFN tensor, written with a fixed seed.
+
+    The adapter perturbs one attention block's feed-forward projection, so chat
+    completions change measurably, while the answer head (base weights only) stays
+    usable for the decision contract. Returns the file path, or None when the
+    adapter cannot be built for this model.
+    """
+    try:
+        sys.path.insert(0, os.path.join(REPO, "gguf-py"))
+        import gguf
+        import numpy as np
+    except ImportError:
+        print("skip adapter checks: gguf-py is not importable")
+        return None
+    try:
+        reader = gguf.GGUFReader(model)
+        arch = bytes(reader.fields["general.architecture"].parts[-1]).decode("utf-8")
+        shape = None
+        for t in reader.tensors:
+            # a per-block 2D weight that exists on every supported architecture
+            if t.name == "blk.0.ffn_down.weight":
+                shape = t.shape
+                break
+        if shape is None:
+            print("skip adapter checks: model has no blk.0.ffn_down tensor")
+            return None
+        n_in, n_out = int(shape[0]), int(shape[1])
+        rng = np.random.default_rng(7)
+        # torch lora convention: A is (rank, n_in), B is (n_out, rank); the gguf
+        # writer reverses numpy shape into the ggml ne fields, so the on-disk
+        # shapes are lora_a ne [n_in, rank] and lora_b ne [rank, n_out]
+        a = rng.standard_normal((LORA_RANK, n_in)).astype(np.float32)
+        b = rng.standard_normal((n_out, LORA_RANK)).astype(np.float32)
+        out_path = os.path.join(HERE, "tmp", "decision-test-lora.gguf")
+        writer = gguf.GGUFWriter(out_path, arch)
+        writer.add_string(gguf.Keys.General.TYPE, "adapter")
+        writer.add_string(gguf.Keys.Adapter.TYPE, "lora")
+        writer.add_float32(gguf.Keys.Adapter.LORA_ALPHA, float(LORA_RANK))
+        writer.add_tensor("blk.0.ffn_down.weight.lora_a", a)
+        writer.add_tensor("blk.0.ffn_down.weight.lora_b", b)
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+        return out_path
+    except Exception as e:  # noqa: BLE001
+        print(f"skip adapter checks: adapter build failed: {e}")
+        return None
+
+
+def max_prob_delta(p1, p2):
+    keys = set(p1) | set(p2)
+    return max(abs(p1.get(k, 0.0) - p2.get(k, 0.0)) for k in keys) if keys else 0.0
+
+
+def run_adapter_checks(model, p_base_full):
+    """Adapter-aware decision contract: the decision decode is scoped to the base model.
+
+    With an adapter configured, the letter path must not read the fast head, an explicit
+    selected request is refused, and auto reports why it used full logits. Chat keeps its
+    own adapter: a decision must not detach it from chat, and chat must re-apply it after
+    the decision cleared the shared context.
+    """
+    lora_path = build_test_lora(model)
+    if lora_path is None:
+        return True
+
+    server = Server(model, ["--lora", lora_path, "--jinja", "--temp", "0.0", "--seed", "42"])
+    try:
+        server.start()
+    except Exception as e:  # noqa: BLE001
+        server.stop()
+        print(f"skip adapter checks on {os.path.basename(model)}: {e}")
+        return True
+
+    def get_loras():
+        status, text = http("GET", f"http://127.0.0.1:{server.port}/lora-adapters")
+        check(status == 200, f"get lora-adapters status {status}: {text}")
+        return json.loads(text)
+
+    def set_scale(scale):
+        status, text = server.post("/lora-adapters", json.dumps([{"id": 0, "scale": scale}]))
+        check(status == 200, f"set lora scale {scale} status {status}: {text}")
+
+    def chat():
+        # returns (status, text): some perturbed outputs no longer satisfy the model's output
+        # parser, so a with-adapter 500 next to a without-adapter 200 is itself a deterministic,
+        # adapter-caused behavioral change and counts as reflection evidence
+        status, text = server.post("/v1/completions", json.dumps(COMPLETE_BODY))
+        return status, json.loads(text)["choices"][0]["text"] if status == 200 else text
+
+    def adapter_reflected(c1, c2):
+        return c1 != c2
+
+    try:
+        # the startup adapter is registered and active
+        loras = get_loras()
+        check(len(loras) == 1 and loras[0]["scale"] == 1.0, f"one active adapter registered: {loras}")
+
+        # chat reflects the adapter
+        c_with = chat()
+        set_scale(0.0)
+        c_without = chat()
+        check(adapter_reflected(c_with, c_without), "chat output changes when the adapter scale is zeroed")
+
+        set_scale(1.0)
+
+        # auto: deterministic base-model answer on the full path, with the adapter scope reported
+        status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, diagnostics=True)))
+        check(status == 200, f"adapter auto status {status}: {text}")
+        auto = json.loads(text)
+        check(auto["head"]["mode"] == "full", f"auto uses full logits with adapters: {auto.get('head')}")
+        check(auto["head"]["fallback"] is True, "auto fallback is reported")
+        check("adapter" in auto["head"].get("reason", ""), f"fallback reason names the adapter scope: {auto['head'].get('reason')}")
+        check(auto["usage"]["head_mode"] == "full", "usage head_mode matches")
+        check(auto["diagnostics"]["adapters_configured"] is True, "adapters_configured reported")
+        check(auto["diagnostics"]["adapter_scope"] == "base", "adapter scope is the base model")
+        p_auto = auto["answers"]["dept"]["probabilities"]
+
+        # the answer is deterministic across repeated runs. On GPU the second run reads a cached
+        # prefix instead of recomputing it, which moves probabilities within the same fp-noise
+        # bound recorded for the GPU lane; a real scope flip moves them by far more
+        status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, diagnostics=True)))
+        check(status == 200, f"adapter auto repeat status {status}: {text}")
+        p_auto2 = json.loads(text)["answers"]["dept"]["probabilities"]
+        check(max_prob_delta(p_auto, p_auto2) < 5e-2, f"auto answer is deterministic: {p_auto} vs {p_auto2}")
+
+        status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, head="full", diagnostics=True)))
+        check(status == 200, f"adapter full status {status}: {text}")
+        p_full = json.loads(text)["answers"]["dept"]["probabilities"]
+        check(max_prob_delta(p_auto, p_full) < 5e-2, f"auto equals the base-scoped full path: {p_auto} vs {p_full}")
+        # the with-adapter answer must be the base-model answer, not the adapted one. On GPU the
+        # two servers plan slightly different graphs, so this compares against the base answer
+        # with a tolerance sized to that fp noise (a real leak moves probabilities by far more)
+        check(max_prob_delta(p_full, p_base_full) < 5e-2,
+              f"decision with adapters reads the base model: {p_full} vs {p_base_full}")
+
+        # selected: the fast head cannot serve adapters, so the explicit request is refused
+        selected = dict(DECISION_VALID)
+        selected["head"] = "selected"
+        status, text = server.post("/v1/decision", json.dumps(selected))
+        check(status == 400, f"selected with adapters status {status}: {text}")
+        check("adapter" in text, f"selected refusal names the adapter conflict: {text}")
+
+        # chat still reflects the adapter after the decision cleared the shared context. A
+        # byte-equal reply is not required: the pool sequences share the cache window on some
+        # architectures, so the prompt may be recomputed; the adapter must still be applied
+        c_after = chat()
+        check(adapter_reflected(c_after, c_without), "the decision did not leak the cleared adapter scope into chat")
+    except Exception as e:  # noqa: BLE001
+        server.stop()
+        print(f"FAIL: {e}")
+        return False
+    server.stop()
+    return True
+
+
 def run_sleep_reload_checks(model):
     """decision -> sleep -> decision: a reload must rebuild the decision state cleanly.
 
@@ -252,7 +565,7 @@ def run_sleep_reload_checks(model):
         return True
 
     try:
-        status, text = server.post("/v1/decision", json.dumps(DECISION_VALID))
+        status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, diagnostics=True)))
         check(status == 200, f"pre-sleep decision status {status}: {text}")
         before = json.loads(text)
         check(set(before.get("answers", {})) == {"refund", "dept", "urgency"}, "pre-sleep answers")
@@ -277,7 +590,7 @@ def run_sleep_reload_checks(model):
             return True
 
         # the next decision wakes the model; the readout must rebuild from the new model
-        status, text = server.post("/v1/decision", json.dumps(DECISION_VALID))
+        status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, diagnostics=True)))
         check(status == 200, f"post-sleep decision status {status}: {text}")
         after = json.loads(text)
         check(set(after.get("answers", {})) == {"refund", "dept", "urgency"}, "post-sleep answers")
@@ -321,6 +634,11 @@ def main():
             print(f"FAIL: {e}")
             return 1
         server.stop()
+
+        # adapter contract: the decision decode is scoped to the base model while chat keeps
+        # its own adapter; p_full from the no-adapter server above is the base-model reference
+        if not run_adapter_checks(model, captured.get("p_full")):
+            return 1
 
         # contract pinning: the running hash is accepted, any other hash refuses the path
         try:

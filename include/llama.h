@@ -397,7 +397,6 @@ extern "C" {
         void *              abort_callback_data;
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
-        bool classifier_only; // if true, only extract embeddings at scored positions, no logits
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
         bool no_perf;     // measure performance timings
@@ -418,6 +417,9 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // if true, only extract embeddings at scored positions, no logits
+        bool classifier_only;
     };
 
     struct llama_model_tensor_override {
@@ -1068,14 +1070,26 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 
+    // Cheap, row-free check that the model can serve the classifier answer head: a supported
+    // architecture, a plain contiguous output table whose row width equals the hidden state width,
+    // no split output, and a per-id output bias that is readable element-wise when one exists.
+    // Returns true when supported and false otherwise. On false, when `reason` is not NULL it
+    // receives a static, human-readable explanation; on true it receives NULL. This is the single
+    // predicate behind the classifier-only context guard, llama_model_classifier_rows and the
+    // decision answer-head probe, so the three cannot disagree on whether the head is usable.
+    LLAMA_API bool llama_model_classifier_supported(const struct llama_model * model, const char ** reason);
+
     // Dequantize the output (classifier) rows for the given token ids into dst. Returns the row
-    // width, or zero when the model's output tensor is unsupported or a required id is out of
-    // range. count must be >= 1 (a zero count returns zero) and dst must hold exactly
-    // count * width floats; dst_count is checked against that exact size. On success softcap is
-    // set to the final logit softcap (0 when the model has none). When the model has a per-id
-    // output bias it must be readable as a contiguous 1-D vector over the vocabulary in a float
-    // (or element-wise dequantizable) type, else the call returns zero; when bias_dst is not NULL
-    // it receives count bias values. Pass NULL when only the rows are needed.
+    // width, or zero when the model's output table is unsupported or a required id is out of range.
+    // count must be in (0, 64]: a zero count or a count above 64 returns zero, so a caller can never
+    // request an unbounded number of rows. dst must hold exactly count * width floats and dst_count
+    // is checked against that exact size (an undersized or oversized dst_count returns zero). On
+    // success the row width is returned and softcap is always written: it is the model's final logit
+    // softcap, or 0 when the model has none. When the model has a per-id output bias it must be
+    // readable as a contiguous 1-D vector over the vocabulary in a float (or element-wise
+    // dequantizable) type, else the call returns zero; when bias_dst is not NULL it receives count
+    // bias values. Pass NULL when only the rows are needed. See llama_model_classifier_supported for
+    // the model-level rules this call enforces.
     LLAMA_API int32_t llama_model_classifier_rows(const struct llama_model * model,
             const llama_token * ids, int32_t count, float * dst, size_t dst_count, float * softcap,
             float * bias_dst);

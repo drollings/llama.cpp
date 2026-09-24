@@ -53,8 +53,12 @@ static common_speculative_output_limits server_output_limits(const common_params
     auto result = common_speculative_get_output_limits(
             params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
 
-    // /decision scores one output row per branch sequence, all in the same ubatch
-    result.total += params.n_seq_decision;
+    // /decision scores one output row per branch sequence, all in the same ubatch. Chat and
+    // decision decodes never run at the same time on the one context, so the shared row budget is
+    // the larger of the chat need and the decision need - not their sum. The context also holds
+    // every decision sequence alongside the chat slots, so the budget must always cover the full
+    // sequence count (n_parallel + n_seq_decision), which the context's output reserve requires.
+    result.total = std::max(result.total, params.n_parallel + params.n_seq_decision);
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
@@ -2402,11 +2406,26 @@ private:
                 decision.ctx_decision_error = "the classifier-only decision context could not be created";
                 SRV_WRN("%s; the letter readout falls back to full logits\n", decision.ctx_decision_error.c_str());
             } else {
+                decision.decision_letter_engine_classifier = std::make_unique<llama_decision::engine>(
+                    decision.ctx_decision, 0, params_base.n_seq_decision);
                 SRV_INF("decision classifier-only context created: %u cells, %d sequences\n",
                         llama_n_ctx(decision.ctx_decision), params_base.n_seq_decision);
             }
         }
         return decision.ctx_decision;
+    }
+
+    // The decision decode answers for the base model: adapters applied for chat must not leak
+    // into a decision answer. Chat re-applies its own set before every batch, so this only
+    // detaches them for the duration of the decision decode.
+    void decision_scope_base_adapters() {
+        std::vector<common_adapter_lora_info> none;
+        if (ctx_tgt) {
+            common_set_adapter_lora(ctx_tgt, none);
+        }
+        if (decision.ctx_decision) {
+            common_set_adapter_lora(decision.ctx_decision, none);
+        }
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -2429,23 +2448,42 @@ private:
             // the default path always falls back to full logits.
             const llama_decision::head_capability & head_cap =
                 decision.decision_head_cache.probe(llama_get_model(ctx_tgt));
-            llama_decision::require_selected_head(req.head, head_cap);
-            // Prefer the classifier-only context: it turns the readout into a handful of answer-row
-            // dots instead of a full-vocabulary projection. A request that forces "full" needs
-            // logits, so it stays on the shared context. Fall back to the shared context when the
-            // classifier context is not available, which keeps the logits path correct.
-            llama_context * ctx_readout = req.head == "full" ? ctx_tgt : decision_hidden_ctx();
-            if (ctx_readout == nullptr) {
-                ctx_readout = ctx_tgt;
+            // The decision decode is scoped to the base model: the answer head reads base
+            // weights only, so with adapters configured the fast path cannot serve the
+            // adapted model. An explicit request for it is refused, the default path reads
+            // full logits on the base scope, and head=full is unchanged.
+            const bool adapters_on = decision.adapters_configured(params_base.lora_adapters);
+            if (adapters_on && req.head == "selected") {
+                throw std::invalid_argument(
+                    "head \"selected\" is incompatible with configured adapters: decision answers are scoped to the base model");
             }
-            // the shared context keeps its chat slots below the decision sequences; the classifier
-            // context has no slots, so its decision sequences start at zero
-            const llama_seq_id readout_seq_base = ctx_readout == decision.ctx_decision
-                ? 0 : (llama_seq_id) params_base.n_parallel;
-            if (decision.decision_letter_engine_ctx != ctx_readout) {
+            llama_decision::require_selected_head(req.head, head_cap);
+            // One full-logits engine on the shared context, plus a classifier-only engine when the
+            // model can serve the fast path. The readout picks the source from the request's
+            // compiled plan, so this code never picks the classifier context on its own.
+            if (!decision.decision_letter_engine) {
                 decision.decision_letter_engine = std::make_unique<llama_decision::engine>(
-                    ctx_readout, readout_seq_base, params_base.n_seq_decision);
-                decision.decision_letter_engine_ctx = ctx_readout;
+                    ctx_tgt, (llama_seq_id) params_base.n_parallel, params_base.n_seq_decision);
+            }
+            llama_decision::readout_sources sources;
+            sources.full = decision.decision_letter_engine.get();
+            if (req.head != "full") {
+                if (adapters_on) {
+                    // the classifier context is not built: the answer is read from the base model
+                    sources.classifier_unavailable =
+                        "the decision decode is scoped to the base model while adapters are configured";
+                } else if (head_cap.available) {
+                    // only build the classifier context when the model probe says it can be used; a
+                    // request that forces "full" or a model without a usable head never allocates it
+                    if (decision_hidden_ctx() != nullptr) {
+                        sources.classifier = decision.decision_letter_engine_classifier.get();
+                    } else {
+                        sources.classifier_unavailable = decision.ctx_decision_error.empty()
+                            ? "the classifier-only decision context is not available" : decision.ctx_decision_error;
+                    }
+                } else {
+                    sources.classifier_unavailable = head_cap.reason;
+                }
             }
             if (!decision.decision_label_vocab) {
                 decision.decision_label_vocab = llama_decision::make_llama_label_vocab(
@@ -2520,7 +2558,9 @@ private:
             std::vector<std::vector<float>> probs;
             // run inside a yield so metrics/slot requests are served while the decision computes
             queue_tasks.yield_to_queue([&]() {
-                probs = llama_decision::letter_readout(*decision.decision_letter_engine, decision.decision_head_cache,
+                // the readout decodes on whichever context the plan picks; both are scoped to the base model
+                decision_scope_base_adapters();
+                probs = llama_decision::letter_readout(sources, decision.decision_head_cache,
                                                        *decision.decision_label_vocab,
                                                        chat_params.tmpls.get(), chat_params.use_jinja,
                                                        req, decision.decision_labels, jopt, &metrics, &audit);
@@ -2534,40 +2574,43 @@ private:
             usage["head_mode"]       = metrics.head_active ? "selected" : "full";
 
             const std::string echo = req.model.empty() ? model_name : req.model;
-            json out = llama_decision::assemble_decision_response(req, probs, echo, usage, &audit);
-            // the fast path is optional; report how the answer was actually read out
-            const bool head_fallback = req.head != "full" && !metrics.head_active;
-            out["head"] = json::object();
-            out["head"]["mode"]     = metrics.head_active ? "selected" : "full";
-            out["head"]["fallback"] = head_fallback;
-            if (head_fallback) {
-                const std::string & reason = !metrics.head_reason.empty() ? metrics.head_reason
-                                          : !decision.ctx_decision_error.empty()   ? decision.ctx_decision_error
-                                                                          : head_cap.reason;
-                out["head"]["reason"] = reason;
-            }
-            // additive diagnostics: the readout contract identity this server is running
-            out["diagnostics"] = json::object();
-            out["diagnostics"]["contract_hash"]  = decision.decision_contract;
-            out["diagnostics"]["prompt_version"] = llama_decision::LETTER_PROMPT_VERSION;
-            out["diagnostics"]["prefill_ms"]     = metrics.prefill_ms;
-            out["diagnostics"]["scoring_ms"]     = metrics.scoring_ms;
-            out["diagnostics"]["suffix_tokens"]        = (long long) metrics.suffix_tokens;
-            out["diagnostics"]["common_suffix_tokens"] = (long long) metrics.common_suffix_tokens;
+            json decision_diagnostics = json::object();
             {
+                // the fast path is optional; report how the answer was actually read out
+                const bool head_fallback = req.head != "full" && !metrics.head_active;
+                decision_diagnostics["head"] = json::object();
+                decision_diagnostics["head"]["mode"]     = metrics.head_active ? "selected" : "full";
+                decision_diagnostics["head"]["fallback"] = head_fallback;
+                if (head_fallback) {
+                    const std::string & reason = !metrics.head_reason.empty() ? metrics.head_reason
+                                              : !decision.ctx_decision_error.empty()   ? decision.ctx_decision_error
+                                                                              : head_cap.reason;
+                    decision_diagnostics["head"]["reason"] = reason;
+                }
+                // additive diagnostics: the readout contract identity this server is running
+                decision_diagnostics["diagnostics"] = json::object();
+                decision_diagnostics["diagnostics"]["contract_hash"]  = decision.decision_contract;
+                decision_diagnostics["diagnostics"]["prompt_version"] = llama_decision::LETTER_PROMPT_VERSION;
+                decision_diagnostics["diagnostics"]["prefill_ms"]     = metrics.prefill_ms;
+                decision_diagnostics["diagnostics"]["scoring_ms"]     = metrics.scoring_ms;
+                decision_diagnostics["diagnostics"]["suffix_tokens"]        = (long long) metrics.suffix_tokens;
+                decision_diagnostics["diagnostics"]["common_suffix_tokens"] = (long long) metrics.common_suffix_tokens;
+                decision_diagnostics["diagnostics"]["adapters_configured"] = adapters_on;
+                decision_diagnostics["diagnostics"]["adapter_scope"]       = "base";
                 const llama_decision::temperature_provenance prov =
                     llama_decision::decision_provenance_current(model_name, params_base, llama_get_model(ctx_tgt),
                                                                 chat_params.tmpls.get(), chat_params.use_jinja);
-                out["diagnostics"]["model"]          = prov.model;
-                out["diagnostics"]["quantization"]   = prov.quantization;
-                out["diagnostics"]["template_hash"]  = prov.template_hash;
-                out["diagnostics"]["backend_flags"]  = prov.backend_flags;
+                decision_diagnostics["diagnostics"]["model"]          = prov.model;
+                decision_diagnostics["diagnostics"]["quantization"]   = prov.quantization;
+                decision_diagnostics["diagnostics"]["template_hash"]  = prov.template_hash;
+                decision_diagnostics["diagnostics"]["backend_flags"]  = prov.backend_flags;
             }
+            json out = llama_decision::assemble_decision_response(req, probs, echo, usage, &audit, &decision_diagnostics);
             return out;
         }
         // one decision per context; all contexts share the schema, the instructions and the cached prefix
-        if (!body.contains("contexts") || !body.at("contexts").is_array() || body.at("contexts").empty() || body.at("contexts").size() > 256) {
-            throw std::invalid_argument("\"contexts\" must be an array of 1-256 strings");
+        if (!body.contains("contexts") || !body.at("contexts").is_array() || body.at("contexts").empty() || body.at("contexts").size() > llama_decision::DECISION_MAX_CONTEXTS) {
+            throw std::invalid_argument("\"contexts\" must be an array of 1-" + std::to_string(llama_decision::DECISION_MAX_CONTEXTS) + " strings");
         }
         std::vector<std::string> contexts;
         for (const auto & c : body.at("contexts")) {
@@ -2608,6 +2651,8 @@ private:
         llama_decision::batch_result b;
         // run inside a yield so metrics/slot requests are served while the decision computes
         queue_tasks.yield_to_queue([&]() {
+            // the trie readout decodes on the shared context, scoped to the base model
+            decision_scope_base_adapters();
             b = decision.decision_engine->decide_batch(shared, dynamic, cs.inputs, opt);
         });
 

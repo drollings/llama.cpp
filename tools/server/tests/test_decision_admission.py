@@ -14,6 +14,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -102,12 +103,14 @@ class Server:
         self.extra_args = extra_args or []
         self.port = free_port()
         self.proc = None
+        self._log = None
+        self._logfile = None
 
     def start(self):
         cmd = [
             SERVER_BIN,
             "-m", self.model,
-            "-c", "2048",
+            "-c", "8192",
             "-ngl", "0",
             "--decision-seqs", "8",
             "--slots",
@@ -120,7 +123,10 @@ class Server:
         env["LD_LIBRARY_PATH"] = build_bin + (os.pathsep + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
         env["LLAMA_DECISION_MAX_BODY"] = str(MAX_BODY)
         env["LLAMA_DECISION_MAX_QUEUE"] = str(MAX_QUEUE)
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        self._logfile = tempfile.NamedTemporaryFile(prefix="decision-server-", suffix=".log", delete=False)
+        self._logfile.close()
+        self._log = open(self._logfile.name, "w", encoding="utf-8")
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=self._log, env=env)
         deadline = time.time() + 120
         while time.time() < deadline:
             if self.proc.poll() is not None:
@@ -140,6 +146,9 @@ class Server:
                 self.proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+        if self._log is not None:
+            self._log.close()
+            self._log = None
 
     def post(self, body):
         return http("POST", f"http://127.0.0.1:{self.port}/v1/decision", body)
@@ -154,7 +163,12 @@ def supports_letter_labels(server):
     status, _, text = server.post(json.dumps(DECISION_VALID))
     if status == 200:
         return True
-    return "answer tokens" not in text
+    if status == 501:
+        # the server's startup probe found no usable answer labels: the 501 carries the probe
+        # failure, so skipping here means "this model cannot serve decisions", never a real error
+        check("cannot serve decision questions" in text, f"501 names the startup probe reason: {text}")
+        return False
+    raise AssertionError(f"letter support probe unexpected status {status}: {text}")
 
 
 def run_checks(server):
@@ -380,6 +394,9 @@ def run_capacity_sweep(model):
         check(sharp[0] == 422 and flat[0] == 422,
               f"the reject is independent of confidence/temperature: {sharp[0]} {flat[0]}")
 
+        # M4.1: the decision context is bounded to the requested n_ctx when set. The sweep above
+        # proved every state past CAPACITY_CTX is rejected on the bounded server (requested size).
+
         # control group: the fitting request decides the same on a large-context server
         control = Server(model)
         control.start()
@@ -394,6 +411,12 @@ def run_capacity_sweep(model):
         tv = sum(abs(lb["probabilities"][k] - cb["probabilities"][k]) for k in lb["probabilities"])
         check(tv <= 5e-2, f"the bounded and control distributions agree (TV={tv})")
 
+        # M4.1: without --decision-ctx-size the decision context reuses the chat n_ctx, so a state
+        # that the bounded (512) context rejected must be accepted on the control (8192) context.
+        status, _, text = control.post(capacity_body(CAPACITY_UNIT * first_reject))
+        check(status == 200,
+              f"the unbounded decision context serves a state beyond CAPACITY_CTX: {status} {text[:120]}")
+
         print(f"capacity sweep: fit up to {last_ok['mult']} units ({last_ok['tokens']} input tokens), "
               f"first reject at {first_reject} units, precision={precision} recall={recall}, ctx={CAPACITY_CTX}")
         return "pass"
@@ -401,6 +424,60 @@ def run_capacity_sweep(model):
         if control is not None:
             control.stop()
         bounded.stop()
+
+
+# M4.5: a decision fired while a chat is generating must not evict or corrupt chat cells. The chat
+# completes byte-for-byte like a no-decision reference, and the decision matches a quiet reference.
+# A fixed seed keeps chat generation deterministic on the CPU backend.
+def run_chat_decision_integrity(model):
+    srv = Server(model, ["--seed", "42"])
+    srv.start()
+    try:
+        if not supports_letter_labels(srv):
+            return "skip"
+        url = f"http://127.0.0.1:{srv.port}/v1/chat/completions"
+        chat_body = {
+            "messages": [{"role": "user", "content": "Write a short paragraph about spring weather."}],
+            "max_tokens": 24,
+            "seed": 42,
+        }
+
+        def chat_once():
+            status, _, text = http("POST", url, json.dumps(chat_body))
+            return status, text
+
+        # reference: quiet chat, no decision
+        status, ref_text = chat_once()
+        check(status == 200, f"quiet chat reference: {status} {ref_text[:120]}")
+        ref = json.loads(ref_text)["choices"][0]["message"]["content"]
+
+        # quiet decision reference
+        status, _, dtext = srv.post(json.dumps(DECISION_VALID))
+        check(status == 200, f"quiet decision reference: {status}")
+        quiet = json.loads(dtext)
+
+        # mid-stream: fire a decision while the chat is generating
+        out = {}
+
+        def run_chat():
+            out["status"], out["text"] = chat_once()
+
+        th = threading.Thread(target=run_chat)
+        th.start()
+        time.sleep(0.05)  # let the chat start so the decision lands mid-stream where possible
+        status, _, dtext = srv.post(json.dumps(DECISION_VALID))
+        th.join()
+
+        check(out.get("status") == 200, f"chat with a mid-stream decision: {out.get('status')}")
+        got = json.loads(out["text"])["choices"][0]["message"]["content"]
+        check(got == ref, "chat with a mid-stream decision matches the quiet reference byte-for-byte")
+        check(status == 200, f"mid-stream decision: {status} {dtext[:120]}")
+        d = json.loads(dtext)
+        check(d["answers"]["dept"]["choice"] == quiet["answers"]["dept"]["choice"],
+              "mid-stream decision matches the quiet decision reference")
+        return "pass"
+    finally:
+        srv.stop()
 
 
 def main():
@@ -443,6 +520,17 @@ def main():
             print("SKIP: no usable answer labels for the capacity sweep")
         else:
             print("decision capacity sweep passed")
+
+        # KV integrity while a chat is generating (M4.5)
+        try:
+            integrity = run_chat_decision_integrity(model)
+        except Exception as e:  # noqa: BLE001
+            print(f"FAIL: chat/decision integrity: {e}")
+            return 1
+        if integrity == "skip":
+            print("SKIP: no usable answer labels for chat/decision integrity")
+        else:
+            print("chat/decision integrity passed")
 
         print("decision admission checks passed")
         return 0

@@ -170,6 +170,9 @@ struct testing {
 
     // A subtest that is known to fail on the current code. It stays green while the expected
     // failure is present, and turns red when it passes, so the marker is removed once fixed.
+    // An unexpected pass (XPASS) is a hard failure, not a silent success. xfail marks
+    // producer-certainty (bit-stability) properties only; it must never absorb a task-value
+    // failure such as a winner or outcome disagreement.
     template <typename F>
     void xfail(const std::string & name, F f) {
         stack.push_back(name);

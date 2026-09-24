@@ -10,33 +10,21 @@
 // DECIDE_SPLIT_BOUNDARY=1 (legacy tokenisation), DECIDE_NSEQ (sequences, default 24).
 
 #include "decision-engine.h"
+#include "decision-file-utils.h"
 
 #include "common.h"
 #include "llama.h"
 
 #include <cstdio>
 #include <cstdlib>
-#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-static std::string env_str(const char * name) {
-    const char * v = std::getenv(name);
-    return v ? v : "";
-}
-
-static std::string read_file(const std::string & path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        throw std::runtime_error("cannot open " + path);
-    }
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
+using decision_file::env_str;
+using decision_file::read_file;
 
 static void decide_files(llama_decision::engine & eng, const std::vector<std::string> & files) {
     if (files.size() < 4 || (files[0] != "@shared" && files[0] != "@fresh")) {

@@ -7,8 +7,7 @@
     },
     "dept": {
       "type": "choice",
-      "confidence": 0.6000000238418579,
-      "certainty": 0.1826545844893872,
+      "confidence": 0.1826545844893872,
       "choice": "billing",
       "probabilities": {
         "billing": 0.6000000238418579,
@@ -18,8 +17,7 @@
     },
     "urgency": {
       "type": "score",
-      "confidence": 0.5,
-      "certainty": 0.06276943291734582,
+      "confidence": 0.06276943291734582,
       "score": 1.300000011920929,
       "probabilities": {
         "0": 0.20000000298023224,
@@ -38,8 +36,6 @@
   },
   "usage": {
     "input_tokens": 12,
-    "output_tokens": 0,
-    "cached_tokens": 4,
-    "state_cache_hit": false
+    "output_tokens": 0
   }
 }

@@ -1,6 +1,6 @@
 {
  "model": "lfm2.5-350m-gguf/latest.gguf",
- "note": "Frozen /v1/decision request bodies for the M0 reference corpus. letter/letter2 are the Jev (state+questions) shape; legacy is the contexts+schema shape. These exact bodies were POSTed to /v1/decision and their responses are frozen in baseline.json under 'reference'.",
+ "note": "Frozen /v1/decision request bodies for the reference corpus. letter/letter2 are the Jev (state+questions) shape; legacy is the contexts+schema shape. These exact bodies were POSTed to /v1/decision and their responses are frozen in baseline.json under 'reference'.",
  "requests": {
   "legacy": {
    "contexts": [

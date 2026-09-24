@@ -893,6 +893,20 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
 
+    // the decision endpoint is enabled by --decision-seqs alone; the other decision flags tune it
+    // and have no effect without it
+    if (params.n_seq_decision == 0 &&
+        (params.n_ctx_decision > 0 || !params.decision_temperature.empty() || !params.decision_contract.empty())) {
+        throw std::invalid_argument("error: --decision-* flags require --decision-seqs (the decision endpoint is disabled without it)\n");
+    }
+
+    // decision branches fork from the prompt with llama_memory_seq_cp, which needs one unified
+    // KV cache; an explicit --no-kv-unified conflicts with --decision-seqs instead of being overridden
+    if (ctx_arg.ex == LLAMA_EXAMPLE_SERVER && params.n_seq_decision > 0 &&
+        params.kv_unified_explicit && !params.kv_unified) {
+        throw std::invalid_argument("error: --decision-seqs requires the unified KV cache; drop --no-kv-unified\n");
+    }
+
     const bool skip_model_download =
         // server will call common_params_handle_models() later, so we skip it here
         ctx_arg.ex == LLAMA_EXAMPLE_SERVER ||
@@ -1723,6 +1737,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
         [](common_params & params, bool value) {
             params.kv_unified = value;
+            params.kv_unified_explicit = true;
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
@@ -2559,7 +2574,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ).set_env("LLAMA_ARG_DECISION_SEQS").set_examples({LLAMA_EXAMPLE_SERVER}));
         add_opt(common_arg(
             {"--decision-ctx-size"}, "N",
-            string_format("context size for the classifier-only decision context; a request that does not fit returns 422 (default: %d = the model's n_ctx)", params.n_ctx_decision),
+            "context size for the classifier-only decision context; 0 (default) reuses the chat context's n_ctx, a request that does not fit returns 422",
             [](common_params & params, int value) {
                 if (value != 0 && value < 3) {
                     throw std::invalid_argument("--decision-ctx-size needs at least 3 (cached prefix, trunk, one branch)");
@@ -2568,7 +2583,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         ).set_env("LLAMA_ARG_DECISION_CTX_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
         add_opt(common_arg(
-            {"--decision-temperature"}, "F",
+            {"--decision-temperature"}, "FILE",
             "JSON file with calibrated decision temperatures and provenance; refused if the provenance does not match",
             [](common_params & params, const std::string & value) {
                 params.decision_temperature = value;

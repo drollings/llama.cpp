@@ -6,6 +6,7 @@
 
 #include "json.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <stdexcept>
@@ -16,6 +17,16 @@
 struct common_chat_templates;
 
 namespace llama_decision {
+
+// Request shape limits. A request over a limit is rejected before any decode; it is never
+// truncated. The choice option cap matches the answer-label pool cap, so every option gets a label.
+inline constexpr size_t DECISION_MIN_QUESTIONS        = 1;
+inline constexpr size_t DECISION_MAX_QUESTIONS        = 256;
+inline constexpr size_t DECISION_MAX_CONTEXTS         = 256;
+inline constexpr size_t DECISION_MIN_OPTIONS          = 2;
+inline constexpr size_t DECISION_MAX_CHOICE_OPTIONS   = 64;
+inline constexpr size_t DECISION_MAX_SCORE_LEVELS     = 10;
+inline constexpr int    DECISION_MAX_PERMUTATIONS     = 8;
 
 // Valid JSON but invalid decision content (bad type, limits, missing fields).
 // The server maps this to HTTP 422; malformed JSON stays a parse error (400).
@@ -64,6 +75,7 @@ struct decision_request {
     common_json               temperatures; // object or null
     int                       permutations = 1;
     std::string               head;         // "" (auto) | "selected" | "full"
+    bool                      diagnostics = false; // emit additive and audit fields
 };
 
 // Renders a string/object/array instruction or criterion value to prompt text.
@@ -112,6 +124,7 @@ struct answer_audit {
     std::string                       prompt_sha256;
     std::string                       prompt_version;
     std::string                       probability_status;
+    bool                              full_vocab_audit = true; // false when only answer rows are measurable
     std::vector<std::vector<int32_t>> answer_token_ids;      // per question, index-aligned with options
     std::vector<float>                allowed_token_mass;    // per question
     std::vector<int32_t>              full_vocab_argmax_id;  // per question
@@ -121,12 +134,15 @@ struct answer_audit {
 // Lowercase hex SHA-256 of the given bytes. Used for the prompt identity in the audit trail.
 std::string sha256_hex(const std::string & text);
 
-// Canonical decision response. `probs` is index-aligned with req.questions and their
-// options; a missing or empty entry falls back to a uniform distribution.
+// Canonical decision response. Additive fields (certainty, audit, extra usage counters, and the
+// optional `head`/`diagnostics` payload) are emitted only when `req.diagnostics` is set; `probs` is
+// index-aligned with req.questions and their options; a missing or empty entry falls back to a
+// uniform distribution. This assembler is the single owner of the default-vs-diagnostics envelope.
 common_json assemble_decision_response(const decision_request & req,
                                   const std::vector<std::vector<float>> & probs,
                                   const std::string & model,
                                   const common_json & usage,
-                                  const answer_audit * audit = nullptr);
+                                  const answer_audit * audit = nullptr,
+                                  const common_json * diagnostics = nullptr);
 
 } // namespace llama_decision

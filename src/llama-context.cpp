@@ -221,9 +221,15 @@ llama_context::llama_context(
         }
     }
 
-    if (cparams.classifier_only && (!llm_arch_supports_classifier(model.arch) ||
-            params.n_samplers != 0 || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
-        throw std::runtime_error("classifier_only requires a supported arch (Gemma4/LFM2/Qwen), no sampler, and unpooled outputs");
+    if (cparams.classifier_only) {
+        const char * classifier_reason = nullptr;
+        if (!llama_model_classifier_supported(&model, &classifier_reason)) {
+            throw std::runtime_error(std::string("classifier_only requires a model with a usable answer head: ") +
+                                     (classifier_reason != nullptr ? classifier_reason : "unknown reason"));
+        }
+        if (params.n_samplers != 0 || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+            throw std::runtime_error("classifier_only requires no sampler and unpooled outputs");
+        }
     }
 
     if (params.attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED) {
@@ -1175,6 +1181,14 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
 }
 
 void llama_context::set_embeddings(bool value) {
+    // A classifier-only context publishes hidden states at the scored positions; those states are
+    // the answer head's input, so embeddings can never be turned off without breaking the context.
+    // Ignore the request rather than throwing across the void C API.
+    if (cparams.classifier_only && !value) {
+        LLAMA_LOG_WARN("%s: embeddings cannot be disabled on a classifier-only context; keeping them enabled\n", __func__);
+        return;
+    }
+
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
     cparams.embeddings = value;
@@ -2783,6 +2797,24 @@ static ggml_backend_t find_backend_for_buft(const std::vector<ggml_backend_ptr> 
     return nullptr;
 }
 
+// Stage source -> destination copies on one backend stream and synchronize once, so the per-tensor
+// sync in a blocking copy does not dominate small state restores. A null backend means the buffer
+// type has no backend in this context, so the copies run through ggml_backend_tensor_copy.
+static void stage_device_copies(ggml_backend_t backend, const std::vector<std::pair<ggml_tensor *, ggml_tensor *>> & copies) {
+    if (backend == nullptr) {
+        for (const auto & [src, dst] : copies) {
+            ggml_backend_tensor_copy(src, dst);
+        }
+        return;
+    }
+
+    for (const auto & [src, dst] : copies) {
+        ggml_backend_tensor_copy_async(backend, backend, src, dst);
+    }
+
+    ggml_backend_synchronize(backend);
+}
+
 class llama_io_write_device : public llama_io_write_i {
 public:
     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs,
@@ -2875,19 +2907,13 @@ public:
                 }
             }
 
-            // stage the device-to-device copies on the backend stream and drain it once, so the
-            // per-tensor sync in the synchronous copy does not dominate small state restores
-            ggml_backend_t backend = find_backend_for_buft(backends, buft);
+            std::vector<std::pair<ggml_tensor *, ggml_tensor *>> copies;
+            copies.reserve(mbuf_cur.org.size());
             for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                if (backend != nullptr) {
-                    ggml_backend_tensor_copy_async(backend, backend, mbuf_cur.org[i], mbuf_cur.cpy[i]);
-                } else {
-                    ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
-                }
+                copies.emplace_back(mbuf_cur.org[i], mbuf_cur.cpy[i]);
             }
-            if (backend != nullptr) {
-                ggml_backend_synchronize(backend);
-            }
+
+            stage_device_copies(find_backend_for_buft(backends, buft), copies);
         }
     }
 
@@ -2985,18 +3011,14 @@ public:
                 }
 
                 if (same_chunking) {
-                    // same chunking: copy 1:1 by index, staged on the backend stream and drained once
-                    ggml_backend_t backend = find_backend_for_buft(backends, buft);
+                    // same chunking: copy 1:1 by index
+                    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> copies;
+                    copies.reserve(mbuf_cur.org.size());
                     for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                        if (backend != nullptr) {
-                            ggml_backend_tensor_copy_async(backend, backend, mbuf_cur.cpy[i], mbuf.org[i]);
-                        } else {
-                            ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
-                        }
+                        copies.emplace_back(mbuf_cur.cpy[i], mbuf.org[i]);
                     }
-                    if (backend != nullptr) {
-                        ggml_backend_synchronize(backend);
-                    }
+
+                    stage_device_copies(find_backend_for_buft(backends, buft), copies);
                     continue;
                 }
             }
@@ -3014,8 +3036,7 @@ public:
             };
             ggml_context * ctx_scratch = ggml_init(params_scratch);
 
-            ggml_backend_t backend   = find_backend_for_buft(backends, buft);
-            bool           needs_sync = false;
+            std::vector<std::pair<ggml_tensor *, ggml_tensor *>> copies;
 
             size_t src_pos  = 0;
             size_t dst_pos  = 0;
@@ -3044,13 +3065,7 @@ public:
                 auto * dst_v = ggml_view_1d(ctx_scratch, dst_t, n_el, dst_off);
                 ggml_backend_view_init(dst_v);
 
-                // stage on the backend stream and drain it once after the byte walk
-                if (backend != nullptr) {
-                    ggml_backend_tensor_copy_async(backend, backend, src_v, dst_v);
-                } else {
-                    ggml_backend_tensor_copy(src_v, dst_v);
-                }
-                needs_sync = true;
+                copies.emplace_back(src_v, dst_v);
 
                 src_pos += n_copy;
                 dst_pos += n_copy;
@@ -3074,9 +3089,7 @@ public:
                 GGML_ASSERT(ggml_nbytes(mbuf.org[i]) == 0);
             }
 
-            if (needs_sync && backend != nullptr) {
-                ggml_backend_synchronize(backend);
-            }
+            stage_device_copies(find_backend_for_buft(backends, buft), copies);
 
             ggml_free(ctx_scratch);
         }
@@ -3733,7 +3746,6 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
-        /*.classifier_only             =*/ false,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
@@ -3743,6 +3755,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.classifier_only             =*/ false,
     };
 
     return result;

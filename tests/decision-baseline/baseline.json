@@ -27,48 +27,30 @@
   "decision_basic.shape.json"
  ],
  "reference": {
-  "note": "Reference /v1/decision request -> response pairs recorded on the M0 reference model with a bit-reproducible flag set (flash attention off) and a fixed --alias so the contract hash is machine-independent. Values are the frozen oracle for byte-identity proofs: a refactor must not change these answers, and the template/contract hashes must not drift. Run-to-run timing fields are excluded.",
+  "note": "Reference /v1/decision request -> response pairs recorded on the reference model with a bit-reproducible flag set (flash attention off) and a fixed --alias so the contract hash is machine-independent. Values are the frozen oracle for byte-identity proofs: a refactor must not change these answers, and the template/contract hashes must not drift. Run-to-run timing fields are excluded.",
   "model": "lfm2.5-350m-gguf/latest.gguf",
-  "model_path": "/app/ai/models/gguf/liquidai/lfm2.5-350m-gguf/latest.gguf",
-  "recorded": "2026-09-23",
+  "recorded": "2026-09-24",
   "backend_flags": "fa=0,k=1,v=1,unified=1,swa=0,ubatch=512",
-  "contract_hash": "dc11458851f22827e9333dd529a724f5834be3ff8844ca4db84c91b73ef220e6",
-  "template_hash": "decision-prefix-v1:95f038da5f9e69be",
-  "prompt_version": "letter-v1",
+  "contract_hash": "e8764284f0387e50c7f5b30b41ba7840891789b263e54be8bf5d21eda008d3e3",
+  "template_hash": "decision-prefix-v1:bb675157f48a4c9f",
+  "prompt_version": "letter-v2",
   "quantization": "2",
   "responses": {
    "letter": {
     "model": "test",
     "answers": {
-     "refund": {
-      "type": "noul",
-      "noul": 0.9959607720375061,
-      "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
-      "prompt_sha256": "09757a4f8227f0ee55c7ec257554a9fa4bab5b7620440e5719d2137574ab08f8",
-      "prompt_version": "letter-v1",
-      "answer_token_ids": [
-       542,
-       543
-      ],
-      "allowed_token_mass": 1.0,
-      "full_vocab_argmax_id": -1,
-      "option_logits": [
-       27.970382690429688,
-       33.47803497314453
-      ]
-     },
      "dept": {
       "type": "choice",
-      "confidence": 0.930706262588501,
-      "certainty": 0.6367175807667123,
+      "confidence": 0.7664031981650385,
+      "certainty": 0.9618817567825317,
       "choice": "technical",
       "probabilities": {
-       "billing": 0.06929371505975723,
-       "technical": 0.930706262588501
+       "billing": 0.03811822459101677,
+       "technical": 0.9618817567825317
       },
       "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
       "prompt_sha256": "09757a4f8227f0ee55c7ec257554a9fa4bab5b7620440e5719d2137574ab08f8",
-      "prompt_version": "letter-v1",
+      "prompt_version": "letter-v2",
       "answer_token_ids": [
        542,
        543
@@ -76,19 +58,36 @@
       "allowed_token_mass": 1.0,
       "full_vocab_argmax_id": -1,
       "option_logits": [
-       28.560556411743164,
-       31.158145904541016
+       28.857860565185547,
+       32.0860595703125
+      ]
+     },
+     "refund": {
+      "type": "noul",
+      "noul": 0.9927088022232056,
+      "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
+      "prompt_sha256": "09757a4f8227f0ee55c7ec257554a9fa4bab5b7620440e5719d2137574ab08f8",
+      "prompt_version": "letter-v2",
+      "answer_token_ids": [
+       542,
+       543
+      ],
+      "allowed_token_mass": 1.0,
+      "full_vocab_argmax_id": -1,
+      "option_logits": [
+       28.218446731567383,
+       33.1322135925293
       ]
      },
      "urgency": {
       "type": "score",
-      "confidence": 0.9511141777038574,
-      "certainty": 0.8027698529144875,
-      "score": 1.033285304903984,
+      "confidence": 0.37944785813159665,
+      "certainty": 0.6233733892440796,
+      "score": 1.3698404431343079,
       "probabilities": {
-       "0": 0.007800265680998564,
-       "1": 0.9511141777038574,
-       "2": 0.041085563600063324
+       "0": 0.003393118968233466,
+       "1": 0.6233733892440796,
+       "2": 0.37323352694511414
       },
       "legend": {
        "0": "calm",
@@ -97,7 +96,7 @@
       },
       "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
       "prompt_sha256": "09757a4f8227f0ee55c7ec257554a9fa4bab5b7620440e5719d2137574ab08f8",
-      "prompt_version": "letter-v1",
+      "prompt_version": "letter-v2",
       "answer_token_ids": [
        542,
        543,
@@ -106,9 +105,9 @@
       "allowed_token_mass": 1.0,
       "full_vocab_argmax_id": -1,
       "option_logits": [
-       26.256282806396484,
-       31.05975914001465,
-       27.917781829833984
+       26.464126586914063,
+       31.677522659301758,
+       31.164581298828125
       ]
      }
     },
@@ -124,48 +123,33 @@
      "fallback": false
     },
     "diagnostics": {
-     "contract_hash": "dc11458851f22827e9333dd529a724f5834be3ff8844ca4db84c91b73ef220e6",
-     "prompt_version": "letter-v1",
-     "suffix_tokens": 97,
+     "contract_hash": "e8764284f0387e50c7f5b30b41ba7840891789b263e54be8bf5d21eda008d3e3",
+     "prompt_version": "letter-v2",
+     "suffix_tokens": 111,
      "common_suffix_tokens": 0,
+     "adapters_configured": false,
+     "adapter_scope": "base",
      "model": "lfm2.5-350m-gguf/latest.gguf",
      "quantization": "2",
-     "template_hash": "decision-prefix-v1:95f038da5f9e69be",
+     "template_hash": "decision-prefix-v1:bb675157f48a4c9f",
      "backend_flags": "fa=0,k=1,v=1,unified=1,swa=0,ubatch=512"
     }
    },
    "letter2": {
     "model": "test",
     "answers": {
-     "refund": {
-      "type": "noul",
-      "noul": 0.999737560749054,
-      "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
-      "prompt_sha256": "f046fd14c4a78b7967f57028ad939debbb5d0154b3628649dbcf55b06783ddbe",
-      "prompt_version": "letter-v1",
-      "answer_token_ids": [
-       542,
-       543
-      ],
-      "allowed_token_mass": 1.0,
-      "full_vocab_argmax_id": -1,
-      "option_logits": [
-       25.352861404418945,
-       33.59809112548828
-      ]
-     },
      "dept": {
       "type": "choice",
-      "confidence": 0.9998111724853516,
-      "certainty": 0.9973917659162155,
+      "confidence": 0.9987962070750634,
+      "certainty": 0.9999200105667114,
       "choice": "technical",
       "probabilities": {
-       "billing": 0.0001888203260023147,
-       "technical": 0.9998111724853516
+       "billing": 7.996925705811009e-05,
+       "technical": 0.9999200105667114
       },
       "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
       "prompt_sha256": "f046fd14c4a78b7967f57028ad939debbb5d0154b3628649dbcf55b06783ddbe",
-      "prompt_version": "letter-v1",
+      "prompt_version": "letter-v2",
       "answer_token_ids": [
        542,
        543
@@ -173,8 +157,25 @@
       "allowed_token_mass": 1.0,
       "full_vocab_argmax_id": -1,
       "option_logits": [
-       24.339780807495117,
-       32.914306640625
+       22.96686553955078,
+       32.40065383911133
+      ]
+     },
+     "refund": {
+      "type": "noul",
+      "noul": 0.9996981620788574,
+      "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
+      "prompt_sha256": "f046fd14c4a78b7967f57028ad939debbb5d0154b3628649dbcf55b06783ddbe",
+      "prompt_version": "letter-v2",
+      "answer_token_ids": [
+       542,
+       543
+      ],
+      "allowed_token_mass": 1.0,
+      "full_vocab_argmax_id": -1,
+      "option_logits": [
+       25.52118492126465,
+       33.6264762878418
       ]
      }
     },
@@ -190,13 +191,15 @@
      "fallback": false
     },
     "diagnostics": {
-     "contract_hash": "dc11458851f22827e9333dd529a724f5834be3ff8844ca4db84c91b73ef220e6",
-     "prompt_version": "letter-v1",
-     "suffix_tokens": 63,
+     "contract_hash": "e8764284f0387e50c7f5b30b41ba7840891789b263e54be8bf5d21eda008d3e3",
+     "prompt_version": "letter-v2",
+     "suffix_tokens": 68,
      "common_suffix_tokens": 0,
+     "adapters_configured": false,
+     "adapter_scope": "base",
      "model": "lfm2.5-350m-gguf/latest.gguf",
      "quantization": "2",
-     "template_hash": "decision-prefix-v1:95f038da5f9e69be",
+     "template_hash": "decision-prefix-v1:bb675157f48a4c9f",
      "backend_flags": "fa=0,k=1,v=1,unified=1,swa=0,ubatch=512"
     }
    },
@@ -211,13 +214,13 @@
       "fields": {
        "category": {
         "value": "billing",
-        "probability": 0.9657906889915466,
+        "probability": 0.9573745131492615,
         "scored_nodes": 1,
         "tree": true
        },
        "urgent": {
         "value": true,
-        "probability": 0.9848628640174866,
+        "probability": 0.9856088757514954,
         "scored_nodes": 1,
         "tree": true
        }
@@ -236,6 +239,141 @@
      "scored_rows": 10
     }
    }
+  }
+ },
+ "gemma4_softcap": {
+  "note": "Provenance-pinned wiring oracle for the Gemma4 final-logit softcap. Gemma4 is the only supported classifier arch whose logits are softcapped and the fixture generator skips it, so this is recorded on a real Gemma4 model. The test runs only when LLAMA_DECISION_TEST_MODEL points at this model; it asserts the classifier predicate accepts, llama_model_classifier_rows writes this softcap and row width, the template/contract hashes and ftype match, and score_answer_rows applies softcap * tanh(dot / softcap).",
+  "model": "gemma-4-e4b-it-gguf/latest.gguf",
+  "recorded": "2026-09-24",
+  "backend_flags": "cpu,fa=0,n_ctx=256,ubatch=128,unified=1,swa=0; the row/softcap path is backend-independent",
+  "quantization": 15,
+  "softcap": 30.0,
+  "width": 2560,
+  "template_hash": "decision-prefix-v1:c19202a018540382",
+  "contract_hash": "f67ff4930df48fb3d844963abebdde1cb20f37033dc0f9c1be81f52065105176"
+ },
+ "cpu_oracle": {
+  "model": "test-models/qwen35-dense.gguf",
+  "pool": {
+   "count": 26,
+   "token_a": 65
+  },
+  "full": {
+   "head_active": false,
+   "head_reason": "",
+   "cache_hit": false,
+   "suffix_tokens": 79,
+   "common_suffix_tokens": 0,
+   "leaf_suffix_tokens": 79,
+   "rows": 79,
+   "rounds": 1,
+   "questions": [
+    {
+     "options": 2,
+     "winner": 0,
+     "probs": [
+      0.5004202127456665,
+      0.4995797872543335
+     ]
+    },
+    {
+     "options": 3,
+     "winner": 0,
+     "probs": [
+      0.33402881026268005,
+      0.3329627215862274,
+      0.33300846815109253
+     ]
+    },
+    {
+     "options": 3,
+     "winner": 0,
+     "probs": [
+      0.33402881026268005,
+      0.3329627215862274,
+      0.33300846815109253
+     ]
+    }
+   ]
+  },
+  "auto_fallback": {
+   "head_active": false,
+   "head_reason": "the decision context does not expose hidden states",
+   "cache_hit": true,
+   "suffix_tokens": 79,
+   "common_suffix_tokens": 0,
+   "leaf_suffix_tokens": 79,
+   "rows": 79,
+   "rounds": 1,
+   "questions": [
+    {
+     "options": 2,
+     "winner": 0,
+     "probs": [
+      0.5004202127456665,
+      0.4995797872543335
+     ]
+    },
+    {
+     "options": 3,
+     "winner": 0,
+     "probs": [
+      0.33402881026268005,
+      0.3329627215862274,
+      0.33300846815109253
+     ]
+    },
+    {
+     "options": 3,
+     "winner": 0,
+     "probs": [
+      0.33402881026268005,
+      0.3329627215862274,
+      0.33300846815109253
+     ]
+    }
+   ]
+  },
+  "head_selection": {
+   "covered_available": true,
+   "covered_width": 256,
+   "covered_classifier": {
+    "active": true,
+    "reason": "",
+    "probs": [
+     0.5001824498176575,
+     0.49981752038002014
+    ]
+   },
+   "full_logits": {
+    "active": false,
+    "reason": "",
+    "probs": [
+     0.5001824498176575,
+     0.49981752038002014
+    ]
+   },
+   "full_context": {
+    "active": false,
+    "reason": "the decision context does not expose hidden states"
+   },
+   "unavailable": {
+    "active": false,
+    "reason": "synthetic unavailable head"
+   },
+   "null_head": {
+    "active": false,
+    "reason": ""
+   },
+   "covered_vs_full": {
+    "winners_match": true,
+    "total_variation": 0.0
+   }
+  },
+  "classifier_rows": {
+   "width": 256,
+   "softcap": 0.0,
+   "max_abs_dot_vs_logit": 3.263722985445694e-10
   }
  }
 }

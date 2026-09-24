@@ -34,16 +34,16 @@
       "type": "choice",
       "choice": "option key (argmax)",
       "probabilities": "object keyed by option key, sums to 1",
-      "confidence": "number = max(p)",
-      "certainty": "number = 1 - H/log(K)"
+      "confidence": "number = 1 - H/log(K)",
+      "certainty": "number = max(p)"
     },
     "score": {
       "type": "score",
       "score": "number = sum(i*p_i), zero-based expected level",
       "probabilities": "object with string keys \"0\"..\"K-1\"",
       "legend": "object mapping level index string to description, in order",
-      "confidence": "number = max(p)",
-      "certainty": "number = 1 - H/log(K)"
+      "confidence": "number = 1 - H/log(K)",
+      "certainty": "number = max(p)"
     }
   },
   "limits": {

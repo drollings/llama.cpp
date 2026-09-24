@@ -158,8 +158,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
     }
 
     // decision branches fork from the prompt with llama_memory_seq_cp; a unified KV cache lets
-    // them share the prompt's cells instead of copying them between per-sequence streams
-    if (params.n_seq_decision > 0 && !params.kv_unified) {
+    // them share the prompt's cells instead of copying them between per-sequence streams.
+    // An explicit --no-kv-unified is rejected at parse time; this only fills in the default.
+    if (params.n_seq_decision > 0 && !params.kv_unified_explicit && !params.kv_unified) {
         SRV_INF("--decision-seqs %d: enabling the unified KV cache\n", params.n_seq_decision);
         params.kv_unified = true;
     }

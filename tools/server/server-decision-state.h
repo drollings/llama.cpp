@@ -6,6 +6,7 @@
 
 #include "letter_readout.h"
 
+#include "common.h"
 #include "llama.h"
 
 #include <memory>
@@ -13,11 +14,25 @@
 #include <vector>
 
 struct server_decision_state {
+    // One live adapter-scope predicate: the decision decode answers for the base model, and
+    // the registry the server applies to chat batches is the single source of truth. Entries
+    // with a zero scale are registered but disabled, matching the enabled-adapter convention
+    // used by the slot scheduler.
+    bool adapters_configured(const std::vector<common_adapter_lora_info> & loras) const {
+        for (const auto & lora : loras) {
+            if (lora.scale > 0.0f) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     std::unique_ptr<llama_decision::engine> decision_engine; // trie readout, created on first use
-    // Separate engine for the letter readout: it runs on the classifier-only context when that
-    // context is available, so its prefix cache does not thrash against the trie engine.
+    // Separate engine per letter-readout context: one on the shared full-logits context (seq ids
+    // above the chat slots) and one on the classifier-only context (its own cache, seq ids from
+    // zero). The readout picks between them from the compiled plan, so both stay alive together.
     std::unique_ptr<llama_decision::engine> decision_letter_engine;
-    llama_context *                         decision_letter_engine_ctx = nullptr;
+    std::unique_ptr<llama_decision::engine> decision_letter_engine_classifier;
     std::unique_ptr<llama_decision::label_vocab> decision_label_vocab; // letter readout, built once per model
     std::vector<llama_decision::label>      decision_labels;
     llama_decision::answer_head_cache       decision_head_cache; // owns the answer-row tables for this model
@@ -41,7 +56,7 @@ struct server_decision_state {
         }
         decision_engine.reset();
         decision_letter_engine.reset();
-        decision_letter_engine_ctx = nullptr;
+        decision_letter_engine_classifier.reset();
         decision_label_vocab.reset();
         decision_labels.clear();
         decision_head_cache.clear();

@@ -15,6 +15,17 @@ std::string letter_answer_tail(const std::string & after) {
     return after + "Answer:\n";
 }
 
+// The one option-line formatter: `label: key`, with ` - description` appended only when a rendered
+// description is non-empty. The framer builds every scored line through this function, so an empty
+// description can never leave a trailing separator that would change the prompt layout.
+std::string format_option_line(const label & l, const decision_option & opt) {
+    std::string line = l.text + ": " + opt.key;
+    if (!opt.description.empty()) {
+        line += " - " + opt.description;
+    }
+    return line;
+}
+
 namespace {
 
 std::string render_state(const common_json & state) {
@@ -34,8 +45,8 @@ std::string format_letter_suffix_ordered(const decision_question & q, const std:
     std::string s = "\nQuestion: " + render_text(q.instructions) + "\nOptions:\n";
     for (size_t i = 0; i < order.size(); ++i) {
         const size_t oi = order[i];
-        const std::string & desc = q.options[oi].description.empty() ? q.options[oi].key : q.options[oi].description;
-        s += labels[i].text + ": " + desc + "\n";
+        s += format_option_line(labels[i], q.options[oi]);
+        s += "\n";
     }
     s += "Return the correct letter label." + letter_answer_tail(after);
     return s;
@@ -135,32 +146,37 @@ void validate_label_capacity(const decision_request & req, size_t label_count) {
     }
 }
 
+// The one hidden-width source: answer rows and the head buffer are sized from the same model
+// query, so a head can never be built at a width other than the hidden state's.
+static int hidden_width(const llama_model * model) {
+    return model == nullptr ? 0 : (int) llama_model_n_embd_out(model);
+}
+
 const head_capability & answer_head_cache::probe(const llama_model * model) {
     if (cap_set_ && model == cap_model_) {
         return capability_;
     }
     head_capability cap;
-    if (model == nullptr) {
-        cap.reason = "no model is loaded";
+    const char * reason = nullptr;
+    // one predicate owns the model-level rules; the server guard, the row reader and this probe
+    // all read the same verdict, so they cannot disagree on whether the fast path can run
+    if (!llama_model_classifier_supported(model, &reason)) {
+        cap.reason = (reason != nullptr && reason[0] != '\0') ? reason : "the selected answer head is unavailable";
     } else {
-        const int width = (int) llama_model_n_embd_out(model);
-        if (width <= 0) {
-            cap.reason = "no hidden state is available";
+        const int width = hidden_width(model);
+        const std::vector<llama_token> ids = { 0, 1 };
+        std::vector<float> rows((size_t) ids.size() * (size_t) width, 0.0f);
+        float softcap = 0.0f;
+        // the predicate is row-free; sampling two rows backs the width and softcap the head
+        // buffer is sized from. bias_dst is null, but the read still validates the output bias.
+        const int w = llama_model_classifier_rows(model, ids.data(), (int32_t) ids.size(), rows.data(),
+                                                  rows.size(), &softcap, nullptr);
+        if (w <= 0) {
+            cap.reason = "the answer rows could not be read";
         } else {
-            const std::vector<llama_token> ids = { 0, 1 };
-            std::vector<float> rows((size_t) ids.size() * (size_t) width, 0.0f);
-            float softcap = 0.0f;
-            // bias_dst is null, but the call still validates the model's output bias, so an
-            // unreadable bias makes the probe fail instead of silently scoring without it
-            const int w = llama_model_classifier_rows(model, ids.data(), (int32_t) ids.size(), rows.data(),
-                                                      rows.size(), &softcap, nullptr);
-            if (w <= 0) {
-                cap.reason = "the model output tensor is not a plain contiguous answer head";
-            } else {
-                cap.available = true;
-                cap.width     = w;
-                cap.softcap   = softcap;
-            }
+            cap.available = true;
+            cap.width     = w;
+            cap.softcap   = softcap;
         }
     }
     capability_ = std::move(cap);
@@ -171,17 +187,13 @@ const head_capability & answer_head_cache::probe(const llama_model * model) {
 
 classifier_head build_classifier_head(const llama_model * model, const std::vector<label> & labels) {
     classifier_head head;
-    if (model == nullptr) {
-        head.reason = "no model is loaded";
-        return head;
-    }
     if (labels.empty()) {
         head.reason = "no answer labels are available";
         return head;
     }
-    const int width = (int) llama_model_n_embd_out(model);
+    const int width = hidden_width(model);
     if (width <= 0) {
-        head.reason = "no hidden state is available";
+        head.reason = model == nullptr ? "no model is loaded" : "no hidden state is available";
         return head;
     }
     head.ids.reserve(labels.size());
@@ -196,7 +208,13 @@ classifier_head build_classifier_head(const llama_model * model, const std::vect
         head.ids.clear();
         head.rows.clear();
         head.bias.clear();
-        head.reason = "the model output tensor is not a plain contiguous answer head";
+        const char * reason = nullptr;
+        if (!llama_model_classifier_supported(model, &reason)) {
+            head.reason = (reason != nullptr && reason[0] != '\0')
+                ? reason : "the model output tensor is not a plain contiguous answer head";
+        } else {
+            head.reason = "the answer rows could not be read";
+        }
         return head;
     }
     head.width = w;
@@ -286,7 +304,7 @@ std::string format_letter_suffix(const decision_question & q, const std::vector<
     return format_letter_suffix_ordered(q, labels, after, order);
 }
 
-std::vector<std::vector<float>> letter_readout(engine & eng,
+std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
                                                answer_head_cache & head_cache,
                                                const label_vocab & vocab,
                                                const common_chat_templates * tmpls, bool use_jinja,
@@ -295,6 +313,9 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
                                                const options & opt,
                                                letter_metrics * metrics,
                                                answer_audit * audit) {
+    if (sources.full == nullptr) {
+        throw std::invalid_argument("the letter readout needs a full-logits engine");
+    }
     const auto split = render_letter_prompt(tmpls, use_jinja, letter_system_text());
 
     validate_label_capacity(req, labels.size());
@@ -334,18 +355,38 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
     readout_opt.audit          = (audit != nullptr);
 
     // The selected head is a fallback-safe fast path: it is used when the model exposes usable
-    // answer rows and the context exposes hidden states, and the full-logits path is used
-    // otherwise. Only an explicit request for it on an incompatible model is a client error.
+    // answer rows and the classifier context covers every candidate, and the shared full-logits
+    // context is used otherwise. Only the model-level head availability is a client error; a
+    // context that cannot carry the head falls back with a reason, like the default path.
+    const llama_model * model = sources.full->get_model();
     if (req.head == "selected") {
-        require_selected_head(req.head, head_cache.probe(eng.get_model()));
+        require_selected_head(req.head, head_cache.probe(model));
     }
     // the row table is a pure function of (model, labels), so the cache builds it once
-    const classifier_head & head = head_cache.for_labels(eng.get_model(), labels);
-    if (req.head != "full" && head.available()) {
-        readout_opt.head = &head;
+    const classifier_head & head = head_cache.for_labels(model, labels);
+
+    engine * chosen = sources.full;
+    std::string fallback_reason;
+    if (req.head != "full") {
+        if (!head.available()) {
+            fallback_reason = head.reason.empty() ? "the selected answer head is unavailable" : head.reason;
+        } else if (sources.classifier == nullptr) {
+            fallback_reason = sources.classifier_unavailable.empty()
+                ? "the classifier-only decision context is not available" : sources.classifier_unavailable;
+        } else {
+            // one plan, one predicate: the engine owns both, so the server and the readout cannot
+            // disagree on whether the fast path can run for these candidates.
+            readout_opt.head = &head;
+            const compiled_fields plan = sources.classifier->compile_fields(fields, readout_opt);
+            if (sources.classifier->select_scoring_head(plan, readout_opt, &fallback_reason)) {
+                chosen = sources.classifier;
+            } else {
+                readout_opt.head = nullptr;
+            }
+        }
     }
 
-    const auto b = eng.decide_batch(split.first, { render_state(req.state) }, fields, readout_opt);
+    const auto b = chosen->decide_batch(split.first, { render_state(req.state) }, fields, readout_opt);
 
     if (metrics) {
         metrics->cache_hit      = b.cache_hit;
@@ -357,6 +398,9 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
         metrics->context_tokens = b.items.empty() ? 0 : b.items[0].context_tokens;
         metrics->head_active    = b.head_active;
         metrics->head_reason    = b.head_reason;
+        if (!b.head_active && req.head != "full" && metrics->head_reason.empty()) {
+            metrics->head_reason = fallback_reason;
+        }
         metrics->suffix_tokens        = b.suffix_tokens;
         metrics->common_suffix_tokens = b.common_suffix_tokens;
         metrics->leaf_suffix_tokens   = b.leaf_suffix_tokens;
@@ -393,6 +437,12 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
         audit->prompt_sha256      = sha256_hex(split.first + render_state(req.state) + split.second);
         audit->prompt_version     = LETTER_PROMPT_VERSION;
         audit->probability_status = "conditional option score over quantized weights; uncalibrated as decision confidence";
+        audit->full_vocab_audit   = !b.head_active;
+        if (b.head_active) {
+            // the answer head scores answer rows only; a full-vocabulary mass or argmax cannot be
+            // measured, so the audit says so instead of reporting a placeholder 1.0 / -1
+            audit->probability_status += "; full-vocabulary mass and argmax are not measurable under the selected head (answer rows only)";
+        }
         audit->answer_token_ids.assign(req.questions.size(), {});
         audit->allowed_token_mass.assign(req.questions.size(), 1.0f);
         audit->full_vocab_argmax_id.assign(req.questions.size(), -1);
@@ -409,6 +459,27 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
         }
     }
     return probs;
+}
+
+std::vector<std::vector<float>> letter_readout(engine & eng,
+                                               answer_head_cache & head_cache,
+                                               const label_vocab & vocab,
+                                               const common_chat_templates * tmpls, bool use_jinja,
+                                               const decision_request & req,
+                                               const std::vector<label> & labels,
+                                               const options & opt,
+                                               letter_metrics * metrics,
+                                               answer_audit * audit) {
+    readout_sources sources;
+    sources.full = &eng;
+    if (eng.classifier_only()) {
+        sources.classifier = &eng;
+    } else {
+        // the one engine is a full-logits context, so it cannot carry the answer rows; keep the
+        // same reason the engine itself reports for a head on a non-classifier context
+        sources.classifier_unavailable = "the decision context does not expose hidden states";
+    }
+    return letter_readout(sources, head_cache, vocab, tmpls, use_jinja, req, labels, opt, metrics, audit);
 }
 
 } // namespace llama_decision

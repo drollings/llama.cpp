@@ -7,6 +7,7 @@
 // tokenizer is abstracted so the pool and boundary logic can be unit tested
 // without a model.
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -40,7 +41,9 @@ int32_t answer_label_token(const label_vocab & vocab, const std::string & tail, 
 
 // A-Z then AA-ZZ, kept only when the boundary resolution yields a unique, non-special token; at
 // most `cap` labels. Throws std::runtime_error if fewer than 2.
-std::vector<label> build_label_pool(const label_vocab & vocab, const std::string & tail, size_t cap = 64);
+inline constexpr size_t LABEL_POOL_CAP = 64;
+
+std::vector<label> build_label_pool(const label_vocab & vocab, const std::string & tail, size_t cap = LABEL_POOL_CAP);
 
 // True when encode(prompt + label) equals encode(prompt) followed by exactly
 // `label_token`. A false result means the scored slot would sit on a different
