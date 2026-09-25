@@ -38,6 +38,20 @@ struct semantic_error : std::invalid_argument {
 // The single hash primitive behind the decision prefix tag and the permutation seed.
 uint64_t fnv1a64(const std::string & s);
 
+// The producer concentration scores, pure functions of an option distribution. `confidence`
+// (default) is the normalized inverse entropy 1 - H/log K, sensitive to the whole shape.
+// `certainty` is the winner's share max(p), the quantity Jev's documented Choice confidence is
+// derived from. Both are 0 at a uniform distribution and 1 at a one-hot one; neither measures
+// whether the winner is correct.
+double inverse_entropy_confidence(const std::vector<float> & p);
+double winner_share(const std::vector<float> & p);
+
+// The opt-in Jev compatibility confidence: `(N*p_max - 1)/(N - 1)` clamped to [0,1], a rescaled
+// winner's share. N is the option count. Jev documents this for Choice and for Score with 2..3
+// levels; above three the definition is undocumented, so the same monotone rule is the stated
+// local value. It reads only the winner, unlike the entropy confidence.
+double jev_winner_share_confidence(const std::vector<float> & p);
+
 // Renders the chat template with a sentinel user message and returns the text before and after
 // the sentinel. `render_prompt` and `render_letter_prompt` share it and differ only in how they
 // use the split; `tmpls` must be non-null.
@@ -67,6 +81,16 @@ struct decision_question {
     bool                     has_criteria = false;
 };
 
+// A request may name a live chat slot to answer about, so the transcript is not re-prefilled.
+// `present` is true only when id_slot is supplied; `session_pos` is the source's next position
+// when pinned by the caller and -1 when the server derives it from the slot. Both are capability
+// inputs: the slot must exist, hold decoded state, and the position must continue it exactly.
+struct session_ref {
+    bool present     = false;
+    int  id_slot     = -1;
+    int  session_pos = -1;
+};
+
 struct decision_request {
     std::string               model;
     common_json               state;
@@ -75,7 +99,9 @@ struct decision_request {
     common_json               temperatures; // object or null
     int                       permutations = 1;
     std::string               head;         // "" (auto) | "selected" | "full"
+    std::string               confidence_profile = "local"; // "local" (1 - H/logK) | "jev" (opt-in)
     bool                      diagnostics = false; // emit additive and audit fields
+    session_ref               session;
 };
 
 // Renders a string/object/array instruction or criterion value to prompt text.
@@ -86,6 +112,11 @@ double question_temperature(const decision_request & req, const decision_questio
 
 // True when the body carries the decision shape (state and/or questions).
 bool is_decision_request(const common_json & body);
+
+// Reads the optional live-session reference shared by the Jev and generic shapes. Throws
+// semantic_error when a field has the wrong type, when id_slot is negative, or when session_pos
+// is supplied without id_slot.
+session_ref parse_session_ref(const common_json & body);
 
 // Throws semantic_error on any invalid decision content.
 decision_request parse_decision_request(const common_json & body);

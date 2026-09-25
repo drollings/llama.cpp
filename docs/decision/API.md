@@ -16,9 +16,10 @@ settled:
 
 Other locked shapes: dual readout (letter labels for Jev, trie for generic
 schemas); adapters strictly optional; temperature `T=1.0` default with a
-per-type override; hybrid KV fork (`seq_cp` fast path, `llama_state_seq`
-restore fallback); probabilities are closed-world and never gated on
-confidence.
+per-type override; fork by `llama_memory_seq_cp` for attention plus a
+`PARTIAL_ONLY` byte copy of the recurrent state, with a full
+`llama_state_seq` save/restore as the fallback; probabilities are closed-world
+and never gated on confidence.
 
 ---
 
@@ -111,6 +112,18 @@ silently default).
   audit fields, `certainty`, and the extra `usage` counters
   (`cached_tokens`, `state_cache_hit`, `head_mode`). The default `false` keeps
   the response to the strict Jev envelope (Section 3).
+* `confidence_profile` (optional, string, `"local"` (default) or `"jev"`): how
+  the `confidence` value on `choice`/`score` is computed. `"local"` keeps
+  `1 - H/log K` (normalized inverse entropy), so existing callers and goldens
+  are unchanged. `"jev"` selects the documented Jev compatibility value
+  `(N*p_max - 1)/(N - 1)`, clamped to [0,1], a rescaled winner share; Jev leaves
+  the Score definition open above three levels, so the same monotone rule is the
+  stated local value there. The profile changes only the reported concentration,
+  never an answer or a probability; it is opt-in and never gates anything.
+
+Server flag: `--decision-permutations N` (env `LLAMA_ARG_DECISION_PERMUTATIONS`,
+default 1) sets the pass count for requests that omit `permutations`; an explicit
+request field always wins and the pass cap still applies.
 
 Local-only notes: `model` is optional here and echoed back verbatim; Jev
 requires it. `GET /v1/models` keeps the OpenAI model-list shape
@@ -174,6 +187,36 @@ When both shapes are supported, negotiate by request shape: presence of
 `state`+`questions` selects the letter readout; presence of `contexts`+`schema`
 selects the trie readout. Never mix both in one call.
 
+### 2.4 Live-session request (`id_slot`, `session_pos`)
+
+Both shapes accept an optional `id_slot` (int) so the decision is answered about
+a chat slot that already holds decoded state, without re-prefilling the
+transcript. `session_pos` (int) optionally pins the continuation position; it
+requires `id_slot` and must equal the slot's next position exactly, otherwise the
+request is a 422 (a shifted position is never scored silently).
+
+* The slot must exist, not be released, and hold decoded state. These are
+  capability checks only: an unknown, released, or empty slot is a 4xx with a
+  reason. The server never inspects a confidence value to accept or reject a
+  session.
+* The generic shape scores exactly one context per session request; a
+  multi-context session is a 400. It forks the slot and appends this request's
+  context tail plus the schema suffix.
+* The Jev shape appends the questions as a fresh user turn rendered through the
+  slot's chat template; the transcript is not re-injected as `state`, and the
+  request `state` is still required by the shape but not re-decoded. Session
+  readout runs full-logits on the shared context, because the classifier-only
+  context has its own cache and cannot fork a chat slot. An explicit
+  `head: "selected"` on a session is a 400.
+* A session fork is exact: `copy` is refused on a recurrent/hybrid model (it
+  would not reproduce the slot state), `hybrid`/`restore`/`auto` are accepted.
+* The source slot is never mutated: a decision reads it only to fork. After the
+  request, chat on that slot and a repeat decision both keep working.
+* The response reports the fork additively: `session_fork: true`, `source_slot`,
+  and `session_pos` on the Jev envelope, or a top-level `session` object on the
+  generic shape. With `diagnostics: true`, `diagnostics.permutations` reports the
+  pass count used.
+
 ---
 
 ## 3. Response specification
@@ -222,7 +265,10 @@ are byte-identical either way.
   entropy). This is a deliberate LOCAL choice, not Jev's documented
   distribution shape: Jev's Choice confidence is derived from the winner's
   share, `(N*p_max - 1)/(N - 1)`, and its Score confidence above 3 levels is
-  undocumented. Do not claim parity for this formula. Clamp to [0,1].
+  undocumented. `confidence_profile: "jev"` selects that rescaled winner share
+  as an opt-in compatibility value (the same monotone rule above 3 levels), and
+  changes only the reported number. Do not claim parity for the default formula.
+  Clamp to [0,1].
 * `certainty = max(p)` (the winner's share). Both are returned on `choice` and
   `score` when `diagnostics` is true; `confidence` is always returned. Both
   measure concentration of the answer distribution; they are not calibrated
@@ -412,8 +458,14 @@ Rules:
   (NLL/Brier per primitive on own traffic). Expect quant/backend swaps to move
   ECE; refit per deployment.
 * Order bias: `permutations` is a seeded distinct shuffle with the mean taken
-  by semantic key. Default stays 1.
-* Expect close-call flips across dtype/batch. Acceptance compares with
+  by semantic key. Default stays 1; `--decision-permutations` raises the server
+  default for deployments that opt in.
+* Fork exactness: a branch must reproduce the parent's state. The fork oracle
+  decodes a branch and compares its state bytes against a full `restore` fork of
+  the same parent, so a plain `seq_cp` that only matches the argmax still fails.
+  The default fork is the partial hybrid (`seq_cp` attention + `PARTIAL_ONLY`
+  recurrent copy); a full restore stays available and is the automatic fallback
+  when the partial format is unavailable. Acceptance compares with
   TOLERANCE, never bit-equality. Pin `tokenizer + template + label code` in a
   contract/startup hash and refuse on mismatch. Every parity/calibration claim
   inherits the frozen backend flag set recorded at baseline (FA type, K/V
@@ -443,6 +495,8 @@ Rules:
   surface-form values.
 - **branch / trunk / prefix**: one KV sequence per scored path; a trunk is
   `shared prefix + context`; the prefix is the cacheable head.
+- **session fork**: answering `id_slot` by forking the slot's decoded state
+  instead of re-prefilling `state`; the source slot is read-only.
 - **producer confidence vs task value**: two DIFFERENT axes (Section 6). Never
   use a confidence number to gate caching/admission/correctness.
 - **closed-world probabilities**: `probabilities` are conditional on the

@@ -42,8 +42,9 @@ uint64_t permutation_seed(const std::string & question_id, int pass) {
 }
 
 std::string format_letter_suffix_ordered(const decision_question & q, const std::vector<label> & labels,
-                                         const std::string & after, const std::vector<size_t> & order) {
-    std::string s = "\nQuestion: " + render_text(q.instructions) + "\nOptions:\n";
+                                         const std::string & before, const std::string & after,
+                                         const std::vector<size_t> & order) {
+    std::string s = before + "\nQuestion: " + render_text(q.instructions) + "\nOptions:\n";
     for (size_t i = 0; i < order.size(); ++i) {
         const size_t oi = order[i];
         s += format_option_line(labels[i], q.options[oi]);
@@ -137,6 +138,28 @@ std::pair<std::string, std::string> render_letter_prompt(const common_chat_templ
         return { system_text + "\n", "\n" };
     }
     return split_chat_template(tmpls, use_jinja, system_text, enable_thinking);
+}
+
+std::pair<std::string, std::string> split_user_turn(const common_chat_templates * tmpls, bool use_jinja,
+                                                    bool enable_thinking) {
+    if (tmpls == nullptr) {
+        return { "", "\n" };
+    }
+    static const std::string sentinel = "\x1f<<decision-turn>>\x1f";
+    common_chat_templates_inputs in;
+    in.use_jinja             = use_jinja;
+    in.add_generation_prompt = true;
+    in.enable_thinking       = enable_thinking;
+    common_chat_msg usr;
+    usr.role    = "user";
+    usr.content = sentinel;
+    in.messages = { usr };
+    const std::string prompt = common_chat_templates_apply(tmpls, in).prompt;
+    const size_t at = prompt.find(sentinel);
+    if (at == std::string::npos) {
+        throw std::runtime_error("the chat template did not keep the user message");
+    }
+    return { prompt.substr(0, at), prompt.substr(at + sentinel.size()) };
 }
 
 void validate_label_capacity(const decision_request & req, size_t label_count) {
@@ -302,7 +325,7 @@ std::string format_letter_suffix(const decision_question & q, const std::vector<
     for (size_t i = 0; i < order.size(); ++i) {
         order[i] = i;
     }
-    return format_letter_suffix_ordered(q, labels, after, order);
+    return format_letter_suffix_ordered(q, labels, "", after, order);
 }
 
 std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
@@ -317,10 +340,22 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
     if (sources.full == nullptr) {
         throw std::invalid_argument("the letter readout needs a full-logits engine");
     }
-    const auto split = render_letter_prompt(tmpls, use_jinja, letter_system_text());
+    const auto split  = render_letter_prompt(tmpls, use_jinja, letter_system_text());
+    const bool session = sources.session != nullptr;
+
+    // A live-session readout appends a fresh user turn with the questions, because the transcript
+    // already carries the system prompt and the state. The stateless readout keeps the question in
+    // the state's user turn. Both share the option lines and the answer tail.
+    std::string before;                // user-turn open, session only
+    std::string after = split.second;  // user-turn close plus assistant open
+    if (session) {
+        const auto turn = split_user_turn(tmpls, use_jinja);
+        before = turn.first;
+        after  = turn.second;
+    }
 
     validate_label_capacity(req, labels.size());
-    verify_letter_request(vocab, split.second, req, labels);
+    verify_letter_request(vocab, after, req, labels);
 
     // One scoring field per (question, pass): pass 0 keeps the caller's order, later passes
     // present the same options in distinct seeded orders so the mean is order-de-biased.
@@ -336,7 +371,7 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
         for (int o = 0; o < n_perm; ++o) {
             std::vector<size_t> order = permutation_order(k, q.id, o);
             field_input in;
-            in.suffix      = format_letter_suffix_ordered(q, labels, split.second, order);
+            in.suffix      = format_letter_suffix_ordered(q, labels, before, after, order);
             in.temperature = (float) question_temperature(req, q);
             in.candidates.reserve(k);
             for (size_t i = 0; i < k; ++i) {
@@ -360,7 +395,7 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
     // context is used otherwise. Only the model-level head availability is a client error; a
     // context that cannot carry the head falls back with a reason, like the default path.
     const llama_model * model = sources.full->get_model();
-    if (req.head == "selected") {
+    if (req.head == "selected" && !session) {
         require_selected_head(req.head, head_cache.probe(model));
     }
     // the row table is a pure function of (model, labels), so the cache builds it once
@@ -372,7 +407,9 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
 
     engine * chosen = sources.full;
     std::string fallback_reason;
-    if (req.head != "full") {
+    // A live session has no classifier option: the classifier-only context has its own cache and
+    // cannot fork a chat slot, so a session readout always uses full logits on the shared context.
+    if (req.head != "full" && !session) {
         if (!head.available()) {
             fallback_reason = head.reason.empty() ? "the selected answer head is unavailable" : head.reason;
         } else if (sources.classifier == nullptr) {
@@ -390,7 +427,9 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
         }
     }
 
-    const auto b = chosen->decide_batch(plan, split.first, { render_state(req.state) }, readout_opt);
+    const batch_result b = session
+        ? sources.full->decide_batch_from_seq(sources.session->seq, sources.session->base_pos, plan, readout_opt)
+        : chosen->decide_batch(plan, split.first, { render_state(req.state) }, readout_opt);
 
     if (metrics) {
         metrics->cache_hit      = b.cache_hit;
@@ -439,7 +478,12 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
     }
 
     if (audit != nullptr) {
-        audit->prompt_sha256      = sha256_hex(split.first + render_state(req.state) + split.second);
+        // A stateless prompt hashes the rendered text; a session prompt's transcript lives on the
+        // source sequence, so it identifies the fork instead of a text that was never rendered.
+        audit->prompt_sha256      = session
+            ? sha256_hex(std::string("session|") + std::to_string(sources.session->seq) + "|" +
+                         std::to_string(sources.session->base_pos) + "|" + letter_system_text())
+            : sha256_hex(split.first + render_state(req.state) + split.second);
         audit->prompt_version     = LETTER_PROMPT_VERSION;
         audit->probability_status = "conditional option score over quantized weights; uncalibrated as decision confidence";
         audit->full_vocab_audit   = !b.head_active;

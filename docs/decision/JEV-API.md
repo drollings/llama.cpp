@@ -247,6 +247,58 @@ Score with structured levels (legend echoes objects):
 ### 4.4 Confidence guidance [Doc]
 Callers gate actions on `confidence` (docs suggest a floor around 0.5 and stricter thresholds for high-stakes actions, e.g. >0.9). It describes the model's certainty, not correctness. Docs also say `confidence` is a default convenience and callers may compute their own from `probabilities`.
 
+### 4.5 Local confidence and certainty vs the Jev formula [Local]
+
+The local implementation returns two numbers on `choice` and `score`:
+
+- `confidence = 1 - H / log K`, where `H = -sum_i p_i log p_i` and `K` is the option count. This is
+  the **normalized inverse entropy**: 0 at a uniform distribution, 1 when all mass is on one option.
+  It reads the whole distribution.
+- `certainty = max_i p_i`, the **winner's share**. It reads only the winner.
+
+The documented Jev Choice confidence is a different number: `(K * p_max - 1) / (K - 1)`, clamped to
+[0,1]. Written in terms of `certainty`, that is exactly
+
+```
+Jev confidence = (K * certainty - 1) / (K - 1)
+```
+
+so the Jev number is a linear rescale of the winner's share that maps a uniform distribution to 0.
+It is not entropy: it ignores every option except the winner. The Score form above K=3 stays
+[Undocumented], so no exact parity claim is possible there either.
+
+Measured on the committed readout corpus (two- and three-option questions), the three numbers for
+the same distribution are:
+
+| probabilities | `confidence` (1 - H/log K) | `certainty` (max p) | Jev `(K p_max - 1)/(K - 1)` |
+|---|---|---|---|
+| (0.5004, 0.4996), K=2 | 5.1e-7 | 0.5004 | 0.0008 |
+| (0.0012, 0.9987), K=2 | 0.9859 | 0.9987 | 0.9975 |
+| (0.0012, 0.0465, 0.9523), K=3 | 0.8205 | 0.9523 | 0.9284 |
+| (0.0062, 0.1662, 0.8276), K=3 | 0.5571 | 0.8276 | 0.7413 |
+
+`certainty` is the raw winner's share, the Jev number is that share rescaled, and `confidence` is
+lowest of the three because it also penalizes mass spread across the non-winners. The gap is
+largest, and the Jev number most flattering, when the distribution is flat enough that `p_max`
+alone looks confident.
+
+Implementation notes [Local]:
+
+- `confidence` is always present on `choice` and `score`; `certainty` is additive and present when
+  `diagnostics` is set. `noul` carries neither, matching the documented contract.
+- Both are pure functions of `probabilities`, so a caller can recompute either and need not trust
+  the server. Neither number ever gates correctness, admission, caching, or routing.
+- The documented Jev value is available as an opt-in: a request with
+  `confidence_profile: "jev"` returns `(N*p_max - 1)/(N - 1)` clamped to [0,1] as `confidence`
+  (the same monotone rule above K=3, where Jev is undocumented). The default stays
+  `1 - H/logK`, so existing callers and goldens are unchanged. `certainty` is unaffected by the
+  profile. The profile changes only the reported concentration; probabilities are identical.
+- The benchmark surfaces record both: `bench-decision --json` reports
+  `metrics.<field>.{confidence,certainty}`, and the frozen readout baselines store both per
+  question.
+- Definitions: `inverse_entropy_confidence`, `winner_share` and `jev_winner_share_confidence` in
+  `tools/parallel-decision/decision-protocol.cpp`.
+
 ---
 
 ## 5. Models

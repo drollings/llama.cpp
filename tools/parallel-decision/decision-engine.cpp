@@ -268,8 +268,11 @@ engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs)
     if (n_swa > 0) {
         swa_ = (llama_pos) n_swa;
     }
-    // Recurrent and hybrid memory cannot be copied between sequences; save and restore instead.
-    probe_fork_ = (llama_model_is_recurrent(model) || llama_model_is_hybrid(model)) ? fork_kind::restore : fork_kind::copy;
+    // Recurrent and hybrid memory keeps state outside the KV cache, so an attention-only copy
+    // drops it. The hybrid fork copies attention cells by metadata and the recurrent state from a
+    // partial save; the full restore stays the fallback when the partial format is unavailable.
+    const bool recurrent = llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
+    probe_fork_ = recurrent ? (partial_state_capable() ? fork_kind::hybrid : fork_kind::restore) : fork_kind::copy;
 }
 
 void engine::select_fork(const std::string & requested) {
@@ -282,18 +285,32 @@ void engine::select_fork(const std::string & requested) {
         active_fork_ = fork_kind::copy;
     } else if (requested == "restore") {
         active_fork_ = fork_kind::restore;
+    } else if (requested == "hybrid") {
+        active_fork_ = fork_kind::hybrid;
     } else if (requested == "auto") {
+        // The partial state format is the fast path for a recurrent model; fall back to the full
+        // restore once a failed partial save retires the capability for the process.
         active_fork_ = probe_fork_;
+        if (active_fork_ == fork_kind::hybrid && !partial_state_capable()) {
+            active_fork_ = fork_kind::restore;
+        }
     } else {
-        throw std::invalid_argument("fork must be auto, copy or restore");
+        throw std::invalid_argument("fork must be auto, copy, restore or hybrid");
     }
 }
 
-llama_state_seq_flags engine::state_load_flags(bool on_device) {
-    return on_device ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : LLAMA_STATE_SEQ_FLAGS_NONE;
+llama_state_seq_flags engine::state_load_flags(bool on_device, bool partial) {
+    llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_NONE;
+    if (on_device) {
+        flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+    }
+    if (partial) {
+        flags |= LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    }
+    return flags;
 }
 
-engine::saved_state engine::save_seq(llama_seq_id seq, bool prefer_device) const {
+engine::saved_state engine::save_seq(llama_seq_id seq, bool prefer_device, bool partial) const {
     // A sequence that was never decoded has no state; saving it must be an error, never a
     // header-only state that a later load would restore as nothing. Occupancy is authoritative:
     // the sequence state writer always emits at least a header, so its byte count cannot tell an
@@ -304,23 +321,33 @@ engine::saved_state engine::save_seq(llama_seq_id seq, bool prefer_device) const
     // The device path stages the tensor bytes in the context staging buffer and returns only a
     // small metadata header on the host, so a saved device state is not self-contained. Prefer it
     // only where the state is consumed before the next save; otherwise use the self-contained host
-    // format. A failed device save retires the device path for the process lifetime.
-    if (prefer_device && device_capable_) {
-        const size_t size = llama_state_seq_get_size_ext(ctx, seq, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+    // format. A failed device save retires the device path for its scope for the process lifetime.
+    const auto                          scope      = device_scope_.find(seq);
+    const bool                          scope_ok   = scope == device_scope_.end() || scope->second == partial;
+    const bool                          capable    = partial ? partial_device_capable_ : device_capable_;
+    const llama_state_seq_flags         device     = state_load_flags(true, partial);
+    if (prefer_device && capable && scope_ok) {
+        const size_t size = llama_state_seq_get_size_ext(ctx, seq, device);
         if (size != 0) {
             std::vector<uint8_t> buf(size);
-            if (llama_state_seq_get_data_ext(ctx, buf.data(), buf.size(), seq, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == size) {
-                return { std::move(buf), true };
+            if (llama_state_seq_get_data_ext(ctx, buf.data(), buf.size(), seq, device) == size) {
+                device_scope_[seq] = partial;
+                return { std::move(buf), device };
             }
         }
-        device_capable_ = false;
+        if (partial) {
+            partial_device_capable_ = false;
+        } else {
+            device_capable_ = false;
+        }
     }
-    const size_t size = llama_state_seq_get_size(ctx, seq);
+    const llama_state_seq_flags host = state_load_flags(false, partial);
+    const size_t size = llama_state_seq_get_size_ext(ctx, seq, host);
     std::vector<uint8_t> buf(size);
-    if (llama_state_seq_get_data(ctx, buf.data(), buf.size(), seq) != size) {
+    if (size == 0 || llama_state_seq_get_data_ext(ctx, buf.data(), buf.size(), seq, host) != size) {
         throw std::runtime_error("failed to save a decision sequence state");
     }
-    return { std::move(buf), false };
+    return { std::move(buf), host };
 }
 
 void engine::load_seq(const saved_state & state, llama_seq_id seq) const {
@@ -329,14 +356,13 @@ void engine::load_seq(const saved_state & state, llama_seq_id seq) const {
         // loudly instead of silently restoring nothing.
         throw std::runtime_error("cannot load an empty decision sequence state");
     }
-    // The format belongs to the value: the device flag is never substituted for the host flag or
-    // the other way around, so a stale engine flag cannot misread the bytes. A failed device load is
-    // fatal because the host bytes are not present to fall back to.
-    const size_t n = llama_state_seq_set_data_ext(ctx, state.bytes.data(), state.bytes.size(), seq,
-                                                  state_load_flags(state.on_device));
+    // The format and the scope belong to the value: the device flag is never substituted for the
+    // host flag or the other way around, so a stale engine flag cannot misread the bytes. A failed
+    // device load is fatal because the host bytes are not present to fall back to.
+    const size_t n = llama_state_seq_set_data_ext(ctx, state.bytes.data(), state.bytes.size(), seq, state.flags);
     if (n == 0) {
-        throw std::runtime_error(state.on_device ? "failed to restore a device decision sequence state"
-                                                 : "failed to restore a decision sequence state");
+        throw std::runtime_error(state.on_device() ? "failed to restore a device decision sequence state"
+                                                   : "failed to restore a decision sequence state");
     }
 }
 
@@ -358,6 +384,36 @@ void engine::fork_into(llama_seq_id src, llama_seq_id dst, const saved_state * s
         }
     }
     llama_memory_seq_cp(mem, src, dst, p0, -1);
+    if (active_fork_ == fork_kind::hybrid) {
+        // The shared attention cells are only metadata; the recurrent part lives outside the KV
+        // cache and must be copied from a partial parent state. An empty state means the parent has
+        // no decoded state yet, so the copy above is all there is.
+        if (src_state == nullptr) {
+            throw std::runtime_error("a hybrid fork needs a partial parent state");
+        }
+        if (!src_state->bytes.empty()) {
+            if ((src_state->flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+                throw std::runtime_error("a hybrid fork needs a partial parent state");
+            }
+            load_seq(*src_state, dst);
+        }
+    }
+}
+
+// The saved parent state a branch fork loads: none for a copy fork, otherwise the trunk's entry in
+// the wave's saved states. Looked up once so every fork site shares one bounds check.
+const engine::saved_state * engine::parent_state_for(const std::vector<saved_state> * parent_states, llama_seq_id trunk) const {
+    if (active_fork_ == fork_kind::copy) {
+        return nullptr;
+    }
+    if (parent_states == nullptr) {
+        throw capacity_error("a save/restore fork needs parent states");
+    }
+    const size_t idx = (size_t) (trunk - seq_pool);
+    if (idx >= parent_states->size()) {
+        throw capacity_error("missing parent state for a decision branch");
+    }
+    return &(*parent_states)[idx];
 }
 
 void engine::check_cancel() const {
@@ -425,7 +481,14 @@ void engine::decode_parts(const std::vector<prompt_part> & parts) {
 // Restore (or build) the cached static prefix on seq_snap. Only this engine's own sequences are
 // touched, so it can share a context with other users (e.g. server slots).
 bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache, const std::string & tag) {
-    if (allow_cache && !shared.empty() && active_fork_ == fork_kind::restore && !tag.empty()) {
+    // The hybrid fork copies attention by sequence metadata and loads only the recurrent part from a
+    // partial state, so its prefix state is partial. The LRU checkpoint stays a self-contained full
+    // host state: restoring it must rebuild both the attention cells a trunk copy shares and the
+    // recurrent state the partial prefix save reads.
+    const bool partial_state = active_fork_ == fork_kind::hybrid;
+    const bool restorable    = active_fork_ == fork_kind::restore || partial_state;
+
+    if (allow_cache && !shared.empty() && restorable && !tag.empty()) {
         for (size_t i = 0; i < prefix_lru_.size(); ++i) {
             if (prefix_lru_[i].tag == tag) {
                 prefix_entry entry = std::move(prefix_lru_[i]);
@@ -433,7 +496,7 @@ bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache, const std
                 clear_seqs(seq_snap, n_pool + 1); // the state moves to seq_snap, so everything resets
                 // the LRU entry is host format; refresh the device copy for the current request only
                 load_seq(entry.state, seq_snap);
-                prefix_state_ = save_seq(seq_snap, true);
+                prefix_state_ = save_seq(seq_snap, true, partial_state);
                 cached        = shared;
                 cached_tag    = tag;
                 // move the entry back to the front; the state bytes are not copied
@@ -445,6 +508,14 @@ bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache, const std
         const bool tag_ok = tag.empty() || tag == cached_tag;
         if (allow_cache && tag_ok && !shared.empty() && shared == cached &&
             llama_memory_seq_pos_max(mem, seq_snap) == (llama_pos) cached.size() - 1) {
+            // The cached prefix on seq_snap survives across requests, but a strategy change means
+            // the prefix state a fork loads must be refreshed for the new scope.
+            if (restorable) {
+                const bool have_partial = (prefix_state_.flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
+                if (prefix_state_.bytes.empty() || have_partial != partial_state) {
+                    prefix_state_ = save_seq(seq_snap, true, partial_state);
+                }
+            }
             return true;
         }
     }
@@ -457,12 +528,12 @@ bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache, const std
         decode_parts({ { &shared, 0, seq_snap } });
         cached     = shared;
         cached_tag = tag;
-        if (active_fork_ == fork_kind::restore) {
-            prefix_state_ = save_seq(seq_snap, true);
+        if (restorable) {
+            prefix_state_ = save_seq(seq_snap, true, partial_state);
             if (!tag.empty()) {
                 // the LRU entry must outlive the request, so it uses the self-contained host format
-                saved_state host_state = save_seq(seq_snap, false);
-                assert(!host_state.on_device);
+                saved_state host_state = save_seq(seq_snap, false, false);
+                assert(!host_state.on_device());
                 prefix_lru_.insert(prefix_lru_.begin(), { tag, std::move(host_state) });
                 while (prefix_lru_.size() > prefix_lru_capacity_) {
                     prefix_lru_.pop_back();
@@ -545,19 +616,7 @@ std::vector<engine::branch_score> engine::score_branches(const std::vector<branc
             // state and the final chunk yields the scored position.
             const size_t b = start;
             const llama_seq_id seq = first;
-            if (active_fork_ == fork_kind::restore) {
-                if (parent_states == nullptr) {
-                    throw capacity_error("a restore fork needs parent states");
-                }
-                const size_t idx = (size_t) (branches[b].trunk - seq_pool);
-                if (idx >= parent_states->size()) {
-                    throw capacity_error("missing parent state for a decision branch");
-                }
-                llama_memory_seq_rm(mem, seq, -1, -1);
-                load_seq((*parent_states)[idx], seq);
-            } else {
-                fork_into(branches[b].trunk, seq, nullptr);
-            }
+            fork_into(branches[b].trunk, seq, parent_state_for(parent_states, branches[b].trunk));
             const auto & toks = branches[b].toks;
             for (size_t i = 0; i < toks.size(); i += (size_t) max_rows) {
                 const size_t n = std::min((size_t) max_rows, toks.size() - i);
@@ -591,19 +650,7 @@ std::vector<engine::branch_score> engine::score_branches(const std::vector<branc
         std::vector<int> out_idx;
         for (size_t b = start; b < end; ++b) {
             const llama_seq_id seq = first + (llama_seq_id) (b - start);
-            if (active_fork_ == fork_kind::restore) {
-                if (parent_states == nullptr) {
-                    throw capacity_error("a restore fork needs parent states");
-                }
-                const size_t idx = (size_t) (branches[b].trunk - seq_pool);
-                if (idx >= parent_states->size()) {
-                    throw capacity_error("missing parent state for a decision branch");
-                }
-                llama_memory_seq_rm(mem, seq, -1, -1);
-                load_seq((*parent_states)[idx], seq);
-            } else {
-                fork_into(branches[b].trunk, seq, nullptr);
-            }
+            fork_into(branches[b].trunk, seq, parent_state_for(parent_states, branches[b].trunk));
             const auto & toks = branches[b].toks;
             for (size_t i = 0; i < toks.size(); ++i) {
                 const bool last = i + 1 == toks.size();
@@ -888,7 +935,6 @@ batch_result engine::decide_batch(const compiled_fields &          plan,
     }
 
     const std::vector<decision_field> & fields          = plan.p->fields;
-    const std::vector<size_t> &         field_first     = plan.p->field_first;
     const tokens_t &                    plan_common     = plan.p->plan_common;
     const int                           total           = plan.rows;
     const int                           branches        = plan.branches;
@@ -986,7 +1032,8 @@ batch_result engine::decide_batch(const compiled_fields &          plan,
                     load_seq(prefix_state_, trunk);
                 }
             } else {
-                fork_into(seq_snap, trunk, nullptr);
+                // copy ignores the state; hybrid loads the partial prefix into the trunk it copied
+                fork_into(seq_snap, trunk, &prefix_state_);
             }
             parts.push_back({ &tails[g0 + i], (llama_pos) shared.size(), trunk });
         }
@@ -994,118 +1041,246 @@ batch_result engine::decide_batch(const compiled_fields &          plan,
         llama_synchronize(ctx); // llama_decode is asynchronous: wait for the prefill so its time isn't billed to scoring
         out.prefill_ms += ms_since(tp);
 
-        std::vector<saved_state> trunk_states;
-        if (active_fork_ == fork_kind::restore) {
-            trunk_states.reserve(n_group);
-            for (size_t i = 0; i < n_group; ++i) {
-                trunk_states.push_back(save_seq(seq_pool + (llama_seq_id) i, true));
-            }
+        std::vector<trunk_run> runs;
+        runs.reserve(n_group);
+        for (size_t i = 0; i < n_group; ++i) {
+            runs.push_back({ seq_pool + (llama_seq_id) i,
+                             (llama_pos) (shared.size() + tails[g0 + i].size()),
+                             g0 + i, prefixes[g0 + i].size() });
         }
+        run_trunk_wave(out, plan, runs, opt.bypass);
+    }
+    out.head_active = head_active_;
+    out.head_reason = head_reason_;
+    return out;
+}
 
-        // round 1 carries every tree node and each greedy field's first step; later rounds only
-        // continue greedy fields that are still open
-        const auto ts = std::chrono::steady_clock::now();
-        std::vector<std::vector<decision_field>> state(n_group, fields);
-        bool first = true;
-        while (true) {
-            check_cancel();
-            if (yield_) {
-                yield_(); // let the caller serve light requests between waves
-            }
-            std::vector<branch> todo;
-            std::vector<std::pair<size_t, size_t>> owner; // (context in group, field)
-            for (size_t i = 0; i < n_group; ++i) {
-                const llama_seq_id trunk = seq_pool + (llama_seq_id) i;
-                const llama_pos    pos0  = (llama_pos) (shared.size() + tails[g0 + i].size());
-                for (size_t f = 0; f < state[i].size(); ++f) {
-                    auto & fd = state[i][f];
-                    if (fd.use_tree) {
-                        if (first) {
-                            for (size_t n = 0; n < fd.node_prefix.size(); ++n) {
-                                tokens_t ids = fd.suffix;
-                                ids.insert(ids.end(), fd.node_prefix[n].begin(), fd.node_prefix[n].end());
-                                todo.push_back({ trunk, pos0, ids, fd.node_options[n] });
-                                owner.push_back({ i, f });
-                            }
-                        }
-                    } else {
-                        tokens_t opts = fd.options();
-                        if (!opts.empty()) {
+// The one scoring loop shared by every decide entry point. It assumes each run's trunk has already
+// been forked and prefilled and that its head was decoded at the position before branch_pos.
+void engine::run_trunk_wave(batch_result & out, const compiled_fields & plan, const std::vector<trunk_run> & runs,
+                            bool allow_bypass) {
+    const std::vector<decision_field> & fields             = plan.p->fields;
+    const std::vector<size_t> &         field_first        = plan.p->field_first;
+    const int                           total              = plan.rows;
+    const size_t                        suffix_tokens      = plan.suffix_tokens;
+    const size_t                        leaf_suffix_tokens = plan.leaf_suffix_tokens;
+    const size_t                        n_group            = runs.size();
+    if (n_group == 0) {
+        return;
+    }
+
+    const bool save_trunks = active_fork_ == fork_kind::restore || active_fork_ == fork_kind::hybrid;
+    std::vector<saved_state> trunk_states;
+    if (save_trunks) {
+        const bool partial = active_fork_ == fork_kind::hybrid;
+        trunk_states.reserve(n_group);
+        for (size_t i = 0; i < n_group; ++i) {
+            assert(runs[i].trunk == seq_pool + (llama_seq_id) i);
+            trunk_states.push_back(save_seq(seq_pool + (llama_seq_id) i, true, partial));
+        }
+    }
+
+    // round 1 carries every tree node and each greedy field's first step; later rounds only
+    // continue greedy fields that are still open
+    const auto ts = std::chrono::steady_clock::now();
+    std::vector<std::vector<decision_field>> state(n_group, fields);
+    bool first = true;
+    while (true) {
+        check_cancel();
+        if (yield_) {
+            yield_(); // let the caller serve light requests between waves
+        }
+        std::vector<branch> todo;
+        std::vector<std::pair<size_t, size_t>> owner; // (trunk in wave, field)
+        for (size_t i = 0; i < n_group; ++i) {
+            const llama_seq_id trunk = runs[i].trunk;
+            const llama_pos    pos0  = runs[i].branch_pos;
+            for (size_t f = 0; f < state[i].size(); ++f) {
+                auto & fd = state[i][f];
+                if (fd.use_tree) {
+                    if (first) {
+                        for (size_t n = 0; n < fd.node_prefix.size(); ++n) {
                             tokens_t ids = fd.suffix;
-                            ids.insert(ids.end(), fd.chosen.begin(), fd.chosen.end());
-                            todo.push_back({ trunk, pos0, ids, opts });
+                            ids.insert(ids.end(), fd.node_prefix[n].begin(), fd.node_prefix[n].end());
+                            todo.push_back({ trunk, pos0, ids, fd.node_options[n] });
                             owner.push_back({ i, f });
                         }
                     }
+                } else {
+                    tokens_t opts = fd.options();
+                    if (!opts.empty()) {
+                        tokens_t ids = fd.suffix;
+                        ids.insert(ids.end(), fd.chosen.begin(), fd.chosen.end());
+                        todo.push_back({ trunk, pos0, ids, opts });
+                        owner.push_back({ i, f });
+                    }
                 }
             }
-            if (todo.empty()) {
-                break;
-            }
-            const auto scores = score_branches(todo, seq_pool + (llama_seq_id) n_group, n_pool - (int) n_group,
-                                                trunk_states.empty() ? nullptr : &trunk_states, opt.bypass && todo.size() == 1);
-            out.rounds += 1;
-            std::vector<std::vector<std::vector<std::vector<float>>>> tree_scores(n_group, std::vector<std::vector<std::vector<float>>>(fields.size()));
-            for (size_t row = 0; row < owner.size(); ++row) {
-                const auto [i, f] = owner[row];
-                auto & fd = state[i][f];
-                if (fd.use_tree) {
-                    tree_scores[i][f].push_back(scores[row].cand_logits);
-                    if (!fd.audit_valid) {
-                        fd.allowed_token_mass = scores[row].allowed_token_mass;
-                        fd.full_vocab_argmax   = scores[row].full_vocab_argmax;
-                        fd.audit_logits        = scores[row].cand_logits;
-                        fd.audit_valid         = true;
-                    }
-                } else {
-                    const auto & s    = scores[row].cand_logits;
-                    const auto   p    = softmax(s, fd.temperature);
-                    const int    best = (int) (std::max_element(s.begin(), s.end()) - s.begin());
-                    fd.select(todo[row].cands[best], p[best]);
+        }
+        if (todo.empty()) {
+            break;
+        }
+        const auto scores = score_branches(todo, seq_pool + (llama_seq_id) n_group, n_pool - (int) n_group,
+                                            trunk_states.empty() ? nullptr : &trunk_states, allow_bypass && todo.size() == 1);
+        out.rounds += 1;
+        std::vector<std::vector<std::vector<std::vector<float>>>> tree_scores(n_group, std::vector<std::vector<std::vector<float>>>(fields.size()));
+        for (size_t row = 0; row < owner.size(); ++row) {
+            const auto [i, f] = owner[row];
+            auto & fd = state[i][f];
+            if (fd.use_tree) {
+                tree_scores[i][f].push_back(scores[row].cand_logits);
+                if (!fd.audit_valid) {
                     fd.allowed_token_mass = scores[row].allowed_token_mass;
                     fd.full_vocab_argmax   = scores[row].full_vocab_argmax;
                     fd.audit_logits        = scores[row].cand_logits;
                     fd.audit_valid         = true;
                 }
+            } else {
+                const auto & s    = scores[row].cand_logits;
+                const auto   p    = softmax(s, fd.temperature);
+                const int    best = (int) (std::max_element(s.begin(), s.end()) - s.begin());
+                fd.select(todo[row].cands[best], p[best]);
+                fd.allowed_token_mass = scores[row].allowed_token_mass;
+                fd.full_vocab_argmax   = scores[row].full_vocab_argmax;
+                fd.audit_logits        = scores[row].cand_logits;
+                fd.audit_valid         = true;
             }
-            if (first) {
-                for (size_t i = 0; i < n_group; ++i) {
-                    for (size_t f = 0; f < fields.size(); ++f) {
-                        if (state[i][f].use_tree) {
-                            state[i][f].finish_tree(tree_scores[i][f]);
-                        }
+        }
+        if (first) {
+            for (size_t i = 0; i < n_group; ++i) {
+                for (size_t f = 0; f < fields.size(); ++f) {
+                    if (state[i][f].use_tree) {
+                        state[i][f].finish_tree(tree_scores[i][f]);
                     }
                 }
             }
-            first = false;
         }
-        clear_seqs(seq_pool, (int) n_group);
-        for (size_t i = 0; i < n_group; ++i) {
-            result & r = out.items[g0 + i];
-            r.context_tokens = prefixes[g0 + i].size();
-            r.rows           = total;
-            r.head_active        = head_active_;
-            r.head_reason        = head_reason_;
-            r.suffix_tokens        = suffix_tokens;
-            r.common_suffix_tokens = plan_common.size();
-            r.leaf_suffix_tokens   = leaf_suffix_tokens;
-            std::vector<field_result> scored;
-            scored.reserve(state[i].size());
-            for (auto & fd : state[i]) {
-                if (fd.use_tree && fd.probs.empty()) {
-                    fd.finish_tree({});
-                }
-                scored.push_back({ fd.winner, fd.path_score, fd.scored_nodes, fd.use_tree, fd.probs,
-                                   fd.allowed_token_mass, fd.full_vocab_argmax, std::move(fd.audit_logits) });
-            }
-            r.fields.resize(field_first.size());
-            for (size_t f = 0; f < field_first.size(); ++f) {
-                r.fields[f] = scored[field_first[f]];
-            }
-        }
-        llama_synchronize(ctx); // the pool sequences are clear before the next group or call reuses them
-        out.scoring_ms += ms_since(ts);
+        first = false;
     }
+    clear_seqs(seq_pool, (int) n_group);
+    for (size_t i = 0; i < n_group; ++i) {
+        result & r = out.items[runs[i].out_index];
+        r.context_tokens       = runs[i].context_tokens;
+        r.rows                 = total;
+        r.head_active          = head_active_;
+        r.head_reason          = head_reason_;
+        r.suffix_tokens        = suffix_tokens;
+        r.common_suffix_tokens = plan.common_suffix_tokens;
+        r.leaf_suffix_tokens   = leaf_suffix_tokens;
+        std::vector<field_result> scored;
+        scored.reserve(state[i].size());
+        for (auto & fd : state[i]) {
+            if (fd.use_tree && fd.probs.empty()) {
+                fd.finish_tree({});
+            }
+            scored.push_back({ fd.winner, fd.path_score, fd.scored_nodes, fd.use_tree, fd.probs,
+                               fd.allowed_token_mass, fd.full_vocab_argmax, std::move(fd.audit_logits) });
+        }
+        r.fields.resize(field_first.size());
+        for (size_t f = 0; f < field_first.size(); ++f) {
+            r.fields[f] = scored[field_first[f]];
+        }
+    }
+    llama_synchronize(ctx); // the pool sequences are clear before the next group or call reuses them
+    out.scoring_ms += ms_since(ts);
+}
+
+batch_result engine::decide_batch_from_seq(llama_seq_id src, llama_pos base_pos, const compiled_fields & plan,
+                                           const options & opt, const std::string & tail_before_common) {
+    if (opt.mode != "auto" && opt.mode != "tree" && opt.mode != "greedy") {
+        throw std::invalid_argument("mode must be auto, tree or greedy");
+    }
+    if (plan.p == nullptr) {
+        throw std::runtime_error("the decision plan is empty");
+    }
+    // The source is the session the caller wants answered; a sequence with no decoded state has
+    // nothing to fork, which is a caller error rather than an empty result.
+    const llama_pos src_pos_max = llama_memory_seq_pos_max(mem, src);
+    if (src_pos_max < 0) {
+        throw std::invalid_argument("the session source sequence has no decoded state");
+    }
+    // The head must continue at the source's next position. A wrong value would decode over the
+    // source's own cells, so reject it instead of shifting the branch positions silently.
+    if (base_pos != src_pos_max + 1) {
+        throw std::invalid_argument("the session fork must continue at the source sequence's next position");
+    }
+    select_fork(opt.fork);
+    stop_  = opt.should_stop;
+    yield_ = opt.yield;
+    audit_ = opt.audit;
+    llama_synchronize(ctx);
+    check_cancel();
+
+    head_        = opt.head;
+    head_active_ = false;
+    head_reason_.clear();
+    if (opt.head != nullptr) {
+        if (select_scoring_head(plan, opt, &head_reason_)) {
+            head_active_ = true;
+        }
+    }
+    if (llama_context_classifier_only(ctx) && !head_active_) {
+        throw unsupported_error("a classifier-only decision context requires an answer head that covers every candidate");
+    }
+
+    // only the plan's suffix head is left to decode: the source already carries the session text
+    tokens_t head = tokenize(tail_before_common, false);
+    head.insert(head.end(), plan.p->plan_common.begin(), plan.p->plan_common.end());
+
+    batch_result out;
+    out.shared_tokens        = 0;
+    out.rows                 = plan.rows;
+    out.suffix_tokens        = plan.suffix_tokens;
+    out.common_suffix_tokens = plan.common_suffix_tokens;
+    out.leaf_suffix_tokens   = plan.leaf_suffix_tokens;
+    out.items.resize(1);
+
+    size_t max_branch = 0;
+    for (const auto & fd : plan.p->fields) {
+        for (const auto & p : fd.paths) {
+            max_branch = std::max(max_branch, p.size());
+        }
+    }
+    // The source occupies cells up to base_pos and the trunk copies them, so the peak is the
+    // source plus the head and the branch suffixes decoded above it. Reject an over-budget request
+    // before touching the cache; the decode rc==1 path is the actual guarantee.
+    const size_t branch_wave = std::min((size_t) n_pool, (size_t) plan.branches);
+    const size_t peak        = (size_t) std::max<llama_pos>(base_pos, 0) + head.size()
+                             + branch_wave * (head.size() + max_branch);
+    const size_t budget      = (size_t) llama_n_ctx(ctx);
+    if (peak > budget) {
+        throw capacity_error("decision context budget exceeded: the request needs up to " + std::to_string(peak) +
+                             " tokens but the context holds " + std::to_string(budget) +
+                             " (raise --decision-ctx-size)");
+    }
+
+    // A restore or hybrid fork loads the parent from a saved state; a copy fork ignores it. Saving
+    // the live source is read-only for `src`.
+    saved_state src_state;
+    if (active_fork_ != fork_kind::copy) {
+        src_state = save_seq(src, true, active_fork_ == fork_kind::hybrid);
+    }
+
+    struct pool_cleanup {
+        engine * e;
+        ~pool_cleanup() { e->clear_pool_seqs(); }
+    } cleanup{this};
+
+    const auto tp = std::chrono::steady_clock::now();
+    const llama_seq_id trunk = seq_pool;
+    fork_into(src, trunk, &src_state);
+    if (!head.empty()) {
+        const std::vector<prompt_part> parts = { { &head, base_pos, trunk } };
+        decode_parts(parts);
+    }
+    llama_synchronize(ctx);
+    out.prefill_ms += ms_since(tp);
+
+    const std::vector<trunk_run> runs = {
+        { trunk, base_pos + (llama_pos) head.size(), 0, (size_t) std::max<llama_pos>(base_pos, 0) },
+    };
+    run_trunk_wave(out, plan, runs, opt.bypass);
+
     out.head_active = head_active_;
     out.head_reason = head_reason_;
     return out;

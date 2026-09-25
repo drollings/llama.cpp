@@ -616,6 +616,50 @@
         "serialization": "chat and decision never decode at the same time"
       }
     },
+    "readout_compatibility": {
+      "trigger": "opt-in confidence profile and order-de-bias pass profile",
+      "axis": "task-value",
+      "may_gate": [
+        "which confidence value is reported",
+        "how many order-de-bias passes run"
+      ],
+      "may_not_gate": [
+        "admission",
+        "caching",
+        "routing",
+        "persistence",
+        "answer key"
+      ],
+      "production_gate": false,
+      "verdict": "the local 1-H/logK confidence and permutations=1 stay the defaults; the Jev confidence profile (N*p_max-1)/(N-1) and a higher default pass count are opt-in per request or per server flag and change only the reported concentration and the cost, never the winner gate; the corpus harness records winner agreement, Brier and ECE",
+      "control_group": {
+        "cases": [
+          {
+            "input": "no confidence_profile field",
+            "expect": "local 1-H/logK, unchanged answer"
+          },
+          {
+            "input": "confidence_profile=jev",
+            "expect": "rescaled winner share, same probabilities"
+          },
+          {
+            "input": "no permutations field at the default server",
+            "expect": "one pass"
+          },
+          {
+            "input": "server default permutations=2",
+            "expect": "two passes unless the request says otherwise"
+          }
+        ],
+        "metrics": [
+          "winner_agreement",
+          "brier",
+          "ece"
+        ],
+        "corpus": "accuracy_corpus.json",
+        "report": "accuracy_report.json"
+      }
+    },
     "determinism_allowlist": {
       "trigger": "weak-quant producer-stability allowlist",
       "axis": "producer-confidence",
@@ -633,13 +677,8 @@
       "production_gate": false,
       "verdict": "only a model whose GPU numerics move a winner may be listed; a model that passes the task-value checks is removed, never kept",
       "measurements": {
-        "entries": [
-          {
-            "model": "qwen3.5-2b-gguf/ud-q5_k_xl.gguf",
-            "verdict": "producer-variance: task-value assertions are skipped, never xfail"
-          }
-        ],
-        "count": 1,
+        "entries": [],
+        "count": 0,
         "non_allowlisted_runs_hard": true,
         "removed_when_task_value_passes": true,
         "production_gate": false

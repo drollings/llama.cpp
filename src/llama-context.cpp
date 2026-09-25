@@ -2603,6 +2603,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
 // state save/load
 //
 
+// Counts the tensor data transfers staged by a state save or load. A transposed cache region is
+// transferred as one strided op instead of one op per embedding, so the count is the observable
+// behind the bulk-copy path. Only the scheduler thread stages state, so a plain counter is enough.
+static uint64_t g_state_transfer_count = 0;
+
 class llama_io_write_dummy : public llama_io_write_i {
 public:
     llama_io_write_dummy(bool skip_tensors) : skip_tensors(skip_tensors) {}
@@ -2617,6 +2622,14 @@ public:
         }
 
         size_written += size;
+    }
+
+    void write_tensor_strided(ggml_tensor * /* tensor */, size_t /* offset */, size_t row_size, size_t n_rows, size_t /* row_stride */) override {
+        if (skip_tensors) {
+            return;
+        }
+
+        size_written += row_size * n_rows;
     }
 
     size_t n_bytes() override {
@@ -2639,6 +2652,7 @@ public:
         for (const auto & winfo : winfos) {
             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
         }
+        g_state_transfer_count += winfos.size();
     }
 
     void write(const void * src, size_t size) override {
@@ -2662,6 +2676,20 @@ public:
         ptr += size;
         size_written += size;
         buf_size -= size;
+    }
+
+    void write_tensor_strided(ggml_tensor * tensor, size_t offset, size_t row_size, size_t n_rows, size_t row_stride) override {
+        const size_t total = row_size * n_rows;
+        if (total > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+
+        ggml_backend_tensor_get_2d(tensor, ptr, offset, row_size, n_rows, row_stride, row_size);
+
+        ptr += total;
+        size_written += total;
+        buf_size -= total;
+        ++g_state_transfer_count;
     }
 
     size_t n_bytes() override {
@@ -2691,6 +2719,7 @@ public:
         for (const auto & rinfo : rinfos) {
             ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
         }
+        g_state_transfer_count += rinfos.size();
     }
 
     void read(void * dst, size_t size) override {
@@ -2714,6 +2743,20 @@ public:
         ptr += size;
         size_read += size;
         buf_size -= size;
+    }
+
+    void read_tensor_strided(ggml_tensor * tensor, size_t offset, size_t row_size, size_t n_rows, size_t row_stride) override {
+        const size_t total = row_size * n_rows;
+        if (total > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+
+        ggml_backend_tensor_set_2d(tensor, ptr, offset, row_size, n_rows, row_stride, row_size);
+
+        ptr += total;
+        size_read += total;
+        buf_size -= total;
+        ++g_state_transfer_count;
     }
 
     size_t n_bytes() override {
@@ -2749,6 +2792,13 @@ public:
         write(temp_buffer.data(), temp_buffer.size());
     }
 
+    void write_tensor_strided(ggml_tensor * tensor, size_t offset, size_t row_size, size_t n_rows, size_t row_stride) override {
+        temp_buffer.resize(row_size * n_rows);
+        ggml_backend_tensor_get_2d(tensor, temp_buffer.data(), offset, row_size, n_rows, row_stride, row_size);
+        write(temp_buffer.data(), temp_buffer.size());
+        ++g_state_transfer_count;
+    }
+
     size_t n_bytes() override {
         return size_written;
     }
@@ -2772,6 +2822,13 @@ public:
         temp_buffer.resize(size);
         read(temp_buffer.data(), size);
         ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
+    }
+
+    void read_tensor_strided(ggml_tensor * tensor, size_t offset, size_t row_size, size_t n_rows, size_t row_stride) override {
+        temp_buffer.resize(row_size * n_rows);
+        read(temp_buffer.data(), temp_buffer.size());
+        ggml_backend_tensor_set_2d(tensor, temp_buffer.data(), offset, row_size, n_rows, row_stride, row_size);
+        ++g_state_transfer_count;
     }
 
     size_t n_bytes() override {
@@ -2805,6 +2862,7 @@ static void stage_device_copies(ggml_backend_t backend, const std::vector<std::p
         for (const auto & [src, dst] : copies) {
             ggml_backend_tensor_copy(src, dst);
         }
+        g_state_transfer_count += copies.size();
         return;
     }
 
@@ -2813,6 +2871,8 @@ static void stage_device_copies(ggml_backend_t backend, const std::vector<std::p
     }
 
     ggml_backend_synchronize(backend);
+
+    g_state_transfer_count += copies.size();
 }
 
 class llama_io_write_device : public llama_io_write_i {
@@ -2930,6 +2990,14 @@ public:
     void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
         // save the write for later during destruction
         winfos.push_back({tensor, ptr, size, offset});
+    }
+
+    void write_tensor_strided(ggml_tensor * tensor, size_t offset, size_t row_size, size_t n_rows, size_t row_stride) override {
+        // The device staging is a flat byte stream that the reader may re-chunk, so a transposed
+        // region is staged one row at a time. The host format is where the rows travel as one op.
+        for (size_t i = 0; i < n_rows; ++i) {
+            write_tensor(tensor, offset + i * row_stride, row_size);
+        }
     }
 
     size_t n_bytes() override {
@@ -3110,6 +3178,12 @@ public:
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
         // save for later during destruction
         rinfos.push_back({tensor, ptr, size, offset});
+    }
+
+    void read_tensor_strided(ggml_tensor * tensor, size_t offset, size_t row_size, size_t n_rows, size_t row_stride) override {
+        for (size_t i = 0; i < n_rows; ++i) {
+            read_tensor(tensor, offset + i * row_stride, row_size);
+        }
     }
 
     size_t n_bytes() override {
@@ -4438,4 +4512,12 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+void llama_state_seq_debug_reset_transfers() {
+    g_state_transfer_count = 0;
+}
+
+uint64_t llama_state_seq_debug_transfer_count() {
+    return g_state_transfer_count;
 }

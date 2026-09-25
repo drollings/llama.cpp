@@ -67,6 +67,12 @@ std::pair<std::string, std::string> render_letter_prompt(const common_chat_templ
                                                          const std::string & system_text,
                                                          bool enable_thinking = false);
 
+// User-turn markers for a standalone user message: the text before and after the user content,
+// including the generation prompt. Appending a decision turn to a live session must not re-render
+// the transcript or add a second system message, so the turn is built from this split alone.
+std::pair<std::string, std::string> split_user_turn(const common_chat_templates * tmpls, bool use_jinja,
+                                                    bool enable_thinking = false);
+
 // The per-question branch text, ending just before the label is generated.
 std::string format_letter_suffix(const decision_question & q, const std::vector<label> & labels,
                                  const std::string & after);
@@ -158,14 +164,25 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
                                                letter_metrics * metrics = nullptr,
                                                answer_audit * audit = nullptr);
 
+// A live chat sequence to answer about instead of a stateless prompt. The readout forks `seq` at
+// `base_pos` and appends only the decision turn, so the transcript is never re-prefilled and the
+// source sequence is never mutated. Session forks are full-logits only: the classifier context has
+// its own cache and cannot fork a chat slot.
+struct session_source {
+    llama_seq_id seq      = -1;
+    llama_pos    base_pos = -1;
+};
+
 // The contexts a letter request may run on: the classifier-only fast path and the shared
 // full-logits fallback. The readout picks the classifier engine when the request's compiled plan
 // is covered by the head, otherwise the full engine, and reports why. Either engine may be null
-// when its context is not available; `full` must always be set.
+// when its context is not available; `full` must always be set. When `session` is set the readout
+// forks the live sequence on `full` and ignores the classifier source and the state text.
 struct readout_sources {
     engine *    classifier = nullptr;  // classifier-only context (hidden states + answer rows)
     engine *    full       = nullptr;  // shared context (full-vocabulary logits)
     std::string classifier_unavailable; // reason the classifier context is not usable, when null
+    const session_source * session = nullptr; // live-session fork source, null for a stateless readout
 };
 
 // The layered readout: one scoring-source decision made from the compiled plan, so the server does

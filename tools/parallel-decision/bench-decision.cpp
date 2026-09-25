@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -29,11 +31,31 @@ struct bench_opts {
     std::string mode        = "auto";   // comma-separated list is accepted
     std::string allow_cache = "true";   // "true"/"false", a comma list, or "both"
     std::string fork        = "auto";
+    std::string report;                 // explicit report path; empty writes a timestamped file
     bool json_out           = false;
     bool bench              = false;
     int contexts            = 1;
     int iters               = 1;
 };
+
+// A run must never overwrite an earlier report, so every take lands in its own file. The
+// timestamp carries milliseconds because a pre/post pair can finish within one second.
+static std::string report_timestamp() {
+    const auto now = std::chrono::system_clock::now();
+    const auto t   = std::chrono::system_clock::to_time_t(now);
+    const auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    std::tm    tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char date[32] = { 0 };
+    std::strftime(date, sizeof(date), "%Y%m%d-%H%M%S", &tm);
+    char suffix[8] = { 0 };
+    std::snprintf(suffix, sizeof(suffix), "-%03d", (int) ms.count());
+    return std::string("tests/decision-baseline/bench-report-") + date + suffix + ".json";
+}
 
 static std::vector<std::string> split_list(const std::string & spec, char sep) {
     std::vector<std::string> out;
@@ -91,12 +113,16 @@ static bench_opts parse_args(int argc, char ** argv) {
             o.json_out = true;
         } else if (a == "--bench") {
             o.bench = true;
+        } else if (a == "--report" && i + 1 < argc) {
+            o.report = argv[++i];
+        } else if (a.rfind("--report=", 0) == 0) {
+            o.report = a.substr(9);
         } else if (a == "--contexts" && i + 1 < argc) {
             o.contexts = std::stoi(argv[++i]);
         } else if (a == "--iters" && i + 1 < argc) {
             o.iters = std::stoi(argv[++i]);
         } else if (a == "--help" || a == "-h") {
-            std::cout << "usage: bench-decision --model <gguf> [--fixture <json>] [--mode auto,tree,greedy] [--allow_cache true,false] [--fork auto|copy|restore] [--contexts N] [--iters N] [--json] [--bench]\n";
+            std::cout << "usage: bench-decision --model <gguf> [--fixture <json>] [--mode auto,tree,greedy] [--allow_cache true,false] [--fork auto|copy|restore] [--contexts N] [--iters N] [--report <path>] [--json] [--bench]\n";
             std::exit(0);
         }
     }
@@ -157,14 +183,9 @@ int main(int argc, char ** argv) {
 
     // bench mode without explicit model uses env or tiny fallback via test-download-model path
     if (bo.bench && bo.model.empty()) {
-        std::string fallback = "build-synthesis/tinyllamas/stories15M-q4_0.gguf";
+        std::string fallback = "build/tinyllamas/stories15M-q4_0.gguf";
         std::ifstream f(fallback);
         if (f) bo.model = fallback;
-        else {
-            fallback = "build/tinyllamas/stories15M-q4_0.gguf";
-            std::ifstream g(fallback);
-            if (g) bo.model = fallback;
-        }
     }
 
     if (bo.bench) {
@@ -255,7 +276,7 @@ int main(int argc, char ** argv) {
                     }
                     auto & br = runs[pick];
                     common_json e = common_json::object();
-                    e["branch"] = "synthesis";
+                    e["branch"] = "engine";
                     e["fixture"] = bo.fixture;
                     e["contexts"] = nc2;
                     e["mode"] = m;
@@ -274,10 +295,20 @@ int main(int argc, char ** argv) {
             }
         }
 
-        // write bench-report.json
-        std::string out_path = "tests/decision-baseline/bench-report.json";
+        // write a fresh report; an explicit --report path can still target the committed baseline
+        const std::string out_path = bo.report.empty() ? report_timestamp() : bo.report;
         common_json env = common_json::object();
-        env["model"] = bo.model;
+        // last two path components, so a committed report names the model without pinning a
+        // machine-private model root
+        auto model_identity = [](const std::string & path) {
+            const size_t slash = path.find_last_of("/\\");
+            if (slash == std::string::npos) {
+                return path;
+            }
+            const size_t prev = path.find_last_of("/\\", slash - 1);
+            return prev == std::string::npos ? path.substr(slash + 1) : path.substr(prev + 1);
+        };
+        env["model"] = model_identity(bo.model);
         // try to get file size
         std::ifstream mf(bo.model, std::ios::binary | std::ios::ate);
         long long bytes = mf ? (long long) mf.tellg() : -1;
@@ -316,8 +347,7 @@ int main(int argc, char ** argv) {
             return rev;
         };
         const std::string rev = git_rev_of("HEAD");
-        env["git_rev"]           = rev;
-        env["git_rev_decision"]  = git_rev_of("_decision");
+        env["git_rev"] = rev;
 
         common_json report = common_json::object();
         report["environment"] = env;
@@ -388,6 +418,23 @@ int main(int argc, char ** argv) {
             auto br = eng.decide_batch(shared_split.first, tails, cs.inputs, opt);
             auto assembled = llama_decision::assemble(cs, br.items[0]);
 
+            // The two producer concentration scores for every tree field: `confidence` is the
+            // normalized inverse entropy, `certainty` is the winner's share.
+            auto field_metrics = [&](const llama_decision::result & r) {
+                common_json m = common_json::object();
+                for (size_t i = 0; i < cs.specs.size(); ++i) {
+                    const auto & fr = r.fields[i];
+                    if (fr.probs.empty()) {
+                        continue;
+                    }
+                    common_json e = common_json::object();
+                    e["confidence"] = llama_decision::inverse_entropy_confidence(fr.probs);
+                    e["certainty"]  = llama_decision::winner_share(fr.probs);
+                    m[cs.specs[i].name] = e;
+                }
+                return m;
+            };
+
             if (bo.json_out) {
                 common_json out = common_json::object();
                 out["mode"] = m;
@@ -413,6 +460,7 @@ int main(int argc, char ** argv) {
                     probs[sp.name] = arr;
                 }
                 out["probabilities"] = probs;
+                out["metrics"] = field_metrics(br.items[0]);
                 runs.push_back(out);
             } else {
                 std::cout << "mode " << m << " cache " << (allow ? "true" : "false")
@@ -421,6 +469,12 @@ int main(int argc, char ** argv) {
                           << " rounds " << br.rounds << " rows " << br.rows
                           << " cache_hit " << (br.cache_hit ? 1 : 0) << "\n";
                 std::cout << assembled.dump(2) << "\n";
+                const common_json metrics = field_metrics(br.items[0]);
+                for (auto it = metrics.begin(); it != metrics.end(); ++it) {
+                    std::cout << "  " << it.key()
+                              << " confidence " << it.value().at("confidence").get<double>()
+                              << " certainty "  << it.value().at("certainty").get<double>() << "\n";
+                }
             }
         }
     }

@@ -896,7 +896,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // the decision endpoint is enabled by --decision-seqs alone; the other decision flags tune it
     // and have no effect without it
     if (params.n_seq_decision == 0 &&
-        (params.n_ctx_decision > 0 || !params.decision_temperature.empty() || !params.decision_contract.empty())) {
+        (params.n_ctx_decision > 0 || !params.decision_temperature.empty() || !params.decision_contract.empty() ||
+         params.n_decision_permutations != 1)) {
         throw std::invalid_argument("error: --decision-* flags require --decision-seqs (the decision endpoint is disabled without it)\n");
     }
 
@@ -2596,6 +2597,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.decision_contract = value;
             }
         ).set_env("LLAMA_ARG_DECISION_CONTRACT").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-permutations"}, "N",
+            string_format("default order-de-bias passes for decision requests that omit \"permutations\" (default: %d); the request field still wins and the pass cap still applies", params.n_decision_permutations),
+            [](common_params & params, int value) {
+                if (value < 1) {
+                    throw std::invalid_argument("--decision-permutations needs at least 1");
+                }
+                params.n_decision_permutations = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_PERMUTATIONS").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

@@ -69,12 +69,22 @@ Set `"permutations": N` (default 1, capped at 8) to de-bias option order: pass 0
 order and each later pass presents the same options in a distinct order seeded by the question id,
 then the per-pass distributions are averaged by option key. Two passes cost about 1.1x and pull a
 position-biased model toward the balanced answer; the noul second pass is the swap. The default
-single pass is byte-identical to a request without the field.
+single pass is byte-identical to a request without the field. A deployment can raise the default for
+requests that omit the field with `--decision-permutations N` (`LLAMA_ARG_DECISION_PERMUTATIONS`); an
+explicit request value always wins.
 
-Branches fork the cached prefix two ways: `copy` uses `llama_memory_seq_cp` (fast, plain attention), `restore` saves
-and reloads a sequence state with `llama_state_seq_get/set_data` (works on recurrent and hybrid memory). The engine
-picks one automatically; set `"fork"` on a `contexts`/`schema` request, or `LLAMA_DECISION_FORK=copy|restore|auto`,
-to force it. On a sliding-window model the copy is clamped to the retained window so branch memory does not grow.
+Branches fork the cached prefix three ways. `copy` uses `llama_memory_seq_cp`; it shares attention cells by metadata and is exact
+only for dense attention, because a recurrent/hybrid model's SSM/conv state is not carried by those cells. `restore` saves and
+reloads the whole sequence state with `llama_state_seq_get/set_data`; it is exact everywhere but copies the attention prefix per
+branch. `hybrid` is `seq_cp` for attention plus a `PARTIAL_ONLY` byte copy of the recurrent state into the child's own cell: exact
+everywhere and cheap on hybrid models. The engine picks per model (`auto` = hybrid on recurrent/hybrid when the partial format is
+available, else restore; copy on dense attention); set `"fork"` on a `contexts`/`schema` request, or
+`LLAMA_DECISION_FORK=copy|restore|hybrid|auto`, to force it. On a sliding-window model the copy is clamped to the retained window
+so branch memory does not grow.
+
+Fork correctness is judged by a byte-level oracle, not by matching the argmax: the engine's tests decode a branch and compare its
+state bytes against a full `restore` fork of the same parent. A plain `seq_cp` fork that shares a recurrent tail can agree on the
+winner while its probabilities are stale, so the oracle is the guarantee and the hybrid fork is its enforcement.
 
 ## POST /v1/decision
 
@@ -175,6 +185,17 @@ Both shapes are served by `POST /v1/decision`, the canonical route. `POST /decis
 alias for the same handler; use `/v1/decision`. `model` is optional and echoed back verbatim;
 `GET /v1/models` keeps the OpenAI list shape, not Jev's.
 
+### Live session (`id_slot`)
+
+Both shapes accept `id_slot` (and an optional `session_pos`) to answer about a chat slot that already
+holds decoded state, so the transcript is not re-prefilled. The slot must exist and hold state; a
+`session_pos` that does not exactly continue it is a 422. The generic shape scores one context per
+session request; the Jev shape appends the questions as a fresh user turn through the slot's chat
+template and runs full logits (the classifier context cannot fork a chat slot). A fork that cannot
+reproduce the slot state (an explicit `copy` on a recurrent/hybrid model) is refused. The source slot
+is never mutated, and the response reports `session_fork`, `source_slot` and `session_pos`
+additively.
+
 ### Limits and errors
 
 The full contract lives in `docs/decision/API.md` (Sections 4 and 5); the
@@ -244,11 +265,15 @@ is concentrated.
 `confidence` is `1 - H/log(K)` (normalized inverse entropy) and `certainty` is `max(p)` (the
 winner's share). The entropy formula is a deliberate local choice, not Jev's documented shape
 (Jev derives Choice confidence from the winner's share, `(N*p_max - 1)/(N - 1)`), so do not claim
-parity for it. Both values measure how concentrated the answer is. They are **not**
+parity for it. A request with `"confidence_profile": "jev"` opts into the rescaled winner share
+instead (the same monotone rule above three score levels, where Jev is undocumented); the default
+stays `1 - H/log(K)` and the profile changes only the reported number, not an answer or a
+probability. Both values measure how concentrated the answer is. They are **not**
 calibrated correctness, and they are **not** accuracy. The probabilities are conditional on the
 options you supplied: if the right answer is not among them, the distribution still sums to 1
 over the wrong set. Never gate admission, caching, routing or persistence on `confidence` or
-`certainty`, and never present them as probability of being correct.
+`certainty`, and never present them as probability of being correct. `tests/decision-baseline/accuracy_report.json`
+reports winner agreement, Brier and ECE per model and framing; confidence never gates any of it.
 
 Admission is not part of this axis. `--decision-ctx-size` bounds the classifier context by token
 cells, and each request is accepted or rejected by its token footprint alone, never by
@@ -283,7 +308,7 @@ task: single-pass decision / classification over a supplied state
 readout: letter labels resolved at the framed answer tail (SentencePiece and BPE), or token-path trie (schema)
 context: shared prefix + one state per request; branches forked on a unified KV cache
 output: probability distributions only, output_tokens always 0, closed over the supplied options
-confidence: 1 - H/log(K); certainty: max(p); concentration, NOT calibrated accuracy
+confidence: 1 - H/log(K); certainty: max(p); concentration, NOT calibrated accuracy; opt-in jev profile is the rescaled winner share
 calibration: deployment-specific; valid only under the recorded model, quantization, template hash and backend flags
 ```
 

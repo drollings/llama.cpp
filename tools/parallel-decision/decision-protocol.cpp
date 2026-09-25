@@ -239,6 +239,8 @@ decision_question parse_question(const std::string & id, const common_json & spe
     return q;
 }
 
+} // namespace
+
 // Normalized inverse entropy, 1 - H/log K. The producer's self-doubt axis: it measures how
 // concentrated the distribution is, never whether the winner is correct.
 double inverse_entropy_confidence(const std::vector<float> & p) {
@@ -262,7 +264,17 @@ double winner_share(const std::vector<float> & p) {
     return p.empty() ? 0.0 : (double) *std::max_element(p.begin(), p.end());
 }
 
-} // namespace
+// The Jev Choice confidence, (N*p_max - 1)/(N - 1), clamped. Jev documents it for Choice and for
+// Score at 2..3 levels; above three the definition is undocumented, so the same rule is the stated
+// local value. N below 2 has no meaningful rescale, so a single option is fully confident.
+double jev_winner_share_confidence(const std::vector<float> & p) {
+    const double n = (double) p.size();
+    if (n <= 1.0) {
+        return 1.0;
+    }
+    const double v = (n * winner_share(p) - 1.0) / (n - 1.0);
+    return std::min(1.0, std::max(0.0, v));
+}
 
 bool temperature_provenance::operator==(const temperature_provenance & other) const {
     return model == other.model && quantization == other.quantization &&
@@ -325,6 +337,38 @@ double question_temperature(const decision_request & req, const decision_questio
 
 bool is_decision_request(const common_json & body) {
     return body.is_object() && (body.contains("questions") || body.contains("state"));
+}
+
+session_ref parse_session_ref(const common_json & body) {
+    session_ref ref;
+    if (!body.is_object()) {
+        return ref;
+    }
+    if (body.contains("id_slot") && !body.at("id_slot").is_null()) {
+        const common_json & v = body.at("id_slot");
+        if (!v.is_number_integer()) {
+            throw semantic_error("id_slot must be an integer");
+        }
+        ref.id_slot = (int) v.get<long long>();
+        if (ref.id_slot < 0) {
+            throw semantic_error("id_slot must be >= 0");
+        }
+        ref.present = true;
+    }
+    if (body.contains("session_pos") && !body.at("session_pos").is_null()) {
+        const common_json & v = body.at("session_pos");
+        if (!v.is_number_integer()) {
+            throw semantic_error("session_pos must be an integer");
+        }
+        ref.session_pos = (int) v.get<long long>();
+        if (ref.session_pos < 0) {
+            throw semantic_error("session_pos must be >= 0");
+        }
+        if (!ref.present) {
+            throw semantic_error("session_pos requires id_slot");
+        }
+    }
+    return ref;
 }
 
 decision_request parse_decision_request(const common_json & body) {
@@ -406,6 +450,18 @@ decision_request parse_decision_request(const common_json & body) {
         }
         req.diagnostics = body.at("diagnostics").get<bool>();
     }
+
+    if (body.contains("confidence_profile") && !body.at("confidence_profile").is_null()) {
+        if (!body.at("confidence_profile").is_string()) {
+            throw semantic_error("confidence_profile must be a string");
+        }
+        req.confidence_profile = body.at("confidence_profile").get<std::string>();
+        if (req.confidence_profile != "local" && req.confidence_profile != "jev") {
+            throw semantic_error("confidence_profile must be local or jev");
+        }
+    }
+
+    req.session = parse_session_ref(body);
 
     return req;
 }
@@ -511,7 +567,9 @@ common_json assemble_decision_response(const decision_request & req,
                     best = i;
                 }
             }
-            a["confidence"] = inverse_entropy_confidence(p);  // 1 - H/log K (Jev reference)
+            a["confidence"] = req.confidence_profile == "jev"
+                                  ? jev_winner_share_confidence(p)   // opt-in Jev rescale of the winner share
+                                  : inverse_entropy_confidence(p);   // default 1 - H/log K
             if (req.diagnostics) {
                 a["certainty"] = winner_share(p);             // max(p); additive
             }

@@ -287,6 +287,8 @@ add_test(NAME test-decision-calibration COMMAND $<TARGET_FILE:test-decision-engi
 set_tests_properties(test-decision-calibration PROPERTIES LABELS "calibration")
 add_test(NAME test-decision-head COMMAND $<TARGET_FILE:test-decision-engine> "decision engine harness(\\..*head.*)?")
 set_tests_properties(test-decision-head PROPERTIES LABELS "head")
+add_test(NAME test-decision-fork COMMAND $<TARGET_FILE:test-decision-engine> "decision engine harness(\\..*fork.*)?")
+set_tests_properties(test-decision-fork PROPERTIES LABELS "fork")
 add_test(NAME test-decision-permut COMMAND $<TARGET_FILE:test-decision-engine> "decision engine harness(\\..*permut.*)?")
 set_tests_properties(test-decision-permut PROPERTIES LABELS "permut")
 # the temperature driver runs the same binary and checks the temperature/confidence subset

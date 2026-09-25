@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -523,6 +524,12 @@ static void test_saved_state_format_dispatch(testing & t) {
         t.assert_equal("a host state selects no flag",
                        (unsigned) LLAMA_STATE_SEQ_FLAGS_NONE,
                        (unsigned) llama_decision::engine::state_load_flags(false));
+        t.assert_equal("a partial device state selects both flags",
+                       (unsigned) (LLAMA_STATE_SEQ_FLAGS_ON_DEVICE | LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY),
+                       (unsigned) llama_decision::engine::state_load_flags(true, true));
+        t.assert_equal("a partial host state selects the partial flag",
+                       (unsigned) LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY,
+                       (unsigned) llama_decision::engine::state_load_flags(false, true));
     });
 }
 
@@ -631,6 +638,66 @@ static void test_confidence_certainty_axes(testing & t) {
 
         t.assert_true("noul carries no confidence", !out.at("answers").at("refund").contains("confidence"));
         t.assert_true("noul carries no certainty", !out.at("answers").at("refund").contains("certainty"));
+    });
+}
+
+static void expect_decision_reject(testing & t, const std::string & body_text, const std::string & needle);
+
+// The opt-in Jev confidence profile is a rescaled winner share, (N*p_max-1)/(N-1). It is opt-in,
+// so the default stays 1 - H/logK and existing goldens are unchanged; above three levels, where
+// Jev documents no Score formula, the same monotone rule is the stated local value.
+static void test_confidence_profile(testing & t) {
+    t.test("the Jev confidence profile is a rescaled winner share and stays opt-in", [](testing & t) {
+        auto req        = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
+        req.diagnostics = true;
+        const std::vector<std::vector<float>> probs = {
+            { 0.2f, 0.8f },          // noul: no confidence either way
+            { 0.6f, 0.3f, 0.1f },    // choice, N=3: (3*0.6-1)/2 = 0.4
+            { 0.9f, 0.1f, 0.0f },    // score, N=3: (3*0.9-1)/2 = 0.85
+        };
+        common_json usage      = common_json::object();
+        usage["output_tokens"] = 0;
+
+        const common_json local = llama_decision::assemble_decision_response(req, probs, "m", usage);
+        req.confidence_profile  = "jev";
+        const common_json jev   = llama_decision::assemble_decision_response(req, probs, "m", usage);
+
+        assert_close(t, "default choice confidence stays 1 - H/log K", 0.182654578,
+                     local.at("answers").at("dept").at("confidence").get<double>(), 1e-6);
+        assert_close(t, "jev choice confidence is (N*p_max-1)/(N-1)", 0.4,
+                     jev.at("answers").at("dept").at("confidence").get<double>(), 1e-6);
+        assert_close(t, "jev score confidence uses the same rule above the documented range", 0.85,
+                     jev.at("answers").at("urgency").at("confidence").get<double>(), 1e-6);
+        assert_close(t, "certainty is the raw winner share and does not change with the profile", 0.6,
+                     jev.at("answers").at("dept").at("certainty").get<double>(), 1e-6);
+        t.assert_true("noul never carries a confidence", !jev.at("answers").at("refund").contains("confidence"));
+    });
+
+    t.test("the Jev confidence rule is pinned at the boundaries and for wide scales", [](testing & t) {
+        assert_close(t, "uniform two-way is 0", 0.0,
+                     llama_decision::jev_winner_share_confidence({ 0.5f, 0.5f }), 1e-9);
+        assert_close(t, "one-hot two-way is 1", 1.0,
+                     llama_decision::jev_winner_share_confidence({ 0.0f, 1.0f }), 1e-9);
+        // (4*0.48-1)/3, a 4-level score where Jev leaves the definition open
+        assert_close(t, "wide scale uses the same monotone rule", 0.306666667,
+                     llama_decision::jev_winner_share_confidence({ 0.48f, 0.3f, 0.2f, 0.02f }), 1e-6);
+    });
+
+    t.test("confidence_profile parses as an opt-in enum and is refused otherwise", [](testing & t) {
+        common_json body = common_json::parse(decision_valid_body());
+        body["confidence_profile"] = "jev";
+        t.assert_equal("jev is accepted", "jev",
+                       llama_decision::parse_decision_request(body).confidence_profile);
+        body["confidence_profile"] = "local";
+        t.assert_equal("local is accepted", "local",
+                       llama_decision::parse_decision_request(body).confidence_profile);
+        body.erase("confidence_profile");
+        t.assert_equal("absent defaults to local", "local",
+                       llama_decision::parse_decision_request(body).confidence_profile);
+        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"confidence_profile":"other"})",
+                               "confidence_profile must be local or jev");
+        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"confidence_profile":1})",
+                               "confidence_profile must be a string");
     });
 }
 
@@ -837,7 +904,7 @@ static bool gpu_model_ready(testing & t, const char * path) {
 // skippable on a particular model. It must never absorb an outcome-correctness failure on a model
 // where the assertion is expected to hold.
 static const std::vector<std::string> weak_quant_gpu_allowlist = {
-    "qwen3.5-2b-gguf/ud-q5_k_xl.gguf",
+    // "qwen3.5-2b-gguf/ud-q5_k_xl.gguf",
 };
 
 static bool weak_quant_gpu_oracle(const char * path) {
@@ -859,7 +926,7 @@ static bool weak_quant_gpu_oracle(const char * path) {
 template <typename F>
 static void determinism_check(testing & t, bool weak_quant, const std::string & name, F body) {
     if (weak_quant) {
-        t.skip(name + " (weak-quant GPU numerics move a winner here; skipped, not xfail)");
+        t.skip(name + " (weak-quant GPU numerics; skipped, not xfail)");
         return;
     }
     t.test(name, body);
@@ -916,7 +983,7 @@ struct test_engine {
         }
     }
 
-    bool make_ctx(bool classifier_only, int n_batch = 512, int n_seq_max = 10) {
+    bool make_ctx(bool classifier_only, int n_batch = 512, int n_seq_max = 10, bool flash_attn = false) {
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx                 = 8192;
         cp.n_batch               = n_batch;
@@ -927,8 +994,9 @@ struct test_engine {
         cp.kv_unified            = true;
         cp.swa_full              = false;
         cp.classifier_only       = classifier_only;
-        // ROCm flash attention is not reproducible; decisions must be bit-exact run to run
-        cp.flash_attn_type       = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        // ROCm flash attention is not reproducible; decisions must be bit-exact run to run. The
+        // state tests may turn it on to exercise the non-transposed V cache.
+        cp.flash_attn_type       = flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
         ctx = llama_init_from_model(model, cp);
         return ctx != nullptr;
     }
@@ -939,6 +1007,14 @@ struct test_engine {
         }
         model = shared_model().model;
         return make_ctx(false, 512, n_seq_max);
+    }
+
+    bool load_fa(const char * path, int n_seq_max = 10) {
+        if (!shared_model().load(path)) {
+            return false;
+        }
+        model = shared_model().model;
+        return make_ctx(false, 512, n_seq_max, true);
     }
 };
 
@@ -1130,6 +1206,36 @@ static void test_decision_parse(testing & t) {
         } catch (const llama_decision::semantic_error & e) {
             t.assert_true("257 questions rejected with range", std::string(e.what()).find("1-256") != std::string::npos);
         }
+    });
+
+    // The optional live-session reference is a capability input, never a producer score. It parses
+    // only from explicit, well-formed fields: a negative or non-integer slot, a negative position,
+    // or a position without a slot is a semantic error, and absent means the stateless path.
+    t.test("a session reference parses only from explicit, well-formed fields", [](testing & t) {
+        const common_json plain = common_json::parse(decision_valid_body());
+        const auto none = llama_decision::parse_session_ref(plain);
+        t.assert_true("no id_slot means no session", !none.present);
+
+        common_json with_slot = plain;
+        with_slot["id_slot"] = 3;
+        const auto slot = llama_decision::parse_session_ref(with_slot);
+        t.assert_true("id_slot marks a session", slot.present);
+        t.assert_equal("id_slot value", 3, slot.id_slot);
+        t.assert_equal("session_pos defaults to derived", -1, slot.session_pos);
+
+        common_json pinned = with_slot;
+        pinned["session_pos"] = 7;
+        const auto pin = llama_decision::parse_session_ref(pinned);
+        t.assert_equal("session_pos pins the position", 7, pin.session_pos);
+
+        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"id_slot":-1})",
+                               "id_slot must be >= 0");
+        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"id_slot":"a"})",
+                               "id_slot must be an integer");
+        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"session_pos":1})",
+                               "session_pos requires id_slot");
+        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"id_slot":0,"session_pos":-2})",
+                               "session_pos must be >= 0");
     });
 
     t.test("unknown top-level fields are ignored while question fields stay strict", [](testing & t) {
@@ -2003,7 +2109,7 @@ static void test_letter_readout_real(testing & t) {
 }
 
 static void test_fork_real(testing & t) {
-    t.test("forks, bypass and LRU behave", [](testing & t) {
+    t.test("copy, bypass and LRU behave", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
         if (path == nullptr || path[0] == '\0') {
             t.skip("set LLAMA_DECISION_TEST_MODEL to run");
@@ -2023,8 +2129,10 @@ static void test_fork_real(testing & t) {
             const std::vector<llama_decision::field_input> one = { { "  \"a\": ", { "1", "2" } } };
 
             // A copy fork cannot carry recurrent state, so it is only meaningful for pure
-            // attention models; on a recurrent model the engine rejects it and auto picks restore.
-            const bool copy_ok = !llama_model_is_recurrent(te.model) && !llama_model_is_hybrid(te.model);
+            // attention models; on a recurrent model the engine rejects it and auto picks the
+            // exact partial hybrid fork.
+            const bool copy_ok    = !llama_model_is_recurrent(te.model) && !llama_model_is_hybrid(te.model);
+            const bool weak_quant = weak_quant_gpu_oracle(path);
 
             llama_decision::options orr;
             orr.fork      = "restore";
@@ -2037,17 +2145,25 @@ static void test_fork_real(testing & t) {
                 oc.cache_tag = "t";
                 const auto copy_run = eng.decide_batch("system", { "ctx" }, two, oc);
 
-                // same math on two KV layouts; the tolerance is the producer-numerics bound
-                bool agree = copy_run.items[0].fields.size() == restore_run.items[0].fields.size();
+                // same math on two KV layouts: the winner is the task value and is always
+                // asserted; the probability bound is producer numerics
+                bool winners = copy_run.items[0].fields.size() == restore_run.items[0].fields.size();
+                bool agree   = winners;
                 for (size_t f = 0; agree && f < copy_run.items[0].fields.size(); ++f) {
                     const auto & pc = copy_run.items[0].fields[f].probs;
                     const auto & pr = restore_run.items[0].fields[f].probs;
-                    agree = pc.size() == pr.size();
+                    winners = winners && copy_run.items[0].fields[f].winner == restore_run.items[0].fields[f].winner;
+                    agree   = pc.size() == pr.size();
                     for (size_t k = 0; agree && k < pc.size(); ++k) {
                         agree = std::fabs(pc[k] - pr[k]) < 5e-3;
                     }
                 }
-                t.assert_true("copy and restore agree within tolerance", agree);
+                t.test("copy and restore pick the same winner", [&](testing & t) {
+                    t.assert_true("copy and restore pick the same winner", winners);
+                });
+                determinism_check(t, weak_quant, "copy and restore agree within tolerance", [&](testing & t) {
+                    t.assert_true("copy and restore agree within tolerance", agree);
+                });
             } else {
                 bool rejected = false;
                 try {
@@ -2063,16 +2179,25 @@ static void test_fork_real(testing & t) {
                 oa.fork      = "auto";
                 oa.cache_tag = "t";
                 const auto auto_run = eng.decide_batch("system", { "ctx" }, two, oa);
-                bool agree = auto_run.items[0].fields.size() == restore_run.items[0].fields.size();
+                // the winner is the task value and is always asserted; the probability bound is the
+                // producer numerics of sharing vs copying the attention cells on the GPU
+                bool winners = auto_run.items[0].fields.size() == restore_run.items[0].fields.size();
+                bool agree   = winners;
                 for (size_t f = 0; agree && f < auto_run.items[0].fields.size(); ++f) {
                     const auto & pa = auto_run.items[0].fields[f].probs;
                     const auto & pr = restore_run.items[0].fields[f].probs;
-                    agree = pa.size() == pr.size();
+                    winners = winners && auto_run.items[0].fields[f].winner == restore_run.items[0].fields[f].winner;
+                    agree   = pa.size() == pr.size();
                     for (size_t k = 0; agree && k < pa.size(); ++k) {
-                        agree = std::fabs(pa[k] - pr[k]) < 1e-9;
+                        agree = std::fabs(pa[k] - pr[k]) < 5e-3;
                     }
                 }
-                t.assert_true("auto resolves to restore on a recurrent model", agree);
+                t.test("auto picks the exact fork on a recurrent model", [&](testing & t) {
+                    t.assert_true("auto picks the exact fork on a recurrent model", winners);
+                });
+                determinism_check(t, weak_quant, "auto and restore agree within tolerance", [&](testing & t) {
+                    t.assert_true("auto and restore agree within tolerance", agree);
+                });
             }
 
             // bounded LRU: two prefixes alternate and both hit on return
@@ -2098,11 +2223,20 @@ static void test_fork_real(testing & t) {
             // identical to the two-question run, within the 5e-3 producer-numerics bound. On a
             // recurrent model both runs take the forked path and differ by the GPU gemm's
             // batch-shape sensitivity, so the bound there is the 5e-2 head-agreement tolerance.
+            // The winner is the task value and is always asserted.
             bool bypass_ok = ps.size() == pp.size();
             for (size_t k = 0; bypass_ok && k < ps.size(); ++k) {
                 bypass_ok = std::fabs(ps[k] - pp[k]) < (copy_ok ? 5e-3 : 5e-2);
             }
-            t.assert_true("single-question bypass matches the forked path", bypass_ok);
+            const auto argmax = [](const std::vector<float> & p) {
+                return (int) (std::max_element(p.begin(), p.end()) - p.begin());
+            };
+            t.test("single-question bypass picks the same winner", [&](testing & t) {
+                t.assert_true("single-question bypass picks the same winner", argmax(ps) == argmax(pp));
+            });
+            determinism_check(t, weak_quant, "single-question bypass matches the forked path", [&](testing & t) {
+                t.assert_true("single-question bypass matches the forked path", bypass_ok);
+            });
 
             // prefix purity: branches never mutate the cached prefix, and branch sequences are released
             llama_memory_t mem = llama_get_memory(te.ctx);
@@ -2113,6 +2247,853 @@ static void test_fork_real(testing & t) {
             t.assert_true("branch sequences are released", llama_memory_seq_pos_max(mem, 3) <= 0);
         } catch (const std::exception & e) {
             t.assert_true(std::string("fork runs: ") + e.what(), false);
+        }
+    });
+}
+
+// Fork correctness is judged by byte equality of the resulting state against a full restore, never
+// by an argmax match: a wrong probability vector can still pick the same winner. The oracle decodes
+// a parent, forks it twice (once through the engine's active strategy, once by a full restore), and
+// requires the two branch states to be byte-identical after the same branch decode.
+static bool decode_tokens_on(llama_context * ctx, llama_seq_id seq, llama_pos pos0, const std::vector<llama_token> & toks) {
+    llama_batch batch = llama_batch_init((int) toks.size(), 0, 1);
+    for (size_t i = 0; i < toks.size(); ++i) {
+        common_batch_add(batch, toks[i], pos0 + (llama_pos) i, { seq }, i + 1 == toks.size());
+    }
+    const int rc = llama_decode(ctx, batch);
+    llama_batch_free(batch);
+    return rc == 0;
+}
+
+static std::vector<uint8_t> seq_state_dump(llama_context * ctx, llama_seq_id seq) {
+    std::vector<uint8_t> buf(llama_state_seq_get_size(ctx, seq));
+    const size_t         n = llama_state_seq_get_data(ctx, buf.data(), buf.size(), seq);
+    buf.resize(n);
+    return buf;
+}
+
+// A serialized state carries the sequence id in its header and in every cell record, so two
+// sequences with identical content still differ in those bytes. Re-serializing both through the
+// same scratch sequence on an empty cache normalizes the ids and the physical cell layout, leaving
+// only the state content for the byte comparison.
+static std::vector<uint8_t> normalize_seq_state(llama_context * ctx, const std::vector<uint8_t> & state, llama_seq_id scratch,
+                                                llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_NONE) {
+    if (state.empty()) {
+        return state;
+    }
+    llama_memory_clear(llama_get_memory(ctx), true);
+    const size_t n = llama_state_seq_set_data_ext(ctx, state.data(), state.size(), scratch, flags);
+    if (n == 0) {
+        return {};
+    }
+    return seq_state_dump(ctx, scratch);
+}
+
+// The serialized state starts with a magic and the source sequence id, which legitimately differ
+// between two sequences; the comparison is over the state payload that follows.
+static constexpr size_t seq_state_header_size = sizeof(uint32_t) + sizeof(llama_seq_id);
+
+static size_t state_bytes_diff(const std::vector<uint8_t> & a, const std::vector<uint8_t> & b, std::string * detail = nullptr) {
+    const size_t skip_a = std::min(a.size(), seq_state_header_size);
+    const size_t skip_b = std::min(b.size(), seq_state_header_size);
+    const size_t n_a    = a.size() - skip_a;
+    const size_t n_b    = b.size() - skip_b;
+    const size_t common = std::min(n_a, n_b);
+    size_t       diff   = std::max(n_a, n_b) - common;
+    size_t       first  = (size_t) -1;
+    for (size_t i = 0; i < common; ++i) {
+        if (a[skip_a + i] != b[skip_b + i]) {
+            if (first == (size_t) -1) {
+                first = i;
+            }
+            ++diff;
+        }
+    }
+    if (detail != nullptr && diff != 0) {
+        *detail = "first at payload offset " + std::to_string(first);
+    }
+    return diff;
+}
+
+static std::vector<float> output_logits(llama_context * ctx, const llama_vocab * vocab, int out_idx) {
+    std::vector<float> out(llama_vocab_n_tokens(vocab), 0.0f);
+    const float *      logits = llama_get_logits_ith(ctx, out_idx);
+    if (logits != nullptr) {
+        std::copy(logits, logits + out.size(), out.begin());
+    }
+    return out;
+}
+
+static double max_abs_logit_delta(const std::vector<float> & a, const std::vector<float> & b) {
+    double       delta = 0.0;
+    const size_t n     = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i) {
+        delta = std::max(delta, (double) std::fabs(a[i] - b[i]));
+    }
+    return delta;
+}
+
+static void fork_oracle_run(testing & t, llama_context * ctx, const std::string & lane, const std::string & strategy) {
+    const llama_model * model = llama_get_model(ctx);
+    if (strategy == "copy" && (llama_model_is_recurrent(model) || llama_model_is_hybrid(model))) {
+        t.skip(lane + ": a copy fork is not supported on a recurrent model");
+        return;
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto          parent = common_tokenize(vocab, "a short decision parent", false, true);
+    const auto          branch = common_tokenize(vocab, "branch", false, true);
+    if (parent.empty() || branch.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+
+    llama_decision::engine eng(ctx, 2, 8);
+    const llama_seq_id     src = 2, ref = 3, subject = 4, scratch = 7;
+
+    // fresh cache and prior sequences: the fork must be exact in both cell layouts
+    for (int n_prior : { 0, 2 }) {
+        const std::string layout = n_prior == 0 ? "fresh" : "prior";
+        llama_memory_clear(llama_get_memory(ctx), true);
+        for (int p = 0; p < n_prior; ++p) {
+            if (!t.assert_true(lane + "/" + layout + ": a prior sequence decodes",
+                               decode_tokens_on(ctx, 5 + p, 0, parent))) {
+                return;
+            }
+        }
+        if (!t.assert_true(lane + "/" + layout + ": the parent decodes", decode_tokens_on(ctx, src, 0, parent))) {
+            return;
+        }
+        llama_synchronize(ctx);
+
+        const auto full = eng.save_seq(src, false, false);
+        const auto part = eng.save_seq(src, false, true);
+        if (!t.assert_true(lane + "/" + layout + ": the parent state is non-empty",
+                           !full.bytes.empty() && !part.bytes.empty())) {
+            return;
+        }
+        const auto parent_before = seq_state_dump(ctx, src);
+
+        // reference: a full restore fork of the same parent
+        llama_memory_seq_rm(llama_get_memory(ctx), ref, -1, -1);
+        eng.load_seq(full, ref);
+
+        // subject: the requested strategy, loading the matching full or partial parent state. An
+        // auto strategy resolves to the partial hybrid fork for a recurrent or hybrid model.
+        eng.select_fork(strategy);
+        const auto & subject_state = eng.active_fork_ == llama_decision::engine::fork_kind::hybrid ? part : full;
+        eng.fork_into(src, subject, &subject_state);
+
+        const llama_pos pos0   = (llama_pos) parent.size();
+        const bool      ref_ok = decode_tokens_on(ctx, ref, pos0, branch);
+        const bool      sub_ok = decode_tokens_on(ctx, subject, pos0, branch);
+        llama_synchronize(ctx);
+        if (!t.assert_true(lane + "/" + layout + ": the reference branch decodes", ref_ok) ||
+            !t.assert_true(lane + "/" + layout + ": the fork branch decodes", sub_ok)) {
+            return;
+        }
+
+        // the source sequence must be byte-identical after a branch fork and decode
+        t.assert_true(lane + "/" + layout + ": the source state is unchanged by a " + strategy + " fork",
+                      parent_before == seq_state_dump(ctx, src));
+
+        const auto ref_state = seq_state_dump(ctx, ref);
+        const auto sub_state = seq_state_dump(ctx, subject);
+        if (!t.assert_true(lane + "/" + layout + ": the fork state is non-empty", !sub_state.empty())) {
+            return;
+        }
+
+        const auto   ref_norm = normalize_seq_state(ctx, ref_state, scratch);
+        const auto   sub_norm = normalize_seq_state(ctx, sub_state, scratch);
+        std::string  detail;
+        const size_t diff = state_bytes_diff(ref_norm, sub_norm, &detail);
+        t.assert_true(lane + "/" + layout + ": the " + strategy + " fork equals a full restore (" +
+                          std::to_string(diff) + " of " + std::to_string(std::max(ref_norm.size(), sub_norm.size())) +
+                          " bytes differ" + (detail.empty() ? "" : ", " + detail) + ")",
+                      diff == 0);
+    }
+}
+
+// Forks `n` children out of a parent and decodes the same branch token on all of them in one
+// batch, the way the engine runs a wave of branches from one trunk. Restore children load the
+// saved host state; plain children only get a metadata sequence copy.
+struct fork_group {
+    std::vector<std::vector<uint8_t>> raw_state; // host state per child, before normalization
+    std::vector<std::vector<float>>   logits;    // branch logits per child
+    bool ok = false;
+};
+
+static fork_group fork_group_decode(llama_context *   ctx,
+                                    llama_decision::engine & eng,
+                                    const llama_decision::engine::saved_state & saved,
+                                    llama_seq_id      src,
+                                    llama_seq_id      first,
+                                    int               n,
+                                    llama_pos         pos0,
+                                    llama_token       tok,
+                                    bool              plain_copy) {
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    llama_memory_t      mem   = llama_get_memory(ctx);
+
+    fork_group out;
+    out.raw_state.resize(n);
+    out.logits.resize(n);
+
+    llama_batch batch = llama_batch_init(n, 0, 1);
+    for (int b = 0; b < n; ++b) {
+        const llama_seq_id seq = first + b;
+        llama_memory_seq_rm(mem, seq, -1, -1);
+        if (plain_copy) {
+            llama_memory_seq_cp(mem, src, seq, -1, -1);
+        } else {
+            eng.load_seq(saved, seq);
+        }
+        common_batch_add(batch, tok, pos0, { seq }, true);
+    }
+    const int rc = llama_decode(ctx, batch);
+    llama_batch_free(batch);
+    if (rc != 0) {
+        return out;
+    }
+    llama_synchronize(ctx);
+    for (int b = 0; b < n; ++b) {
+        out.raw_state[b] = seq_state_dump(ctx, first + b);
+        out.logits[b]    = output_logits(ctx, vocab, b);
+    }
+    out.ok = true;
+    return out;
+}
+
+// The control that proves why an exact recurrent fork is needed: plain seq_cp shares the recurrent
+// tail cell instead of copying it, so the branch state and its logits can drift from an exact
+// restore. The divergence is recorded, not asserted, because a layout may happen to be exact.
+static void fork_divergence_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const auto          parent = common_tokenize(vocab, "a short decision parent", false, true);
+    const auto          branch = common_tokenize(vocab, "branch", false, true);
+    if (parent.empty() || branch.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+
+    llama_decision::engine eng(ctx, 2, 8);
+    const llama_seq_id     src = 2;
+    const llama_pos        pos0 = (llama_pos) parent.size();
+
+    // a trunk forked from a shared prefix: the engine's shape, where the trunk inherits the
+    // prefix's recurrent state through seq_cp instead of restoring it
+    {
+        llama_memory_clear(llama_get_memory(ctx), true);
+        if (!t.assert_true(lane + ": the prefix decodes", decode_tokens_on(ctx, src, 0, parent))) {
+            return;
+        }
+        llama_synchronize(ctx);
+        const auto prefix_state = eng.save_seq(src, false);
+
+        const llama_seq_id plain_trunk = 8, ref_trunk = 9;
+        llama_memory_seq_rm(llama_get_memory(ctx), plain_trunk, -1, -1);
+        llama_memory_seq_cp(llama_get_memory(ctx), src, plain_trunk, -1, -1);
+        llama_memory_seq_rm(llama_get_memory(ctx), ref_trunk, -1, -1);
+        eng.load_seq(prefix_state, ref_trunk);
+
+        const bool plain_ok = decode_tokens_on(ctx, plain_trunk, pos0, branch);
+        llama_synchronize(ctx);
+        const auto plain_trunk_logits = output_logits(ctx, vocab, 0);
+        const bool ref_ok = decode_tokens_on(ctx, ref_trunk, pos0, branch);
+        llama_synchronize(ctx);
+        const auto ref_trunk_logits = output_logits(ctx, vocab, 0);
+        if (!t.assert_true(lane + ": the plain trunk decodes", plain_ok) ||
+            !t.assert_true(lane + ": the restore trunk decodes", ref_ok)) {
+            return;
+        }
+        const auto plain_trunk_raw = seq_state_dump(ctx, plain_trunk);
+        const auto ref_trunk_raw   = seq_state_dump(ctx, ref_trunk);
+
+        const auto plain_trunk_norm = normalize_seq_state(ctx, plain_trunk_raw, 5);
+        const auto ref_trunk_norm   = normalize_seq_state(ctx, ref_trunk_raw, 5);
+        printf("[fork control] %s: prefix trunk fork via seq_cp vs restore: %zu of %zu state bytes differ, max logit delta %.6g\n",
+               lane.c_str(), state_bytes_diff(ref_trunk_norm, plain_trunk_norm),
+               std::max(ref_trunk_norm.size(), plain_trunk_norm.size()),
+               max_abs_logit_delta(ref_trunk_logits, plain_trunk_logits));
+    }
+
+    for (int n_prior : { 0, 2 }) {
+        for (int n_branches : { 1, 2 }) {
+            // each probe starts from a clean cache so the parent's layout is the same for both forks
+            llama_memory_clear(llama_get_memory(ctx), true);
+            // prior sequences occupy cells before the fork, a layout in which plain seq_cp can
+            // hand a branch a stale recurrent source cell
+            for (int p = 0; p < n_prior; ++p) {
+                if (!t.assert_true(lane + ": a prior sequence decodes", decode_tokens_on(ctx, 8 + p, 0, parent))) {
+                    return;
+                }
+            }
+            if (!t.assert_true(lane + ": the parent decodes", decode_tokens_on(ctx, src, 0, parent))) {
+                return;
+            }
+            llama_synchronize(ctx);
+            const auto saved = eng.save_seq(src, false);
+            if (!t.assert_true(lane + ": the parent state is non-empty", !saved.bytes.empty())) {
+                return;
+            }
+
+            const llama_seq_id ref_first   = 3;
+            const llama_seq_id plain_first = 3 + n_branches;
+            const llama_seq_id scratch     = plain_first + n_branches;
+
+            const auto ref   = fork_group_decode(ctx, eng, saved, src, ref_first,   n_branches, pos0, branch[0], false);
+            const auto plain = fork_group_decode(ctx, eng, saved, src, plain_first, n_branches, pos0, branch[0], true);
+            if (!t.assert_true(lane + ": the fork control decodes", ref.ok && plain.ok)) {
+                return;
+            }
+
+            size_t diff = 0, total = 0;
+            double max_logit_delta = 0.0;
+            for (int b = 0; b < n_branches; ++b) {
+                const auto ref_norm   = normalize_seq_state(ctx, ref.raw_state[b], scratch);
+                const auto plain_norm = normalize_seq_state(ctx, plain.raw_state[b], scratch);
+                diff += state_bytes_diff(ref_norm, plain_norm);
+                total += std::max(ref_norm.size(), plain_norm.size());
+                max_logit_delta = std::max(max_logit_delta, max_abs_logit_delta(ref.logits[b], plain.logits[b]));
+            }
+            printf("[fork control] %s: plain seq_cp vs restore, %d prior, %d branch(es) in one batch: %zu of %zu state bytes differ, max logit delta %.6g\n",
+                   lane.c_str(), n_prior, n_branches, diff, total, max_logit_delta);
+        }
+    }
+}
+
+static void test_fork_oracle(testing & t) {
+    t.test("strategy forks equal a full restore on the CPU model", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        for (const char * strategy : { "auto", "copy", "restore", "hybrid" }) {
+            t.test(std::string(strategy) + ": the fork matches the reference", [&](testing & t) {
+                try {
+                    fork_oracle_run(t, te.ctx, "cpu", strategy);
+                } catch (const std::exception & e) {
+                    t.assert_true(std::string("the CPU fork oracle runs: ") + e.what(), false);
+                }
+            });
+        }
+    });
+
+    t.test("strategy forks equal a full restore on the GPU model", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        for (const char * strategy : { "auto", "copy", "restore", "hybrid" }) {
+            t.test(std::string(strategy) + ": the fork matches the reference", [&](testing & t) {
+                try {
+                    fork_oracle_run(t, te.ctx, "gpu", strategy);
+                } catch (const std::exception & e) {
+                    t.assert_true(std::string("the GPU fork oracle runs: ") + e.what(), false);
+                }
+            });
+        }
+    });
+}
+
+// decide_batch forks twice: a trunk from the shared prefix, then a branch from the trunk. A single
+// fork oracle would miss a drift that only appears after the trunk has decoded its tail, so this
+// decodes a multi-token tail on a forked trunk, forks a branch from it, and compares the branch
+// logits against the same nested sequence done with full restore states at both levels.
+static void nested_fork_oracle_run(testing & t, llama_context * ctx, const std::string & lane, const std::string & strategy) {
+    const llama_model * model = llama_get_model(ctx);
+    if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
+        t.skip(lane + ": a nested partial fork needs a recurrent model");
+        return;
+    }
+    const llama_vocab * vocab  = llama_model_get_vocab(model);
+    const auto          prefix = common_tokenize(vocab, "the shared decision prefix", false, true);
+    const auto          tail   = common_tokenize(vocab, "tail tokens decoded on the trunk", false, true);
+    const auto          branch = common_tokenize(vocab, "branch", false, true);
+    if (prefix.empty() || tail.empty() || branch.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+
+    llama_decision::engine eng(ctx, 2, 8);
+    const llama_seq_id     snap = 2, ref_trunk = 3, ref_branch = 4, sub_trunk = 5, sub_branch = 6;
+
+    for (int n_prior : { 0, 2 }) {
+        const std::string layout = n_prior == 0 ? "fresh" : "prior";
+        llama_memory_clear(llama_get_memory(ctx), true);
+        for (int p = 0; p < n_prior; ++p) {
+            if (!t.assert_true(lane + "/" + layout + ": a prior sequence decodes",
+                               decode_tokens_on(ctx, 8 + p, 0, prefix))) {
+                return;
+            }
+        }
+        if (!t.assert_true(lane + "/" + layout + ": the shared prefix decodes", decode_tokens_on(ctx, snap, 0, prefix))) {
+            return;
+        }
+        llama_synchronize(ctx);
+
+        const auto full = eng.save_seq(snap, false, false);
+        const auto part = eng.save_seq(snap, false, true);
+
+        // reference: a full restore at both levels
+        eng.select_fork("restore");
+        llama_memory_seq_rm(llama_get_memory(ctx), ref_trunk, -1, -1);
+        eng.load_seq(full, ref_trunk);
+        if (!t.assert_true(lane + "/" + layout + ": the reference trunk decodes",
+                           decode_tokens_on(ctx, ref_trunk, (llama_pos) prefix.size(), tail))) {
+            return;
+        }
+        llama_synchronize(ctx);
+        const auto ref_trunk_state = eng.save_seq(ref_trunk, false, false);
+        llama_memory_seq_rm(llama_get_memory(ctx), ref_branch, -1, -1);
+        eng.load_seq(ref_trunk_state, ref_branch);
+        if (!t.assert_true(lane + "/" + layout + ": the reference branch decodes",
+                           decode_tokens_on(ctx, ref_branch, (llama_pos) (prefix.size() + tail.size()), branch))) {
+            return;
+        }
+        llama_synchronize(ctx);
+        const auto ref_logits = output_logits(ctx, vocab, 0);
+
+        // subject: the requested strategy at both levels, from its own clean prefix
+        llama_memory_clear(llama_get_memory(ctx), true);
+        if (!t.assert_true(lane + "/" + layout + ": the subject prefix decodes", decode_tokens_on(ctx, snap, 0, prefix))) {
+            return;
+        }
+        llama_synchronize(ctx);
+        const auto sub_full = eng.save_seq(snap, false, false);
+        const auto sub_part = eng.save_seq(snap, false, true);
+
+        eng.select_fork(strategy);
+        const bool   hybrid = eng.active_fork_ == llama_decision::engine::fork_kind::hybrid;
+        const auto & root   = hybrid ? sub_part : sub_full;
+        eng.fork_into(snap, sub_trunk, &root);
+        if (!t.assert_true(lane + "/" + layout + ": the subject trunk decodes",
+                           decode_tokens_on(ctx, sub_trunk, (llama_pos) prefix.size(), tail))) {
+            return;
+        }
+        llama_synchronize(ctx);
+        const auto sub_trunk_state = eng.save_seq(sub_trunk, false, hybrid);
+        eng.fork_into(sub_trunk, sub_branch, &sub_trunk_state);
+        if (!t.assert_true(lane + "/" + layout + ": the subject branch decodes",
+                           decode_tokens_on(ctx, sub_branch, (llama_pos) (prefix.size() + tail.size()), branch))) {
+            return;
+        }
+        llama_synchronize(ctx);
+        const auto sub_logits = output_logits(ctx, vocab, 0);
+
+        const double delta = max_abs_logit_delta(ref_logits, sub_logits);
+        t.assert_true(lane + "/" + layout + ": the nested " + strategy + " fork matches a full restore (max logit delta " +
+                          std::to_string(delta) + ")",
+                      delta == 0.0);
+    }
+}
+
+static void test_nested_fork_oracle(testing & t) {
+    t.test("a nested strategy fork equals a full restore on the GPU model", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        for (const char * strategy : { "restore", "hybrid" }) {
+            t.test(std::string(strategy) + ": the nested fork matches the reference", [&](testing & t) {
+                try {
+                    nested_fork_oracle_run(t, te.ctx, "gpu", strategy);
+                } catch (const std::exception & e) {
+                    t.assert_true(std::string("the GPU nested fork oracle runs: ") + e.what(), false);
+                }
+            });
+        }
+    });
+}
+
+// A decision forked from a live source sequence must equal the same decision whose source text was
+// prefilled as an ordinary context: the session entry only skips the re-prefill, it does not change
+// what is scored. The source must survive the decision untouched.
+static void session_fork_oracle_run(testing & t, llama_context * ctx, const std::string & lane) {
+    llama_decision::engine eng(ctx, 2, 8);
+    const std::vector<llama_decision::field_input> fields = {
+        { "  \"a\": ", { "1", "2" } },
+        { "  \"b\": ", { "x", "y", "z" } },
+    };
+    llama_decision::options o;
+    o.mode        = "tree";
+    o.fork        = "auto";
+    o.allow_cache = false;
+
+    const std::string shared_text  = "the shared decision prefix";
+    const std::string context_text = "the session context";
+    const std::vector<llama_token> shared  = eng.tokenize(shared_text, true);
+    const std::vector<llama_token> context = eng.tokenize(context_text, shared.empty());
+    if (shared.empty() || context.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    const auto plan = eng.compile_fields(fields, o);
+
+    // control: the stateless decision prefills shared + context itself
+    llama_memory_clear(llama_get_memory(ctx), true);
+    const auto stateless = eng.decide_batch(plan, shared_text, { context_text }, o);
+
+    // session: the same tokens are already decoded on the source sequence
+    llama_memory_clear(llama_get_memory(ctx), true);
+    const llama_seq_id src = 0;
+    if (!t.assert_true(lane + ": the session prefix decodes", decode_tokens_on(ctx, src, 0, shared)) ||
+        !t.assert_true(lane + ": the session context decodes",
+                       decode_tokens_on(ctx, src, (llama_pos) shared.size(), context))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const auto       src_before = seq_state_dump(ctx, src);
+    const llama_pos  base_pos   = (llama_pos) (shared.size() + context.size());
+
+    llama_decision::batch_result session;
+    try {
+        session = eng.decide_batch_from_seq(src, base_pos, plan, o);
+    } catch (const std::exception & e) {
+        t.assert_true(std::string(lane + ": the session decision runs: ") + e.what(), false);
+        return;
+    }
+
+    t.assert_true(lane + ": the source state is unchanged by the session fork", src_before == seq_state_dump(ctx, src));
+
+    if (!t.assert_true(lane + ": both decisions return one result",
+                       stateless.items.size() == 1 && session.items.size() == 1)) {
+        return;
+    }
+    // the session path physically places branch cells differently, so the GPU producer numerics
+    // bound applies; the winners are the task-value outcome and must agree
+    const double tol = lane == "gpu" ? 5e-2 : 1e-4;
+    bool         same  = stateless.items[0].fields.size() == session.items[0].fields.size();
+    bool         wins  = same;
+    double       worst = 0.0;
+    for (size_t f = 0; same && f < fields.size(); ++f) {
+        wins = wins && stateless.items[0].fields[f].winner == session.items[0].fields[f].winner;
+        const auto & ps = stateless.items[0].fields[f].probs;
+        const auto & pn = session.items[0].fields[f].probs;
+        same = same && ps.size() == pn.size();
+        for (size_t k = 0; same && k < ps.size(); ++k) {
+            const double d = std::fabs(ps[k] - pn[k]);
+            worst = std::max(worst, d);
+            same  = d <= tol;
+        }
+    }
+    t.assert_true(lane + ": the session decision keeps the winners", wins);
+    t.assert_true(lane + ": the session decision matches the prefilled context (worst " +
+                              std::to_string(worst) + ")",
+                  same);
+
+    // The branch-level byte oracle (a forked branch equals a full restore) lives in the fork oracle
+    // tests; the session entry reuses that primitive and only changes where the trunk is forked
+    // from, so the session check is the task-value equality above plus the source invariance below.
+    t.assert_true(lane + ": the source state is still unchanged after scoring",
+                  src_before == seq_state_dump(ctx, src));
+}
+
+// A wrong base_pos must fail instead of silently scoring at shifted positions.
+static void session_fork_position_run(testing & t, llama_context * ctx, const std::string & lane) {
+    llama_decision::engine eng(ctx, 2, 8);
+    const std::vector<llama_decision::field_input> fields = { { "  \"a\": ", { "1", "2" } } };
+    llama_decision::options o;
+    o.allow_cache = false;
+    const std::vector<llama_token> src_toks = eng.tokenize("a session with a transcript", true);
+    if (src_toks.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    const auto plan = eng.compile_fields(fields, o);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!decode_tokens_on(ctx, 0, 0, src_toks)) {
+        t.assert_true(lane + ": the source decodes", false);
+        return;
+    }
+    llama_synchronize(ctx);
+    const llama_pos good = (llama_pos) src_toks.size();
+    // a position the source does not continue from must be rejected before any decode
+    bool rejected = false;
+    try {
+        (void) eng.decide_batch_from_seq(0, good + 1, plan, o);
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    t.assert_true(lane + ": a shifted base_pos is rejected, not scored", rejected);
+    // the correct continuation still runs
+    bool ran = true;
+    try {
+        (void) eng.decide_batch_from_seq(0, good, plan, o);
+    } catch (const std::exception &) {
+        ran = false;
+    }
+    t.assert_true(lane + ": the correct continuation still runs", ran);
+}
+
+static void test_session_fork(testing & t) {
+    t.test("a session fork matches a prefilled context on the CPU model", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            session_fork_oracle_run(t, te.ctx, "cpu");
+            session_fork_position_run(t, te.ctx, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU session fork: ") + e.what(), false);
+        }
+    });
+
+    t.test("a session fork matches a prefilled context on the GPU model", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            session_fork_oracle_run(t, te.ctx, "gpu");
+            session_fork_position_run(t, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU session fork: ") + e.what(), false);
+        }
+    });
+}
+
+// Flipping the default fork must not move an answer: for a recurrent or hybrid model `auto` now
+// selects the partial hybrid fork, whose branch state is byte-identical to a full restore, so the
+// winners stay the same and the probabilities agree within the GPU producer-numerics bound. A dense
+// model keeps the previous copy default, so its answers are identical to an explicit copy.
+static void fork_auto_default_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model     = llama_get_model(ctx);
+    const bool          recurrent = llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
+    const std::vector<llama_decision::field_input> fields = {
+        { "  \"a\": ", { "1", "2" } },
+        { "  \"b\": ", { "x", "y" } },
+        { "  \"c\": ", { "p", "q", "r" } },
+    };
+
+    llama_decision::engine eng(ctx, 2, 8);
+    llama_decision::options o_auto;
+    o_auto.fork        = "auto";
+    o_auto.allow_cache = false;
+    const auto auto_run = eng.decide_batch("system", { "ctx" }, fields, o_auto);
+    const auto resolved = eng.active_fork_;
+
+    // the reference is the strategy `auto` must resolve to: the exact hybrid fork for a recurrent
+    // model, or the unchanged copy fork for a dense one
+    llama_decision::options o_ref = o_auto;
+    o_ref.fork = recurrent ? "restore" : "copy";
+    const auto ref_run = eng.decide_batch("system", { "ctx" }, fields, o_ref);
+
+    const auto expected = recurrent ? llama_decision::engine::fork_kind::hybrid
+                                    : llama_decision::engine::fork_kind::copy;
+    t.test(lane + ": auto selects the expected fork", [&](testing & t) {
+        t.assert_true(lane + ": auto selects the expected fork", resolved == expected);
+    });
+    if (!t.assert_true(lane + ": both the default and the reference run return one result",
+                       auto_run.items.size() == 1 && ref_run.items.size() == 1)) {
+        return;
+    }
+
+    // a dense copy default must not move at all; on a recurrent model the CPU path is also exact,
+    // while the GPU reduction order changes with the physical cell placement, so its bound is the
+    // producer numerics
+    const double tol = recurrent && lane == "gpu" ? 5e-2 : 0.0;
+    bool   same  = auto_run.items[0].fields.size() == ref_run.items[0].fields.size();
+    double worst = 0.0;
+    for (size_t f = 0; same && f < fields.size(); ++f) {
+        same = auto_run.items[0].fields[f].winner == ref_run.items[0].fields[f].winner;
+        const auto & pa = auto_run.items[0].fields[f].probs;
+        const auto & pr = ref_run.items[0].fields[f].probs;
+        same = same && pa.size() == pr.size();
+        for (size_t k = 0; same && k < pa.size(); ++k) {
+            const double d = std::fabs(pa[k] - pr[k]);
+            worst = std::max(worst, d);
+            same  = d <= tol;
+        }
+    }
+    t.assert_true(lane + ": the default fork keeps the reference answers (worst " + std::to_string(worst) + ")",
+                  same);
+}
+
+static void test_fork_auto_default(testing & t) {
+    t.test("the default fork keeps the reference answers on the CPU model", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            fork_auto_default_run(t, te.ctx, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU default fork: ") + e.what(), false);
+        }
+    });
+
+    t.test("the default fork keeps the reference answers on the GPU model", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            fork_auto_default_run(t, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU default fork: ") + e.what(), false);
+        }
+    });
+}
+
+// A strategy change must reuse the token-cached prefix without carrying the previous scope with it:
+// a restore request leaves a full prefix state, a hybrid request needs a partial one, and the
+// token-cached prefix path must refresh the scope before it forks.
+static void fork_strategy_switch_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const std::vector<llama_decision::field_input> fields = {
+        { "  \"a\": ", { "1", "2" } },
+        { "  \"b\": ", { "x", "y" } },
+    };
+    const double tol = lane == "gpu" ? 5e-2 : 1e-4;
+
+    const std::pair<const char *, const char *> pairs[] = {
+        { "restore", "hybrid" },
+        { "hybrid", "restore" },
+    };
+    for (const auto & pair : pairs) {
+        llama_memory_clear(llama_get_memory(ctx), true);
+        llama_decision::engine eng(ctx, 2, 8);
+
+        llama_decision::options o1;
+        o1.fork      = pair.first;
+        o1.cache_tag = "switch";
+        const auto r1 = eng.decide_batch("system", { "ctx" }, fields, o1);
+
+        llama_decision::options o2;
+        o2.fork      = pair.second;
+        o2.cache_tag = "switch";
+        const auto r2 = eng.decide_batch("system", { "ctx" }, fields, o2);
+
+        if (!t.assert_true(lane + ": the " + pair.first + " run returns", r1.items.size() == 1) ||
+            !t.assert_true(lane + ": the " + pair.second + " run returns", r2.items.size() == 1)) {
+            return;
+        }
+        bool   same  = r1.items[0].fields.size() == r2.items[0].fields.size();
+        double worst = 0.0;
+        for (size_t f = 0; same && f < fields.size(); ++f) {
+            same = r1.items[0].fields[f].winner == r2.items[0].fields[f].winner;
+            const auto & p1 = r1.items[0].fields[f].probs;
+            const auto & p2 = r2.items[0].fields[f].probs;
+            same = same && p1.size() == p2.size();
+            for (size_t k = 0; same && k < p1.size(); ++k) {
+                worst = std::max(worst, (double) std::fabs(p1[k] - p2[k]));
+                same  = std::fabs(p1[k] - p2[k]) < tol;
+            }
+        }
+        t.assert_true(lane + ": " + pair.first + " then " + pair.second + " agrees (worst " +
+                          std::to_string(worst) + ")",
+                      same);
+    }
+}
+
+static void test_fork_strategy_switch(testing & t) {
+    t.test("a fork strategy change reuses the cached prefix on the CPU model", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            fork_strategy_switch_run(t, te.ctx, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU strategy switch: ") + e.what(), false);
+        }
+    });
+
+    t.test("a fork strategy change reuses the cached prefix on the GPU model", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            fork_strategy_switch_run(t, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU strategy switch: ") + e.what(), false);
+        }
+    });
+}
+
+static void test_fork_divergence_control(testing & t) {
+    t.test("plain seq_cp fork divergence against restore is recorded (cpu)", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            fork_divergence_run(t, te.ctx, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU fork control runs: ") + e.what(), false);
+        }
+    });
+
+    t.test("plain seq_cp fork divergence against restore is recorded (gpu)", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            fork_divergence_run(t, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU fork control runs: ") + e.what(), false);
         }
     });
 }
@@ -2183,6 +3164,105 @@ static void test_prefix_lru_restores_own_state(testing & t) {
 
 // Baseline for the state-format work: a device-format sequence state must round-trip on the CPU
 // backend. The host dump is the reference because it is serialized in sequence cell order.
+// The transposed V cache stores one row per embedding, so a state save would otherwise touch each
+// embedding separately. The bulk path moves one range per layer as a single strided transfer. A
+// non-transposed V cache (flash attention on) is already contiguous and is the control that must
+// not regress. Both must round-trip the sequence state byte-identically.
+static void state_bulk_copy_run(testing & t, llama_context * ctx, const std::string & lane, int n_layer) {
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const auto          toks  = common_tokenize(vocab, "a transposed decision state", false, true);
+    if (toks.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    if (!t.assert_true(lane + ": the prefix decodes", decode_tokens_on(ctx, 0, 0, toks))) {
+        return;
+    }
+    llama_synchronize(ctx);
+
+    const std::vector<uint8_t> before = seq_state_dump(ctx, 0);
+    if (!t.assert_true(lane + ": the sequence state is non-empty", !before.empty())) {
+        return;
+    }
+
+    llama_state_seq_debug_reset_transfers();
+    std::vector<uint8_t> saved(llama_state_seq_get_size(ctx, 0));
+    const size_t         saved_n = llama_state_seq_get_data(ctx, saved.data(), saved.size(), 0);
+    saved.resize(saved_n);
+    const uint64_t save_transfers = llama_state_seq_debug_transfer_count();
+
+    llama_memory_clear(llama_get_memory(ctx), true);
+    llama_state_seq_debug_reset_transfers();
+    const size_t nset = llama_state_seq_set_data(ctx, saved.data(), saved.size(), 0);
+    const uint64_t load_transfers = llama_state_seq_debug_transfer_count();
+    t.assert_equal(lane + ": the sequence state restores in full", saved.size(), nset);
+
+    const std::vector<uint8_t> after = seq_state_dump(ctx, 0);
+    t.assert_true(lane + ": the restored sequence state is byte-identical", before == after);
+
+    // the device format carries the same state through its staging buffers
+    const size_t dev_size = llama_state_seq_get_size_ext(ctx, 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+    if (t.assert_true(lane + ": the device state has a size", dev_size > 0)) {
+        std::vector<uint8_t> dev(dev_size);
+        t.assert_equal(lane + ": the device state is written", dev_size,
+                       llama_state_seq_get_data_ext(ctx, dev.data(), dev.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
+        llama_memory_clear(llama_get_memory(ctx), true);
+        t.assert_equal(lane + ": the device state restores in full", dev_size,
+                       llama_state_seq_set_data_ext(ctx, dev.data(), dev.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
+        t.assert_true(lane + ": the device-restored sequence state is byte-identical", before == seq_state_dump(ctx, 0));
+    }
+
+    printf("[state bulk] %s: n_layer %d, save transfers %" PRIu64 ", load transfers %" PRIu64 "\n",
+           lane.c_str(), n_layer, save_transfers, load_transfers);
+
+    // one bulk transfer per layer plus a bounded constant; the per-embedding path was thousands
+    const uint64_t bound = (uint64_t) 8 * (uint64_t) std::max(n_layer, 1) + 32;
+    t.assert_true(lane + ": the save uses a bulk transfer per layer", save_transfers <= bound);
+    t.assert_true(lane + ": the load uses a bulk transfer per layer", load_transfers <= bound);
+}
+
+static void test_state_bulk_copy(testing & t) {
+    t.test("a transposed sequence state round-trips and copies per layer on the GPU backend", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            state_bulk_copy_run(t, te.ctx, "transposed", llama_model_n_layer(te.model));
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the transposed state round trip: ") + e.what(), false);
+        }
+    });
+
+    t.test("a non-transposed sequence state round-trips on the GPU backend", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        bool         loaded = false;
+        try {
+            loaded = te.load_fa(path);
+        } catch (const std::exception &) {
+            loaded = false;
+        }
+        if (!loaded) {
+            t.skip("flash attention is not available for this model");
+            return;
+        }
+        try {
+            state_bulk_copy_run(t, te.ctx, "non-transposed", llama_model_n_layer(te.model));
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the non-transposed state round trip: ") + e.what(), false);
+        }
+    });
+}
+
 static void test_device_state_round_trip(testing & t) {
     t.test("a device sequence state round-trips on the CPU backend", [](testing & t) {
         const std::string path = decision_cpu_model_path();
@@ -2299,7 +3379,7 @@ static void test_device_async_staging(testing & t) {
             // a working device path is what the engine prefers; it must not have retired to host
             llama_decision::engine eng(te.ctx, 2, 8);
             const auto st = eng.save_seq(0, true);
-            t.assert_true("the engine keeps the device save when the backend supports it", st.on_device);
+            t.assert_true("the engine keeps the device save when the backend supports it", st.on_device());
 
             bool threw = false;
             try {
@@ -2388,6 +3468,243 @@ static void test_recurrent_multi_range_device_save(testing & t) {
             t.assert_true("the restored pre-fragmentation state equals the saved state", pre == host_dump());
         } catch (const std::exception & e) {
             t.assert_true(std::string("the fragmented recurrent save: ") + e.what(), false);
+        }
+    });
+}
+
+// A full restore and a partial restore must carry the same recurrent state: the partial bytes read
+// back after either restore are byte-identical, and the partial host format round-trips on its own.
+// The full host save is also checked against the low-level serialization so the flag work cannot
+// change the existing full-state bytes.
+static void partial_state_round_trip_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const auto          toks  = common_tokenize(vocab, "a short partial decision state", false, true);
+    if (toks.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+
+    llama_decision::engine eng(ctx, 2, 8);
+    const llama_seq_id     src = 2;
+    if (!t.assert_true(lane + ": the state decodes", decode_tokens_on(ctx, src, 0, toks))) {
+        return;
+    }
+    llama_synchronize(ctx);
+
+    const auto full = eng.save_seq(src, false, false);
+    const auto part = eng.save_seq(src, false, true);
+    if (!t.assert_true(lane + ": the full host state is non-empty", !full.bytes.empty()) ||
+        !t.assert_true(lane + ": the partial host state is non-empty", !part.bytes.empty())) {
+        return;
+    }
+    t.assert_equal(lane + ": the full save carries no scope flag",
+                   (unsigned) LLAMA_STATE_SEQ_FLAGS_NONE, (unsigned) full.flags);
+    t.assert_equal(lane + ": the partial save carries the partial flag",
+                   (unsigned) LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, (unsigned) part.flags);
+    t.assert_true(lane + ": the engine reports partial state capability", eng.partial_state_capable());
+
+    // the full host save is exactly the low-level full serialization, unchanged by the flags
+    const size_t direct_size = llama_state_seq_get_size_ext(ctx, src, LLAMA_STATE_SEQ_FLAGS_NONE);
+    std::vector<uint8_t> direct(direct_size);
+    const size_t direct_n = llama_state_seq_get_data_ext(ctx, direct.data(), direct.size(), src, LLAMA_STATE_SEQ_FLAGS_NONE);
+    direct.resize(direct_n);
+    t.assert_true(lane + ": the full host save matches the direct serialization", direct == full.bytes);
+
+    llama_memory_t mem = llama_get_memory(ctx);
+
+    // a full restore carries the same recurrent state that a partial save reads
+    llama_memory_clear(mem, true);
+    eng.load_seq(full, src);
+    const auto part_of_full = eng.save_seq(src, false, true);
+    t.assert_true(lane + ": a full restore's recurrent state matches the partial save", part_of_full.bytes == part.bytes);
+
+    // a partial restore round-trips the recurrent state on its own; the attention side stays empty
+    // here, so the read-back uses the low-level serialization
+    llama_memory_clear(mem, true);
+    eng.load_seq(part, src);
+    std::vector<uint8_t> part_rt(llama_state_seq_get_size_ext(ctx, src, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+    const size_t         part_rt_n =
+        llama_state_seq_get_data_ext(ctx, part_rt.data(), part_rt.size(), src, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    part_rt.resize(part_rt_n);
+    t.assert_true(lane + ": the partial host round-trip is byte-identical", part_rt == part.bytes);
+
+    // the partial device state must carry the same recurrent bytes as the host format
+    llama_memory_clear(mem, true);
+    eng.load_seq(full, src);
+    const auto part_dev = eng.save_seq(src, true, true);
+    if (t.assert_true(lane + ": the partial device save is staged", part_dev.on_device())) {
+        llama_memory_clear(mem, true);
+        eng.load_seq(part_dev, src);
+        std::vector<uint8_t> dev_rt(llama_state_seq_get_size_ext(ctx, src, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+        const size_t         dev_rt_n =
+            llama_state_seq_get_data_ext(ctx, dev_rt.data(), dev_rt.size(), src, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        dev_rt.resize(dev_rt_n);
+        t.assert_true(lane + ": the partial device round-trip matches the host bytes", dev_rt == part.bytes);
+    }
+
+    // the hybrid fork shape: attention copied by metadata, recurrent state restored partial
+    llama_memory_clear(mem, true);
+    eng.load_seq(full, src);
+    llama_memory_seq_rm(mem, 5, -1, -1);
+    llama_memory_seq_cp(mem, src, 5, -1, -1);
+    eng.load_seq(part, 5);
+    const auto fork_part = eng.save_seq(5, false, true);
+    const auto fork_norm = normalize_seq_state(ctx, fork_part.bytes, 6, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    const auto part_norm = normalize_seq_state(ctx, part.bytes, 6, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    t.assert_true(lane + ": the copied-attention partial fork matches the partial save",
+                  state_bytes_diff(fork_norm, part_norm) == 0);
+}
+
+static void test_partial_state_round_trip(testing & t) {
+    t.test("a partial host state round-trips and matches a full restore (cpu)", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            partial_state_round_trip_run(t, te.ctx, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU partial round trip: ") + e.what(), false);
+        }
+    });
+
+    t.test("a partial host state round-trips and matches a full restore (gpu)", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            partial_state_round_trip_run(t, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU partial round trip: ") + e.what(), false);
+        }
+    });
+}
+
+// A fragmented recurrent cache cannot be staged as one device range: the whole-cache partial device
+// save is refused recoverably (size 0, no abort) and the host partial format still round-trips. The
+// engine's one-way partial device capability then falls back to the host partial format.
+static void partial_state_fragmented_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
+        t.skip(lane + ": the model is neither recurrent nor hybrid");
+        return;
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto          toks  = common_tokenize(vocab, "the fragmented partial state", false, true);
+    if (toks.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+
+    for (llama_seq_id seq = 0; seq < 3; ++seq) {
+        if (!t.assert_true(lane + ": the fragmented prefix decodes", decode_tokens_on(ctx, seq, 0, toks))) {
+            return;
+        }
+    }
+    llama_synchronize(ctx);
+    if (!llama_memory_seq_rm(llama_get_memory(ctx), 1, -1, -1)) {
+        t.skip(lane + ": the model cannot remove a middle sequence");
+        return;
+    }
+
+    const llama_state_seq_flags partial_device = llama_decision::engine::state_load_flags(true, true);
+    t.assert_equal(lane + ": the fragmented partial device save is refused", (size_t) 0,
+                   llama_state_seq_get_size_ext(ctx, -1, partial_device));
+
+    // the host partial format is self-contained and must round-trip the fragmented recurrent cache
+    const llama_state_seq_flags partial_host = llama_decision::engine::state_load_flags(false, true);
+    const size_t host_size = llama_state_seq_get_size_ext(ctx, -1, partial_host);
+    if (!t.assert_true(lane + ": the fragmented partial host state is non-empty", host_size > 0)) {
+        return;
+    }
+    std::vector<uint8_t> host(host_size);
+    t.assert_equal(lane + ": the fragmented partial host state is written", host_size,
+                   llama_state_seq_get_data_ext(ctx, host.data(), host.size(), -1, partial_host));
+    llama_memory_clear(llama_get_memory(ctx), true);
+    t.assert_equal(lane + ": the fragmented partial host state restores", host_size,
+                   llama_state_seq_set_data_ext(ctx, host.data(), host.size(), -1, partial_host));
+    std::vector<uint8_t> after(llama_state_seq_get_size_ext(ctx, -1, partial_host));
+    llama_state_seq_get_data_ext(ctx, after.data(), after.size(), -1, partial_host);
+    t.assert_true(lane + ": the restored partial state equals the saved partial state", host == after);
+
+    // the engine retires partial device staging when it fails and uses the host partial format
+    llama_memory_clear(llama_get_memory(ctx), true);
+    llama_decision::engine eng(ctx, 4, 6);
+    const llama_seq_id     src = 4;
+    t.assert_true(lane + ": the engine starts with partial state capability", eng.partial_state_capable());
+    if (!t.assert_true(lane + ": the engine prefix decodes", decode_tokens_on(ctx, src, 0, toks))) {
+        return;
+    }
+    llama_synchronize(ctx);
+
+    eng.partial_device_capable_ = false; // the retired state a failed device save leaves behind
+    const auto st = eng.save_seq(src, true, true);
+    t.assert_true(lane + ": a retired partial device save falls back to the host format", !st.on_device());
+    t.assert_equal(lane + ": the fallback keeps the partial scope",
+                   (unsigned) LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, (unsigned) st.flags);
+    t.assert_true(lane + ": the fallback state is non-empty", !st.bytes.empty());
+    t.assert_true(lane + ": the capability stays retired", !eng.partial_state_capable());
+
+    llama_memory_clear(llama_get_memory(ctx), true);
+    bool round_trip = false;
+    try {
+        eng.load_seq(st, src);
+        std::vector<uint8_t> rt(llama_state_seq_get_size_ext(ctx, src, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+        const size_t         rt_n =
+            llama_state_seq_get_data_ext(ctx, rt.data(), rt.size(), src, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        rt.resize(rt_n);
+        round_trip = rt == st.bytes;
+    } catch (const std::exception &) {
+        round_trip = false;
+    }
+    t.assert_true(lane + ": the fallback host partial state round-trips", round_trip);
+}
+
+static void test_partial_state_fragmented(testing & t) {
+    t.test("a fragmented recurrent cache refuses the whole-cache partial device save (cpu)", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            partial_state_fragmented_run(t, te.ctx, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU partial fragmented save: ") + e.what(), false);
+        }
+    });
+
+    t.test("a fragmented recurrent cache refuses the whole-cache partial device save (gpu)", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            partial_state_fragmented_run(t, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU partial fragmented save: ") + e.what(), false);
         }
     });
 }
@@ -2607,7 +3924,7 @@ static void test_save_load_fail_fast(testing & t) {
 
             llama_decision::engine eng(te.ctx, 2, 8);
             const auto st = eng.save_seq(2, false);
-            t.assert_true("a decoded sequence saves a non-empty state", !st.bytes.empty() && !st.on_device);
+            t.assert_true("a decoded sequence saves a non-empty state", !st.bytes.empty() && !st.on_device());
             bool threw = false;
             try {
                 eng.load_seq(st, 2);
@@ -2811,7 +4128,8 @@ static void test_bounded_decision_context(testing & t) {
 static void multi_trunk_restore_round_trip(testing &           t,
                                            llama_context *     ctx,
                                            llama_model *       model,
-                                           const std::string & lane) {
+                                           const std::string & lane,
+                                           const std::string & fork) {
     const llama_vocab *            vocab = llama_model_get_vocab(model);
     const std::vector<llama_token> chat  = common_tokenize(vocab, "a chat turn on the shared context", false, true);
     if (chat.empty()) {
@@ -2848,7 +4166,7 @@ static void multi_trunk_restore_round_trip(testing &           t,
     };
     llama_decision::options o;
     o.mode        = "tree";
-    o.fork        = "restore";
+    o.fork        = fork;
     o.allow_cache = false;
 
     const auto   plan      = eng.compile_fields(fields, o);
@@ -2859,13 +4177,17 @@ static void multi_trunk_restore_round_trip(testing &           t,
     t.assert_equal(lane + ": every context is returned", contexts.size(), batch.items.size());
 
     // the same context twice in one wave must not alias: identical inputs must score identically
+    // identical contexts in one wave must score the same. GPU batch packing can place their
+    // branches in different batches, so the probability bound there is the documented
+    // head-agreement tolerance; the branch-state oracle is the byte-level exactness check.
+    const double twin_tol = lane == "gpu" ? 5e-2 : 1e-4;
     bool twins = batch.items[0].fields.size() == batch.items[2].fields.size();
     for (size_t f = 0; twins && f < fields.size(); ++f) {
         const auto & p0 = batch.items[0].fields[f].probs;
         const auto & p2 = batch.items[2].fields[f].probs;
         twins           = batch.items[0].fields[f].winner == batch.items[2].fields[f].winner && p0.size() == p2.size();
         for (size_t k = 0; twins && k < p0.size(); ++k) {
-            twins = std::fabs(p0[k] - p2[k]) < 1e-4;
+            twins = std::fabs(p0[k] - p2[k]) < twin_tol;
         }
     }
     t.assert_true(lane + ": the repeated context scores identically in one wave", twins);
@@ -2885,49 +4207,52 @@ static void multi_trunk_restore_round_trip(testing &           t,
 }
 
 static void test_multi_trunk_restore(testing & t) {
-    t.test("a multi-trunk restore keeps contexts independent and chat untouched on the CPU backend", [](testing & t) {
-        const std::string path = decision_cpu_model_path();
-        if (path.empty()) {
-            t.skip("no generated model; run the generate-models fixture");
-            return;
-        }
-        cpu_test_engine te;
-        if (!te.load(path, 512, false, false, 128, 18)) {
-            t.assert_true("the CPU decision scaffold loads the model", false);
-            return;
-        }
-        try {
-            multi_trunk_restore_round_trip(t, te.ctx, te.model, "cpu");
-        } catch (const std::exception & e) {
-            t.assert_true(std::string("the CPU multi-trunk restore: ") + e.what(), false);
-        }
-    });
+    for (const char * fork : { "restore", "hybrid" }) {
+        t.test(std::string("the ") + fork + " fork keeps contexts independent on the CPU backend",
+               [fork](testing & t) {
+                   const std::string path = decision_cpu_model_path();
+                   if (path.empty()) {
+                       t.skip("no generated model; run the generate-models fixture");
+                       return;
+                   }
+                   cpu_test_engine te;
+                   if (!te.load(path, 512, false, false, 128, 18)) {
+                       t.assert_true("the CPU decision scaffold loads the model", false);
+                       return;
+                   }
+                   try {
+                       multi_trunk_restore_round_trip(t, te.ctx, te.model, "cpu", fork);
+                   } catch (const std::exception & e) {
+                       t.assert_true(std::string("the CPU multi-trunk ") + fork + ": " + e.what(), false);
+                   }
+               });
 
-    t.test("a multi-trunk restore keeps contexts independent and chat untouched on a recurrent GPU backend",
-           [](testing & t) {
-               const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-               if (!gpu_model_ready(t, path)) {
-                   return;
-               }
-               test_engine te;
-               if (!te.load(path, 18)) {
-                   t.assert_true("the GPU decision scaffold loads the model", false);
-                   return;
-               }
-               if (!llama_model_is_recurrent(te.model) && !llama_model_is_hybrid(te.model)) {
-                   t.skip("the model is neither recurrent nor hybrid; the restore-fork multi-trunk path needs one");
-                   return;
-               }
-               if (weak_quant_gpu_oracle(path)) {
-                   t.skip("weak-quant GPU numerics move a winner here; the aliasing check is skipped, not xfail");
-                   return;
-               }
-               try {
-                   multi_trunk_restore_round_trip(t, te.ctx, te.model, "gpu");
-               } catch (const std::exception & e) {
-                   t.assert_true(std::string("the GPU multi-trunk restore: ") + e.what(), false);
-               }
-           });
+        t.test(std::string("the ") + fork + " fork keeps contexts independent on a recurrent GPU backend",
+               [fork](testing & t) {
+                   const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+                   if (!gpu_model_ready(t, path)) {
+                       return;
+                   }
+                   test_engine te;
+                   if (!te.load(path, 18)) {
+                       t.assert_true("the GPU decision scaffold loads the model", false);
+                       return;
+                   }
+                   if (!llama_model_is_recurrent(te.model) && !llama_model_is_hybrid(te.model)) {
+                       t.skip("the model is neither recurrent nor hybrid; the multi-trunk save/restore path needs one");
+                       return;
+                   }
+                   if (weak_quant_gpu_oracle(path)) {
+                       t.skip("weak-quant GPU numerics move a winner here; the aliasing check is skipped, not xfail");
+                       return;
+                   }
+                   try {
+                       multi_trunk_restore_round_trip(t, te.ctx, te.model, "gpu", fork);
+                   } catch (const std::exception & e) {
+                       t.assert_true(std::string("the GPU multi-trunk ") + fork + ": " + e.what(), false);
+                   }
+               });
+    }
 }
 
 // A failed decision must leave the pool sequences empty: a mid-wave decode failure forks pool
@@ -3024,6 +4349,112 @@ static void test_pool_seq_lifecycle(testing & t) {
     });
 }
 
+// A sliding-window cache no longer holds cells older than the window, so a fork must copy only the
+// cells that survive. The copy and hybrid forks share one clamp; this checks that a decision on a
+// context longer than the window is unchanged under hybrid against the full-restore ground truth.
+// The two paths may materialize different numbers of (attention-masked) cells, so this compares the
+// task value, not the state bytes.
+static void swa_fork_clamp_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
+        t.skip(lane + ": the model has no recurrent partial state; the clamp control is the copy fork");
+        return;
+    }
+    const int           n_swa = llama_model_n_swa(model);
+    if (n_swa <= 0) {
+        t.skip(lane + ": the model has no sliding-window attention");
+        return;
+    }
+    const int n_ctx    = (int) llama_n_ctx(ctx);
+    const int n_parent = std::min(n_swa + 8, n_ctx - 64);
+    if (n_parent <= n_swa) {
+        t.skip(lane + ": the sliding window does not fit the test context");
+        return;
+    }
+
+    const llama_vocab * vocab   = llama_model_get_vocab(model);
+    const std::string   context = text_of_n_tokens(vocab, n_parent);
+    const auto          ctx_toks = common_tokenize(vocab, context, false, true);
+    if ((int) ctx_toks.size() <= n_swa) {
+        t.skip(lane + ": the model has no usable long prompt");
+        return;
+    }
+    t.assert_true(lane + ": the context exceeds the sliding window", (int) ctx_toks.size() > n_swa);
+
+    llama_memory_clear(llama_get_memory(ctx), true);
+    llama_decision::engine eng(ctx, 2, 8);
+    const std::vector<llama_decision::field_input> fields = {
+        { "  \"a\": ", { "1", "2" } },
+        { "  \"b\": ", { "x", "y" } },
+    };
+
+    llama_decision::options o_restore;
+    o_restore.fork        = "restore";
+    o_restore.allow_cache = false;
+    llama_decision::options o_hybrid = o_restore;
+    o_hybrid.fork = "hybrid";
+
+    const auto restore = eng.decide_batch("system", { context }, fields, o_restore);
+    const auto hybrid  = eng.decide_batch("system", { context }, fields, o_hybrid);
+    if (!t.assert_true(lane + ": the clamped restore decision returns", restore.items.size() == 1) ||
+        !t.assert_true(lane + ": the clamped hybrid decision returns", hybrid.items.size() == 1)) {
+        return;
+    }
+
+    const double swa_tol = lane == "gpu" ? 5e-2 : 1e-4;
+    bool agree = restore.items[0].fields.size() == hybrid.items[0].fields.size();
+    for (size_t f = 0; agree && f < fields.size(); ++f) {
+        agree = restore.items[0].fields[f].winner == hybrid.items[0].fields[f].winner;
+        const auto & pr = restore.items[0].fields[f].probs;
+        const auto & ph = hybrid.items[0].fields[f].probs;
+        agree = agree && pr.size() == ph.size();
+        for (size_t k = 0; agree && k < pr.size(); ++k) {
+            agree = std::fabs(pr[k] - ph[k]) < swa_tol;
+        }
+    }
+    t.assert_true(lane + ": a context past the sliding window scores the same under hybrid", agree);
+}
+
+static void test_fork_swa_clamp(testing & t) {
+    t.test("a hybrid fork clamps to the sliding window on the CPU backend", [](testing & t) {
+        // the decision fixture qwen35 has no sliding window; the generated lfm2 is hybrid with one
+        std::string path = std::string(DECISION_TEST_GENERATED_MODEL_DIR) + "/lfm2-dense.gguf";
+        if (!file_exists(path)) {
+            path = decision_cpu_model_path();
+        }
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            swa_fork_clamp_run(t, te.ctx, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU SWA clamp fork: ") + e.what(), false);
+        }
+    });
+
+    t.test("a hybrid fork clamps to the sliding window on the GPU backend", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            swa_fork_clamp_run(t, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU SWA clamp fork: ") + e.what(), false);
+        }
+    });
+}
 
 // A classifier-only context is selected through llama_context_params. The field must be appended
 // after every pre-existing member so the by-value C ABI offsets of existing fields do not move.
@@ -3490,6 +4921,8 @@ static common_json oracle_readout(const llama_decision::letter_metrics & m,
             scores.push_back((double) v);
         }
         q["probs"] = scores;
+        q["confidence"] = llama_decision::inverse_entropy_confidence(p);
+        q["certainty"]  = llama_decision::winner_share(p);
         questions.push_back(q);
     }
     o["questions"] = questions;
@@ -3767,6 +5200,8 @@ static void oracle_assert_readout(testing & t, const std::string & label,
         const std::string q = label + " q" + std::to_string(qi);
         t.assert_equal(q + " options", eq.at(qi).at("options").get<long long>(), aq.at(qi).at("options").get<long long>());
         t.assert_equal(q + " winner", eq.at(qi).at("winner").get<long long>(), aq.at(qi).at("winner").get<long long>());
+        t.assert_true(q + " carries confidence = 1 - H/log K", aq.at(qi).contains("confidence"));
+        t.assert_true(q + " carries certainty = max p", aq.at(qi).contains("certainty"));
         oracle_assert_probs(t, q, eq.at(qi), aq.at(qi), tol);
     }
 }
@@ -7072,6 +8507,23 @@ static common_json calibration_rows() {
         rows["output_row_capacity"] = r;
     }
     {
+        auto r = calibration_row("opt-in confidence profile and order-de-bias pass profile", "task-value",
+                                 { "which confidence value is reported", "how many order-de-bias passes run" },
+                                 { "admission", "caching", "routing", "persistence", "answer key" },
+                                 "the local 1-H/logK confidence and permutations=1 stay the defaults; the Jev confidence profile (N*p_max-1)/(N-1) and a higher default pass count are opt-in per request or per server flag and change only the reported concentration and the cost, never the winner gate; the corpus harness records winner agreement, Brier and ECE");
+        common_json g = control_group({
+            control_case("no confidence_profile field", "local 1-H/logK, unchanged answer"),
+            control_case("confidence_profile=jev", "rescaled winner share, same probabilities"),
+            control_case("no permutations field at the default server", "one pass"),
+            control_case("server default permutations=2", "two passes unless the request says otherwise"),
+        });
+        g["metrics"] = common_json::parse(R"(["winner_agreement","brier","ece"])");
+        g["corpus"]  = "accuracy_corpus.json";
+        g["report"]  = "accuracy_report.json";
+        r["control_group"] = g;
+        rows["readout_compatibility"] = r;
+    }
+    {
         auto r = calibration_row("weak-quant producer-stability allowlist", "producer-confidence",
                                  { "whether a producer-stability assertion is skipped on a model" },
                                  { "any task-value assertion", "answers", "admission", "caching", "routing", "persistence" },
@@ -7092,14 +8544,14 @@ static void test_calibration_table(testing & t) {
         const common_json cal = common_json::parse(
             read_file(std::string(DECISION_TEST_BASELINE_DIR) + "/calibration.json"));
 
-        const char * ids[] = { "tree_vs_greedy", "prefix_hoist", "single_question_bypass", "question_dedup", "confidence_diagnostics", "auto_mode_boundary", "temperature_profile", "selected_head", "head_context_selector", "adapter_scope", "admission_control" };
+        const char * ids[] = { "tree_vs_greedy", "prefix_hoist", "single_question_bypass", "question_dedup", "confidence_diagnostics", "auto_mode_boundary", "temperature_profile", "selected_head", "head_context_selector", "adapter_scope", "readout_compatibility", "admission_control" };
         for (const char * id : ids) {
             const auto & row = cal.at("rows").at(id);
             t.assert_true(std::string(id) + " has an axis", row.contains("axis"));
             t.assert_true(std::string(id) + " has a verdict", !row.at("verdict").get<std::string>().empty());
             t.assert_true(std::string(id) + " is not a production gate", !row.at("production_gate").get<bool>());
         }
-        for (const char * id : { "confidence_diagnostics", "temperature_profile", "selected_head", "head_context_selector", "adapter_scope" }) {
+        for (const char * id : { "confidence_diagnostics", "temperature_profile", "selected_head", "head_context_selector", "adapter_scope", "readout_compatibility" }) {
             const auto & ng = cal.at("rows").at(id).at("may_not_gate");
             for (const char * rule : { "admission", "caching", "routing", "persistence" }) {
                 bool found = false;
@@ -7531,8 +8983,8 @@ static int write_decision_golden(const char * model_path) {
     }
     auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
     const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
-    llama_decision::engine eng(te.ctx, 2, 8);
-    const auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
+            llama_decision::engine eng(te.ctx, 2, 8);
+            const auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
     const auto probs = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, llama_decision::options{}, nullptr);
     common_json usage = common_json::object();
     usage["input_tokens"]    = 0;
@@ -7676,8 +9128,9 @@ static int write_readout_baseline(const std::string & backend) {
         common_json rec = readout_capture(path, gpu);
         rec["note"] =
             "Frozen readout of the committed decision corpus. The deterministic core "
-            "(probabilities, winners, head mode, label-pool size) is a contract; the "
-            "timing block is recorded for context and excluded from the byte diff.";
+            "(probabilities, winners, confidence = 1 - H/log K, certainty = max p, head mode, "
+            "label-pool size) is a contract; the timing block is recorded for context and excluded "
+            "from the byte diff.";
         write_file(readout_baseline_path(backend), rec.dump(1) + "\n");
     } catch (const std::exception & e) {
         fprintf(stderr, "failed to record the %s readout baseline: %s\n", backend.c_str(), e.what());
@@ -7839,6 +9292,7 @@ int main(int argc, char ** argv) {
         test_question_temperature(t);
         test_temperature_effect(t);
         test_confidence_certainty_axes(t);
+        test_confidence_profile(t);
         test_temperature_profile(t);
         test_confidence_never_gates(t);
         test_letter_suffix(t);
@@ -7852,10 +9306,20 @@ int main(int argc, char ** argv) {
         test_label_boundary_calibration(t);
         test_letter_readout_real(t);
         test_fork_real(t);
+        test_fork_oracle(t);
+        test_nested_fork_oracle(t);
+        test_session_fork(t);
+        test_fork_auto_default(t);
+        test_fork_strategy_switch(t);
+        test_fork_divergence_control(t);
+        test_fork_swa_clamp(t);
         test_prefix_lru_restores_own_state(t);
+        test_state_bulk_copy(t);
         test_device_state_round_trip(t);
         test_device_async_staging(t);
         test_recurrent_multi_range_device_save(t);
+        test_partial_state_round_trip(t);
+        test_partial_state_fragmented(t);
         test_device_layout_mutation_round_trip(t);
         test_prefix_cache_cost(t);
         test_classifier_head_unbiased(t);

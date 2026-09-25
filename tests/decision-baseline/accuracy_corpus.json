@@ -1,0 +1,99 @@
+{
+  "note": "Labeled decision corpus for the accuracy harness. Each case pairs evidence with one typed question and the ground-truth expected answer key. The harness reports winner agreement, Brier and ECE per model and per readout; it is measurement only and never gates a request. States are written so the expected answer follows from the text alone.",
+  "letter": [
+    {
+      "id": "duplicate_charge",
+      "state": "The customer was charged twice for the same order on May 3 and asks for a refund of the duplicate.",
+      "question": {"type": "choice", "instructions": "Which team should handle this?", "criteria": {"billing": "payments and refunds", "technical": "software errors"}},
+      "expected": "billing"
+    },
+    {
+      "id": "crash_stack_trace",
+      "state": "The application crashes with a stack trace every time the user opens the settings screen.",
+      "question": {"type": "choice", "instructions": "Which team should handle this?", "criteria": {"billing": "payments and refunds", "technical": "software errors"}},
+      "expected": "technical"
+    },
+    {
+      "id": "broken_item_refund",
+      "state": "The item arrived broken and the customer requests their money back.",
+      "question": {"type": "noul", "instructions": "Should this be refunded?"},
+      "expected": "true"
+    },
+    {
+      "id": "satisfied_no_refund",
+      "state": "The customer says the product works perfectly and they are very happy with it.",
+      "question": {"type": "noul", "instructions": "Should this be refunded?"},
+      "expected": "false"
+    },
+    {
+      "id": "production_outage",
+      "state": "The production database is down and every customer is affected right now.",
+      "question": {"type": "score", "instructions": "How urgent is this?", "criteria": ["low", "medium", "high"]},
+      "expected": "2"
+    },
+    {
+      "id": "cosmetic_request",
+      "state": "A user suggests a cosmetic change to the label color for a future release.",
+      "question": {"type": "score", "instructions": "How urgent is this?", "criteria": ["low", "medium", "high"]},
+      "expected": "0"
+    },
+    {
+      "id": "angry_customer",
+      "state": "I am extremely frustrated and angry that this same failure keeps happening.",
+      "question": {"type": "choice", "instructions": "What is the sentiment?", "criteria": {"positive": "happy", "negative": "upset", "neutral": "matter of fact"}},
+      "expected": "negative"
+    },
+    {
+      "id": "pleased_customer",
+      "state": "Thank you so much, this is exactly what I needed and it works great.",
+      "question": {"type": "choice", "instructions": "What is the sentiment?", "criteria": {"positive": "happy", "negative": "upset", "neutral": "matter of fact"}},
+      "expected": "positive"
+    },
+    {
+      "id": "feature_request",
+      "state": "The user wants a new dark mode option added to the settings menu.",
+      "question": {"type": "choice", "instructions": "Is this a bug or a feature request?", "criteria": {"bug": "broken behavior", "feature": "new capability"}},
+      "expected": "feature"
+    },
+    {
+      "id": "login_bug",
+      "state": "The login button does nothing and users cannot sign in at all.",
+      "question": {"type": "choice", "instructions": "Is this a bug or a feature request?", "criteria": {"bug": "broken behavior", "feature": "new capability"}},
+      "expected": "bug"
+    },
+    {
+      "id": "account_compromised",
+      "state": "Someone logged into the account from another country and changed the password.",
+      "question": {"type": "noul", "instructions": "Does this need immediate escalation?"},
+      "expected": "true"
+    },
+    {
+      "id": "minor_typo",
+      "state": "A page has a small typo in the footer text.",
+      "question": {"type": "noul", "instructions": "Does this need immediate escalation?"},
+      "expected": "false"
+    }
+  ],
+  "schema": [
+    {
+      "id": "schema_duplicate_charge",
+      "context": "The customer was charged twice for the same order and needs it fixed today.",
+      "instructions": "Answer each field from the context.",
+      "schema": {
+        "category": {"type": "enum", "choices": ["billing", "technical"], "description": "What is the issue?"},
+        "urgent": {"type": "boolean", "description": "Is this urgent?"}
+      },
+      "expected": {"category": "billing", "urgent": true}
+    },
+    {
+      "id": "schema_routine_question",
+      "context": "The user asks how to change the display language whenever it is convenient.",
+      "instructions": "Answer each field from the context.",
+      "schema": {
+        "category": {"type": "enum", "choices": ["billing", "technical"], "description": "What is the issue?"},
+        "urgent": {"type": "boolean", "description": "Is this urgent?"}
+      },
+      "expected": {"category": "technical", "urgent": false}
+    }
+  ]
+}
