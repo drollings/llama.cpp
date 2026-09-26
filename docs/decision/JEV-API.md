@@ -82,6 +82,43 @@ Field rules [Doc]:
 - Noul `criteria`: optional. `true` = what a yes (value near 1) means; `false` = what a no (near 0) means.
 - Choice `criteria`: option name -> description; use `null` when the option name needs no extra detail. Descriptions may be nested objects/arrays (e.g. taxonomy subtrees).
 - Score `criteria`: array position is the level number, starting at 0. The model sees descriptions only, not level numbers or neighbors; each level is judged independently.
+
+### Numeric extension (not part of Jev)
+
+This branch adds two question types on top of the Jev set. They are optional
+extensions, additive to the request and response; a Jev-only client never sees
+them.
+
+```ts
+interface IntegerQuestion {
+  type: "integer";
+  instructions: EntryType;              // required
+  minimum: number;                      // required, integer
+  maximum: number;                      // required, integer, >= minimum
+  aggregate?: "mode" | "median" | "mean";
+}
+
+interface NumberQuestion {
+  type: "number";
+  instructions: EntryType;              // required
+  minimum: number;                      // required
+  maximum: number;                      // required, >= minimum
+  step?: number;                        // required unless multipleOf is set; > 0
+  multipleOf?: number;                  // alias for step; provide one, not both
+  aggregate?: "mode" | "median" | "mean";
+}
+```
+
+The bounds define an ascending 2-255 value grid (shown to the model and scored
+exactly like a `choice`); `multipleOf`/`step` must divide the range so the grid
+includes both ends. Values render at fixed decimal width (no float noise).
+Answers are `{type, value, probabilities, confidence}` where `value` is the
+winning grid value as a typed JSON number (mode) and `probabilities` keys are
+the rendered values. An `aggregate` adds a scalar summary of the same
+distribution (`mean = sum(p_i * v_i)`, `median` is the value-space weighted
+quantile at 0.5, `mode` is `value`); it never changes `value`. Under
+`diagnostics: true` the numeric answer also carries `certainty`, `median`, and
+`interval_p10_p90`, matching the `score` spread summaries.
 - Duplicate/empty option names, empty `questions`, and max question count: [Undocumented].
 
 ### 3.2 Question-time semantics the model relies on [Doc]

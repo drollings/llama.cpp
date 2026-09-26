@@ -27,6 +27,7 @@ inline constexpr size_t DECISION_MAX_CONTEXTS         = 256;
 inline constexpr size_t DECISION_MIN_OPTIONS          = 2;
 inline constexpr size_t DECISION_MAX_CHOICE_OPTIONS   = 255;
 inline constexpr size_t DECISION_MAX_SCORE_LEVELS     = 10;
+inline constexpr size_t DECISION_MAX_NUMERIC_VALUES   = 255;
 inline constexpr int    DECISION_MAX_PERMUTATIONS     = 8;
 
 // Valid JSON but invalid decision content (bad type, limits, missing fields).
@@ -85,10 +86,11 @@ struct decision_option {
 
 struct decision_question {
     std::string              id;
-    std::string              type;         // canonical: noul | choice | score
+    std::string              type;         // canonical: noul | choice | score | integer | number
     common_json              instructions; // string/object/array, may be null
     std::vector<decision_option>  options;
     bool                     has_criteria = false;
+    std::string              aggregate;    // numeric only: "" | mode | median | mean
 };
 
 // A request may name a live chat slot to answer about, so the transcript is not re-prefilled.

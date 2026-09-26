@@ -98,6 +98,19 @@ bool is_textual(const common_json & v) {
     return v.is_string() || v.is_object() || v.is_array();
 }
 
+// The number of decimal places a value needs to round-trip, so a grid built by
+// `lo + i * step` can be rendered with fixed width and no float noise ("0.3",
+// never "0.30000000000000004").
+int decimal_places(double x) {
+    for (int k = 0; k <= 9; ++k) {
+        const double v = x * std::pow(10.0, k);
+        if (std::fabs(v - std::llround(v)) < 1e-9 * std::max(1.0, std::fabs(v))) {
+            return k;
+        }
+    }
+    return 9;
+}
+
 void check_allowed_keys(const common_json & obj, std::initializer_list<const char *> allowed, const std::string & where) {
     for (const auto & e : obj.items()) {
         bool ok = false;
@@ -131,7 +144,8 @@ void read_temperatures(const common_json & temps, std::map<std::string, double> 
         throw semantic_error("temperatures must be an object");
     }
     for (const auto & e : temps.items()) {
-        if (e.key() != "noul" && e.key() != "choice" && e.key() != "score") {
+        if (e.key() != "noul" && e.key() != "choice" && e.key() != "score" &&
+            e.key() != "integer" && e.key() != "number") {
             throw semantic_error("temperatures: unknown field \"" + e.key() + "\"");
         }
         if (!e.value().is_number() || !(e.value().get<double>() > 0.0)) {
@@ -173,21 +187,27 @@ decision_question parse_question(const std::string & id, const common_json & spe
     if (!spec.is_object()) {
         throw semantic_error("question \"" + id + "\" must be an object");
     }
-    check_allowed_keys(spec, { "type", "instructions", "criteria" }, "question \"" + id + "\"");
 
     if (!spec.contains("type") || !spec.at("type").is_string()) {
         throw semantic_error("question \"" + id + "\" needs a string \"type\"");
     }
-    const std::string raw_type = spec.at("type").get<std::string>();
+    const std::string q_type = canonical_type(spec.at("type").get<std::string>());
+    const bool numeric = q_type == "integer" || q_type == "number";
+    if (q_type != "noul" && q_type != "choice" && q_type != "score" && !numeric) {
+        throw semantic_error("question \"" + id + "\": unknown type \"" + q_type + "\"");
+    }
+
+    if (numeric) {
+        check_allowed_keys(spec, { "type", "instructions", "minimum", "maximum", "step", "multipleOf", "aggregate" },
+                           "question \"" + id + "\"");
+    } else {
+        check_allowed_keys(spec, { "type", "instructions", "criteria" }, "question \"" + id + "\"");
+    }
 
     decision_question q;
     q.id          = id;
-    q.type        = canonical_type(raw_type);
+    q.type        = q_type;
     q.has_criteria = spec.contains("criteria") && !spec.at("criteria").is_null();
-
-    if (q.type != "noul" && q.type != "choice" && q.type != "score") {
-        throw semantic_error("question \"" + id + "\": unknown type \"" + raw_type + "\"");
-    }
 
     if (spec.contains("instructions")) {
         const common_json & ins = spec.at("instructions");
@@ -239,7 +259,7 @@ decision_question parse_question(const std::string & id, const common_json & spe
             o.original    = e.value();
             q.options.push_back(o);
         }
-    } else { // score
+    } else if (q.type == "score") {
         if (!q.has_criteria) {
             throw semantic_error("question \"" + id + "\": score needs \"criteria\"");
         }
@@ -269,6 +289,74 @@ decision_question parse_question(const std::string & id, const common_json & spe
             }
         } else {
             throw semantic_error("question \"" + id + "\": score criteria must be an array or a legend object");
+        }
+    } else if (q.type == "integer") {
+        // A range-generated typed grid: minimum..maximum inclusive, scored by label exactly like a
+        // choice. The typed value rides in `original`, so the answer and the aggregates are numbers.
+        if (!spec.contains("minimum") || !spec.at("minimum").is_number_integer() ||
+            !spec.contains("maximum") || !spec.at("maximum").is_number_integer()) {
+            throw semantic_error("question \"" + id + "\": integer needs integer minimum and maximum");
+        }
+        const long long lo = spec.at("minimum").get<long long>();
+        const long long hi = spec.at("maximum").get<long long>();
+        const size_t    n  = (size_t) (hi - lo) + 1;
+        if (hi < lo || n < DECISION_MIN_OPTIONS || n > DECISION_MAX_NUMERIC_VALUES) {
+            throw semantic_error("question \"" + id + "\": integer bounds must define " +
+                                 std::to_string(DECISION_MIN_OPTIONS) + "-" +
+                                 std::to_string(DECISION_MAX_NUMERIC_VALUES) + " values");
+        }
+        for (long long v = lo; v <= hi; ++v) {
+            decision_option o;
+            o.key      = std::to_string(v);
+            o.original = common_json(v);
+            q.options.push_back(std::move(o));
+        }
+    } else { // number
+        if (spec.contains("step") && spec.contains("multipleOf")) {
+            throw semantic_error("question \"" + id + "\": provide step or multipleOf, not both");
+        }
+        const char * step_key = spec.contains("step") ? "step" : (spec.contains("multipleOf") ? "multipleOf" : nullptr);
+        if (step_key == nullptr ||
+            !spec.contains("minimum") || !spec.contains("maximum") ||
+            !spec.at("minimum").is_number() || !spec.at("maximum").is_number() ||
+            !spec.at(step_key).is_number()) {
+            throw semantic_error("question \"" + id + "\": number needs minimum, maximum and step (or multipleOf)");
+        }
+        const double lo   = spec.at("minimum").get<double>();
+        const double hi   = spec.at("maximum").get<double>();
+        const double step = spec.at(step_key).get<double>();
+        if (!(step > 0) || !(hi >= lo)) {
+            throw semantic_error("question \"" + id + "\": number needs ordered bounds and a positive step");
+        }
+        const double    count = (hi - lo) / step;
+        const long long n     = std::llround(count);
+        if (std::fabs(count - (double) n) > 1e-7 ||
+            n + 1 < (long long) DECISION_MIN_OPTIONS || n + 1 > (long long) DECISION_MAX_NUMERIC_VALUES) {
+            throw semantic_error("question \"" + id + "\": the number grid must include both ends and hold " +
+                                 std::to_string(DECISION_MIN_OPTIONS) + "-" +
+                                 std::to_string(DECISION_MAX_NUMERIC_VALUES) + " values");
+        }
+        const int places = std::max({ decimal_places(lo), decimal_places(hi), decimal_places(step) });
+        for (long long i = 0; i <= n; ++i) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%.*f", places, lo + (double) i * step);
+            const double v = std::strtod(buf, nullptr); // drop float noise: 0.1 + 0.2 -> "0.3"
+            decision_option o;
+            o.key      = buf;
+            o.original = common_json(v);
+            q.options.push_back(std::move(o));
+        }
+    }
+
+    if (q.type == "integer" || q.type == "number") {
+        if (spec.contains("aggregate") && !spec.at("aggregate").is_null()) {
+            if (!spec.at("aggregate").is_string()) {
+                throw semantic_error("question \"" + id + "\": aggregate must be a string");
+            }
+            q.aggregate = spec.at("aggregate").get<std::string>();
+            if (q.aggregate != "mode" && q.aggregate != "median" && q.aggregate != "mean") {
+                throw semantic_error("question \"" + id + "\": aggregate must be mode, median or mean");
+            }
         }
     }
 
@@ -618,6 +706,33 @@ static double score_quantile(const std::vector<float> & p, double q) {
     return (double) (p.size() - 1);
 }
 
+// The typed numeric value of a numeric-grid option. The grid stores the value as the option's
+// `original` (a JSON integer or float), so the answer and the aggregates are real numbers.
+static double option_number(const decision_option & o) {
+    if (o.original.is_number_integer()) {
+        return (double) o.original.get<long long>();
+    }
+    return o.original.get<double>();
+}
+
+// Value-space weighted quantile of a numeric distribution: the same interpolation the score
+// quantile does, but over the actual grid values instead of level indices.
+static double value_quantile(const std::vector<float> & p, const std::vector<double> & values, double q) {
+    double cum = 0.0;
+    for (size_t i = 0; i < p.size(); ++i) {
+        const double prev = cum;
+        cum += p[i];
+        if (cum >= q) {
+            if (i > 0 && p[i] > 0.0) {
+                const double t = (q - prev) / (double) p[i];
+                return values[i - 1] + t * (values[i] - values[i - 1]);
+            }
+            return values[i];
+        }
+    }
+    return values.back();
+}
+
 common_json assemble_decision_response(const decision_request & req,
                                   const std::vector<std::vector<float>> & probs,
                                   const std::string & model,
@@ -662,7 +777,7 @@ const common_json conc = concentration_metrics(p, req.confidence_profile);
             if (q.type == "choice") {
                 a["choice"]        = q.options[best].key;
                 a["probabilities"] = probs_obj;
-            } else { // score
+            } else if (q.type == "score") {
                 double expected = 0.0;
                 common_json legend = common_json::object();
                 for (size_t i = 0; i < q.options.size(); ++i) {
@@ -682,6 +797,35 @@ const common_json conc = concentration_metrics(p, req.confidence_profile);
                 }
                 a["probabilities"] = probs_obj;
                 a["legend"]        = legend;
+            } else { // integer | number: the numeric extension over Jev
+                std::vector<double> values;
+                values.reserve(q.options.size());
+                for (const auto & o : q.options) {
+                    values.push_back(option_number(o));
+                }
+                // `value` is always the winner (mode), a typed grid value; the aggregate is the
+                // optional scalar summary. Both are pure functions of the same distribution.
+                a["value"]         = q.options[best].original;
+                a["probabilities"] = probs_obj;
+                if (!q.aggregate.empty()) {
+                    double agg = values[best]; // mode
+                    if (q.aggregate == "median") {
+                        agg = value_quantile(p, values, 0.5);
+                    } else if (q.aggregate == "mean") {
+                        agg = 0.0;
+                        for (size_t i = 0; i < p.size(); ++i) {
+                            agg += (double) p[i] * values[i];
+                        }
+                    }
+                    a["aggregate"] = agg;
+                }
+                if (req.diagnostics) {
+                    common_json band = common_json::array();
+                    band.push_back(value_quantile(p, values, 0.10));
+                    band.push_back(value_quantile(p, values, 0.90));
+                    a["median"]          = value_quantile(p, values, 0.5);
+                    a["interval_p10_p90"] = band;
+                }
             }
         }
         answers[q.id] = a;

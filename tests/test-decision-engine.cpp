@@ -364,6 +364,117 @@ static void test_saved_state_format_dispatch(testing & t) {
 // The provenance gate control is shared by the temperature test and the sign-off table.
 static common_json calibration_temperature_control_measurement();
 
+// The numeric extension over the Jev question set: integer/number grids are generated from bounds
+// at parse time, scored by label exactly like a choice, and answered with a typed value plus an
+// optional aggregate. Pure JSON, no model needed.
+static void expect_decision_reject(testing & t, const std::string & body_text, const std::string & needle);
+static void test_numeric_questions(testing & t) {
+    t.test("numeric integer and number grids parse into typed options", [](testing & t) {
+        const auto body = common_json::parse(R"({"model":"m","state":"s","questions":{
+            "age":   {"type":"integer","instructions":"age in years","minimum":18,"maximum":20},
+            "amount":{"type":"number","instructions":"amount","minimum":0,"maximum":0.5,"step":0.25},
+            "avg":   {"type":"integer","instructions":"rating","minimum":1,"maximum":3,"aggregate":"mean"}}})");
+        const auto req = llama_decision::parse_decision_request(body);
+        t.assert_equal("three questions", (size_t) 3, req.questions.size());
+
+        const auto & age = req.questions[0];
+        t.assert_equal("integer canonical type", std::string("integer"), age.type);
+        t.assert_equal("integer grid 18..20", (size_t) 3, age.options.size());
+        t.assert_equal("integer key is the value", std::string("18"), age.options[0].key);
+        t.assert_equal("integer grid is ascending", std::string("20"), age.options[2].key);
+        t.assert_true("integer originals are typed numbers", age.options[0].original.is_number_integer());
+        t.assert_equal("aggregate absent stays empty", std::string(), age.aggregate);
+
+        const auto & amount = req.questions[1];
+        t.assert_equal("number canonical type", std::string("number"), amount.type);
+        t.assert_equal("number grid 0..0.5 by 0.25", (size_t) 3, amount.options.size());
+        t.assert_equal("number key is fixed width", std::string("0.00"), amount.options[0].key);
+        t.assert_equal("number key strips float noise", std::string("0.50"), amount.options[2].key);
+        t.assert_true("number originals are floats", amount.options[1].original.is_number_float());
+
+        const auto & avg = req.questions[2];
+        t.assert_equal("aggregate parsed", std::string("mean"), avg.aggregate);
+    });
+
+    t.test("numeric limits and shapes are validated", [](testing & t) {
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"integer","instructions":"x","minimum":10,"maximum":9}}})",
+                               "bounds");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"integer","instructions":"x","minimum":1,"maximum":2,"criteria":{"a":"x"}}}})",
+                               "unknown field");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"integer","instructions":"x","minimum":1.5,"maximum":2}}})",
+                               "integer needs integer minimum");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"integer","instructions":"x"}}})",
+                               "needs integer minimum and maximum");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"number","instructions":"x","minimum":0,"maximum":1}}})",
+                               "step (or multipleOf)");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"number","instructions":"x","minimum":0,"maximum":1,"step":0,"multipleOf":0.1}}})",
+                               "not both");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"number","instructions":"x","minimum":0,"maximum":1,"step":0.3}}})",
+                               "must include both ends");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"integer","instructions":"x","minimum":1,"maximum":1,"aggregate":"mean"}}})",
+                               "2-255 values");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"number","instructions":"x","minimum":1,"maximum":256,"step":1}}})",
+                               "2-255 values");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"integer","instructions":"x","minimum":1,"maximum":3,"aggregate":"bogus"}}})",
+                               "aggregate must be mode, median or mean");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"number","instructions":"x","minimum":0,"maximum":1,"step":0.25,"aggregate":1}}})",
+                               "aggregate must be a string");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"choice","instructions":"x","criteria":{"a":null,"b":null},"aggregate":"mean"}}})",
+                               "unknown field");
+    });
+
+    t.test("numeric answers carry a typed value, probabilities and the optional aggregate", [](testing & t) {
+        const auto body = common_json::parse(R"({"model":"m","state":"s","questions":{
+            "age":{"type":"integer","instructions":"age","minimum":18,"maximum":20},
+            "avg":{"type":"number","instructions":"amount","minimum":0,"maximum":2,"step":1,"aggregate":"mean"},
+            "med":{"type":"integer","instructions":"rating","minimum":1,"maximum":4,"aggregate":"median"}}})");
+        auto req = llama_decision::parse_decision_request(body);
+        common_json usage = common_json::object();
+        usage["output_tokens"] = 0;
+
+        const std::vector<std::vector<float>> probs = {
+            { 0.1f, 0.2f, 0.7f },       // age grid 18,19,20: winner 20
+            { 0.5f, 0.3f, 0.2f },       // avg grid 0,1,2: mean = 0.3 + 0.4 = 0.7
+            { 0.5f, 0.2f, 0.2f, 0.1f }, // med grid 1..4: median crosses at 1
+        };
+        const common_json out = llama_decision::assemble_decision_response(req, probs, "m", usage);
+
+        const auto & age = out.at("answers").at("age");
+        t.assert_equal("type echoed", std::string("integer"), age.at("type").get<std::string>());
+        t.assert_equal("value is the typed winner", 20, age.at("value").get<long long>());
+        assert_close(t, "probabilities keyed by value", 0.7, age.at("probabilities").at("20").get<double>(), 1e-6);
+        t.assert_true("no aggregate without a request", !age.contains("aggregate"));
+
+        const auto & avg = out.at("answers").at("avg");
+        t.assert_equal("value is the winner as a number", 0.0, avg.at("value").get<double>());
+        assert_close(t, "aggregate mean is the weighted mean", 0.7, avg.at("aggregate").get<double>(), 1e-6);
+
+        const auto & med = out.at("answers").at("med");
+        assert_close(t, "aggregate median is the value-space quantile", 1.0,
+                     med.at("aggregate").get<double>(), 1e-6);
+
+        req.diagnostics = true;
+        const common_json diag = llama_decision::assemble_decision_response(req, probs, "m", usage);
+        const auto & dage = diag.at("answers").at("age");
+        t.assert_true("diagnostics add certainty", dage.contains("certainty"));
+        t.assert_true("diagnostics add the spread median", dage.contains("median"));
+        t.assert_true("diagnostics add the p10/p90 band", dage.contains("interval_p10_p90"));
+        assert_close(t, "p10/p90 band has two entries", 2, (long long) dage.at("interval_p10_p90").size());
+    });
+
+    t.test("numeric types take their own temperature overrides", [](testing & t) {
+        const auto body = common_json::parse(R"({"model":"m","state":"s","questions":{
+            "age":{"type":"integer","instructions":"x","minimum":1,"maximum":3},
+            "amt":{"type":"number","instructions":"x","minimum":0,"maximum":1,"step":0.5}}})");
+        common_json with_temps = body;
+        with_temps["temperature"]  = 1.5;
+        with_temps["temperatures"] = common_json::parse(R"({"integer":0.5,"number":2.0})");
+        const auto req = llama_decision::parse_decision_request(with_temps);
+        assert_close(t, "integer override", 0.5, llama_decision::question_temperature(req, req.questions[0]));
+        assert_close(t, "number override", 2.0, llama_decision::question_temperature(req, req.questions[1]));
+    });
+}
+
 static void test_question_temperature(testing & t) {
     t.test("effective temperature follows per-type override then global", [](testing & t) {
         const auto base = common_json::parse(R"({"model":"m","state":"s","questions":{
@@ -6620,6 +6731,7 @@ static void test_permutations_real(testing & t) {
             // reordering the request options, because identity+swap is closed under reversal.
             auto make_pair = [](bool reversed) {
                 common_json body = common_json::object();
+                body["model"] = "m";
                 body["state"] = "Customer was charged twice on May 3.";
                 common_json q;
                 q["type"]         = "choice";
@@ -7692,8 +7804,47 @@ static void test_calibration_selected_head_lfm(testing & t) {
             llama_decision::answer_head_cache probe_cache;
             t.assert_true("no model means no head", !probe_cache.probe(nullptr).available);
 
-            // 250 scored pairs: one 64-option question plus 31 six-option questions
+            // The head can only score length-1 label paths, and a label is coverable only when the
+            // token the plan scores at the answer boundary is the same single token the head
+            // carries. A symbol label whose tokenizer merges it with the trailing newline (e.g. a
+            // "!\n" token) drops out of head coverage, so the head's fan-out can be smaller than
+            // the pool. Size the wide question to the largest coverable prefix, probed with the
+            // engine's own predicate, so the head-vs-full agreement is still exercised on the
+            // widest question this model's head can actually serve.
+            llama_decision::engine e_full(te_full.ctx, 2, 8);
+            llama_decision::engine e_head(te_head.ctx, 2, 8);
+            size_t wide = pool.size();
+            for (; wide >= llama_decision::DECISION_MIN_OPTIONS; --wide) {
+                llama_decision::field_input probe;
+                probe.suffix = "\nQuestion: probe\nOptions:\n";
+                for (size_t i = 0; i < wide; ++i) {
+                    llama_decision::decision_option o;
+                    o.key = "opt" + std::to_string(i);
+                    probe.suffix += llama_decision::format_option_line(pool[i], o) + "\n";
+                }
+                probe.suffix += "Return the correct letter label.\nAnswer:\n";
+                probe.candidates.reserve(wide);
+                for (size_t i = 0; i < wide; ++i) {
+                    probe.candidates.push_back(pool[i].text);
+                }
+                llama_decision::options probe_opt;
+                probe_opt.mode           = "tree";
+                probe_opt.tree_max       = (int) pool.size();
+                probe_opt.split_boundary = false;
+                probe_opt.cache_tag      = "cal-head-probe";
+                llama_decision::options head_opt = probe_opt;
+                head_opt.head = &head;
+                std::string probe_reason;
+                const auto probe_plan = e_head.compile_fields({ probe }, probe_opt);
+                if (e_head.select_scoring_head(probe_plan, head_opt, &probe_reason)) {
+                    break;
+                }
+            }
+            t.assert_true("the head covers a usable wide prefix", wide >= llama_decision::DECISION_MIN_OPTIONS);
+
+            // scored pairs: one wide-option question plus 31 six-option questions
             common_json body = common_json::object();
+            body["model"] = "m";
             body["state"] = "Customer was charged twice on May 3 and asked for a refund.";
             common_json questions = common_json::object();
             auto add_question = [&questions](const std::string & id, int k) {
@@ -7707,7 +7858,7 @@ static void test_calibration_selected_head_lfm(testing & t) {
                 q["criteria"]     = crit;
                 questions[id]     = q;
             };
-            add_question("wide", 64);
+            add_question("wide", (int) wide);
             for (int i = 0; i < 31; ++i) {
                 add_question("q" + std::to_string(i), 6);
             }
@@ -7718,10 +7869,8 @@ static void test_calibration_selected_head_lfm(testing & t) {
             for (const auto & q : req.questions) {
                 pairs += (int) q.options.size();
             }
-            t.assert_equal("the request scores 250 pairs", 250, pairs);
-
-            llama_decision::engine e_full(te_full.ctx, 2, 8);
-            llama_decision::engine e_head(te_head.ctx, 2, 8);
+            t.assert_true("the request scores the wide question plus 31 six-option questions",
+                          pairs == (int) wide + 31 * 6);
 
             llama_decision::decision_request rfull = req;
             rfull.head = "full";
@@ -8841,6 +8990,7 @@ int main(int argc, char ** argv) {
         test_temperature_effect(t);
         test_confidence_certainty_axes(t);
         test_confidence_profile(t);
+        test_numeric_questions(t);
         test_temperature_profile(t);
         test_confidence_never_gates(t);
         test_letter_suffix(t);

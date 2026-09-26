@@ -171,12 +171,15 @@ the option names for choice, and `"0".."K-1"` for score.
 
 The wire converges on Jev's shape: a map of typed questions (`noul` /
 `choice` / `score`), answered against one `state` (Jev) or, as this branch's
-extension, against a list of `contexts` in one batched pass.
+extension, against a list of `contexts` in one batched pass. The numeric types
+(`integer` / `number`) are this branch's extension over Jev: a range generates a
+typed grid, answered with the winning value and an optional scalar `aggregate`.
 
 ```json
-{"state": "...", "questions": {"qid": {"type": "noul|choice|score",
+{"state": "...", "questions": {"qid": {"type": "noul|choice|score|integer|number",
     "instructions": ..., "criteria": ...}},
- "temperature": 1.0, "temperatures": {"noul": 1.0, "choice": 1.0, "score": 1.0},
+ "temperature": 1.0, "temperatures": {"noul": 1.0, "choice": 1.0, "score": 1.0,
+                                      "integer": 1.0, "number": 1.0},
  "confidence_profile": "jev|local", "permutations": 1}
 ```
 
@@ -184,11 +187,18 @@ extension, against a list of `contexts` in one batched pass.
   carries its own `instructions` (string/object/array) and `criteria`
   (noul `{true,false}` map, choice option->description map up to the label-pool
   cap, score ordered-level array). Question keys are the answer keys.
+* Numeric questions: `type: "integer"` needs integer `minimum` and `maximum`;
+  `type: "number"` needs numeric `minimum`, `maximum` and `step` (or
+  `multipleOf`, not both). The bounds define a 2-`DECISION_MAX_NUMERIC_VALUES`
+  ascending grid, shown to the model and scored exactly like a choice. The grid
+  must include both ends (`multipleOf` must divide the range). An optional
+  `aggregate` (`"mode"` default, `"median"`, `"mean"`) adds a scalar summary to
+  the answer; it never changes `value`.
 * Evidence: exactly one of `state` (string/object/array, Jev) or `contexts`
   (1-`DECISION_MAX_CONTEXTS` non-empty strings, answered in order against the
   same questions). Session fork scores exactly one context.
 * `temperature` (global, float > 0, default 1.0) with per-type `temperatures`
-  overrides; `confidence_profile` (`"jev"` default / `"local"`); `permutations`
+  overrides (the map accepts `integer` and `number` keys too); `confidence_profile` (`"jev"` default / `"local"`); `permutations`
   (1-8, order-de-biasing, capped, not on a session fork). All match Section 2.1
   semantics.
 * Response, single `state`: `{model, answers: {qid: {...}}, usage, timings}`.
@@ -245,15 +255,18 @@ The default response is exactly the Jev envelope:
             | {"type": "score", "score": 0.0-(K-1),
                "probabilities": {"0": p, ...}, "legend": {"0": "desc", ...},
                "confidence": c}
+            | {"type": "integer"|"number", "value": <typed grid value>,
+               "probabilities": {"<value>": p, ...},
+               "confidence": c, "aggregate": s}
   },
   "usage": {"input_tokens": N, "output_tokens": 0}
 }
 ```
 
 With `diagnostics: true` the same answers are returned with additive fields:
-`certainty` on choice/score, the `head` and `diagnostics` objects, the extra
-`usage` counters, the `timings` object, and the score spread summaries
-(`median`, `interval_p10_p90`). The answers themselves
+`certainty` on choice/score/numeric, the `head` and `diagnostics` objects, the
+extra `usage` counters, the `timings` object, and the score/numeric spread
+summaries (`median`, `interval_p10_p90`). The answers themselves
 are byte-identical either way.
 
 ```json
@@ -275,6 +288,12 @@ are byte-identical either way.
 * `score.score = sum(i * p_i)` (expected zero-based index, float in
   [0, K-1]); `probabilities` keys are STRINGS `"0".."K-1"`; `legend` echoes
   input criteria in order with string keys.
+* `integer`/`number`: `value` is the winning grid value as a typed JSON number
+  (mode); `probabilities` keys are the grid values rendered at fixed width
+  (no float noise), sums to 1. The optional `aggregate` is the scalar summary
+  of the same distribution when the question set one: `mean = sum(p_i * v_i)`,
+  `median` is the value-space weighted quantile at 0.5, `mode` is `value`.
+  `aggregate` is additive and never changes `value`.
 * `confidence = (N*p_max - 1)/(N - 1)`, clamped to [0,1] (the default). This is
   Jev's documented Choice confidence, a linear rescale of the winner's share
   `certainty = max(p)`: uniform -> 0, one-hot -> 1. Because it is built from the
@@ -285,13 +304,16 @@ are byte-identical either way.
   entropy) instead, which reads the whole distribution and calibrates better on
   some families; the profile changes only the reported number. Clamp to [0,1].
 * `certainty = max(p)` (the winner's share). `confidence` is always returned on
-  `choice` and `score`; `certainty` is additive and returned when `diagnostics`
-  is true. Both measure concentration of the answer distribution; they are not
+  `choice`, `score` and numeric questions; `certainty` is additive and returned
+  when `diagnostics` is true. Both measure concentration of the answer
+  distribution; they are not
   calibrated correctness and never gate admission, caching, routing, or
   persistence on their own.
 * Score `median` and `interval_p10_p90` (skew-robust spread summaries) are
   additive and only present when `diagnostics: true`; the default score answer
   is the strict Jev `{type, score, probabilities, legend, confidence}` shape.
+  Numeric answers report the same two summaries, over the grid values, under
+  `diagnostics: true`.
 * The `timings` object is additive and only present when `diagnostics: true`
   (or on a session fork, which reports its diagnostics additively).
 * `probabilities` are CONDITIONAL on the supplied options (they are a

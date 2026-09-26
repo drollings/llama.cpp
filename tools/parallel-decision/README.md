@@ -152,14 +152,18 @@ Numeric fields take `aggregate`: `mode` (default), `median` or `mean`.
 ## Decision shape (`state` + `questions`)
 
 `POST /v1/decision` also accepts the decision shape: one `state` and 1-256 typed `questions`
-(`noul` yes/no, `choice` pick-one, `score` ordered rating). Answers come back as one closed
+(`noul` yes/no, `choice` pick-one, `score` ordered rating, plus the numeric extension
+`integer`/`number` grids). Answers come back as one closed
 distribution per question, with `output_tokens` always 0:
 
 ```json
 {"state": "...",
  "questions": {"refund": {"type": "noul", "instructions": "refund?"},
                "dept": {"type": "choice", "instructions": "route", "criteria": {"billing": "payment", "support": "help"}},
-               "urgency": {"type": "score", "instructions": "urgency", "criteria": ["low", "medium", "high"]}}}
+               "urgency": {"type": "score", "instructions": "urgency", "criteria": ["low", "medium", "high"]},
+               "age": {"type": "integer", "instructions": "age in years", "minimum": 18, "maximum": 60},
+               "amount": {"type": "number", "instructions": "refund amount", "minimum": 0, "maximum": 100,
+                          "step": 10, "aggregate": "mean"}}}
 ```
 
 ```json
@@ -168,8 +172,17 @@ distribution per question, with `output_tokens` always 0:
                       "confidence": 0.53},
              "urgency": {"type": "score", "score": 1.6, "probabilities": {"0": 0.05, "1": 0.3, "2": 0.65},
                          "legend": {"0": "low", "1": "medium", "2": "high"},
-                         "confidence": 0.28}}}
+                         "confidence": 0.28},
+             "age": {"type": "integer", "value": 45, "probabilities": {"18": 0.01, "...": "...", "45": 0.87},
+                     "confidence": 0.86},
+             "amount": {"type": "number", "value": 10.0, "probabilities": {"0": 0.01, "...": "...", "10": 0.9},
+                        "confidence": 0.88, "aggregate": 11.4}}}
 ```
+
+A numeric question's bounds generate an ascending 2-255 value grid, scored by label exactly
+like a choice; the answer's `value` is the winning grid value (a typed JSON number), and an
+optional `aggregate` (`mean`/`median`/`mode`) adds a scalar summary of the same distribution
+without changing `value`. See `docs/decision/API.md` for the full contract.
 
 `instructions` is required and non-null on every question; choice keys and score levels keep object
 order, and each option line sent to the model is rendered by `format_option_line` (one function) as
