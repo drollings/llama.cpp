@@ -584,37 +584,39 @@ static void test_temperature_effect(testing & t) {
         };
         common_json usage = common_json::object();
         usage["output_tokens"] = 0;
-        const common_json out = llama_decision::assemble_decision_response(req, probs, "m", usage);
 
-        auto recompute = [](const std::vector<float> & p) {
-            double h = 0.0;
-            for (float x : p) {
-                if (x > 0.0f) {
-                    h -= (double) x * std::log((double) x);
-                }
-            }
-            return 1.0 - h / std::log((double) p.size());
+        auto jev_recompute = [](const std::vector<float> & p) {
+            const double n = (double) p.size();
+            const double pmax = (double) *std::max_element(p.begin(), p.end());
+            return std::min(1.0, std::max(0.0, (n * pmax - 1.0) / (n - 1.0)));
         };
+
+        const common_json out = llama_decision::assemble_decision_response(req, probs, "m", usage);
+        req.confidence_profile = "local";
+        const common_json local_out = llama_decision::assemble_decision_response(req, probs, "m", usage);
 
         const auto & dept = out.at("answers").at("dept");
         t.assert_true("choice has confidence", dept.contains("confidence"));
         t.assert_true("choice has certainty", dept.contains("certainty"));
-        assert_close(t, "choice confidence is 1 - H/log K", recompute(probs[1]), dept.at("confidence").get<double>(), 1e-6);
+        assert_close(t, "default choice confidence is the Jev winner-share rescale", jev_recompute(probs[1]),
+                     dept.at("confidence").get<double>(), 1e-6);
         assert_close(t, "choice certainty is the winner share", 0.5, dept.at("certainty").get<double>(), 1e-6);
 
         const auto & urg = out.at("answers").at("urgency");
         t.assert_true("score has confidence", urg.contains("confidence"));
         t.assert_true("score has certainty", urg.contains("certainty"));
+        assert_close(t, "default score confidence is the Jev winner-share rescale", jev_recompute(probs[2]),
+                     urg.at("confidence").get<double>(), 1e-6);
 
         t.assert_true("noul has no confidence", !out.at("answers").at("refund").contains("confidence"));
         t.assert_true("noul has no certainty", !out.at("answers").at("refund").contains("certainty"));
     });
 }
 
-// confidence and certainty are two axes: normalized inverse entropy and the winner's share. Pin
-// both against hand-computed literals so a rename cannot quietly swap them.
+// confidence and certainty are two axes: the Jev winner-share rescale (default) and the winner's
+// share. Pin both against hand-computed literals so a rename cannot quietly swap them.
 static void test_confidence_certainty_axes(testing & t) {
-    t.test("confidence is inverse entropy and certainty is the winner share", [](testing & t) {
+    t.test("confidence is the Jev winner-share rescale and certainty is the winner share", [](testing & t) {
         auto req        = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
         req.diagnostics = true;
         const std::vector<std::vector<float>> probs = {
@@ -625,16 +627,25 @@ static void test_confidence_certainty_axes(testing & t) {
         common_json usage      = common_json::object();
         usage["output_tokens"] = 0;
         const common_json out  = llama_decision::assemble_decision_response(req, probs, "m", usage);
+        req.confidence_profile = "local";
+        const common_json local_out = llama_decision::assemble_decision_response(req, probs, "m", usage);
 
         const auto & dept = out.at("answers").at("dept");
-        assert_close(t, "choice confidence is 1 - H/log 3 for (0.6,0.3,0.1)", 0.182654578,
+        assert_close(t, "default choice confidence is the Jev rescale for (0.6,0.3,0.1)", 0.4,
                      dept.at("confidence").get<double>(), 1e-6);
         assert_close(t, "choice certainty is max(p) = 0.6", 0.6, dept.at("certainty").get<double>(), 1e-6);
 
         const auto & urg = out.at("answers").at("urgency");
-        assert_close(t, "score confidence is 1 - H/log 3 for (0.9,0.1,0.0)", 0.704096726,
+        assert_close(t, "default score confidence is the Jev rescale for (0.9,0.1,0.0)", 0.85,
                      urg.at("confidence").get<double>(), 1e-6);
         assert_close(t, "score certainty is max(p) = 0.9", 0.9, urg.at("certainty").get<double>(), 1e-6);
+
+        const auto & ldept = local_out.at("answers").at("dept");
+        assert_close(t, "local choice confidence is 1 - H/log 3 for (0.6,0.3,0.1)", 0.182654578,
+                     ldept.at("confidence").get<double>(), 1e-6);
+        const auto & lurg = local_out.at("answers").at("urgency");
+        assert_close(t, "local score confidence is 1 - H/log 3 for (0.9,0.1,0.0)", 0.704096726,
+                     lurg.at("confidence").get<double>(), 1e-6);
 
         t.assert_true("noul carries no confidence", !out.at("answers").at("refund").contains("confidence"));
         t.assert_true("noul carries no certainty", !out.at("answers").at("refund").contains("certainty"));
@@ -647,7 +658,7 @@ static void expect_decision_reject(testing & t, const std::string & body_text, c
 // so the default stays 1 - H/logK and existing goldens are unchanged; above three levels, where
 // Jev documents no Score formula, the same monotone rule is the stated local value.
 static void test_confidence_profile(testing & t) {
-    t.test("the Jev confidence profile is a rescaled winner share and stays opt-in", [](testing & t) {
+    t.test("the Jev confidence profile is the default certainty-based winner share", [](testing & t) {
         auto req        = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
         req.diagnostics = true;
         const std::vector<std::vector<float>> probs = {
@@ -658,15 +669,15 @@ static void test_confidence_profile(testing & t) {
         common_json usage      = common_json::object();
         usage["output_tokens"] = 0;
 
-        const common_json local = llama_decision::assemble_decision_response(req, probs, "m", usage);
-        req.confidence_profile  = "jev";
         const common_json jev   = llama_decision::assemble_decision_response(req, probs, "m", usage);
+        req.confidence_profile  = "local";
+        const common_json local = llama_decision::assemble_decision_response(req, probs, "m", usage);
 
-        assert_close(t, "default choice confidence stays 1 - H/log K", 0.182654578,
-                     local.at("answers").at("dept").at("confidence").get<double>(), 1e-6);
-        assert_close(t, "jev choice confidence is (N*p_max-1)/(N-1)", 0.4,
+        assert_close(t, "default choice confidence is (N*p_max-1)/(N-1)", 0.4,
                      jev.at("answers").at("dept").at("confidence").get<double>(), 1e-6);
-        assert_close(t, "jev score confidence uses the same rule above the documented range", 0.85,
+        assert_close(t, "local confidence is the opt-in 1 - H/log K", 0.182654578,
+                     local.at("answers").at("dept").at("confidence").get<double>(), 1e-6);
+        assert_close(t, "default score confidence uses the same rule above the documented range", 0.85,
                      jev.at("answers").at("urgency").at("confidence").get<double>(), 1e-6);
         assert_close(t, "certainty is the raw winner share and does not change with the profile", 0.6,
                      jev.at("answers").at("dept").at("certainty").get<double>(), 1e-6);
@@ -683,7 +694,7 @@ static void test_confidence_profile(testing & t) {
                      llama_decision::jev_winner_share_confidence({ 0.48f, 0.3f, 0.2f, 0.02f }), 1e-6);
     });
 
-    t.test("confidence_profile parses as an opt-in enum and is refused otherwise", [](testing & t) {
+    t.test("confidence_profile parses as an enum and is refused otherwise", [](testing & t) {
         common_json body = common_json::parse(decision_valid_body());
         body["confidence_profile"] = "jev";
         t.assert_equal("jev is accepted", "jev",
@@ -692,7 +703,7 @@ static void test_confidence_profile(testing & t) {
         t.assert_equal("local is accepted", "local",
                        llama_decision::parse_decision_request(body).confidence_profile);
         body.erase("confidence_profile");
-        t.assert_equal("absent defaults to local", "local",
+        t.assert_equal("absent defaults to jev (certainty-based)", "jev",
                        llama_decision::parse_decision_request(body).confidence_profile);
         expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"confidence_profile":"other"})",
                                "confidence_profile must be local or jev");
@@ -8510,10 +8521,10 @@ static common_json calibration_rows() {
         auto r = calibration_row("opt-in confidence profile and order-de-bias pass profile", "task-value",
                                  { "which confidence value is reported", "how many order-de-bias passes run" },
                                  { "admission", "caching", "routing", "persistence", "answer key" },
-                                 "the local 1-H/logK confidence and permutations=1 stay the defaults; the Jev confidence profile (N*p_max-1)/(N-1) and a higher default pass count are opt-in per request or per server flag and change only the reported concentration and the cost, never the winner gate; the corpus harness records winner agreement, Brier and ECE");
+                                 "the certainty-based Jev confidence (N*p_max-1)/(N-1) and permutations=1 stay the defaults; the local 1-H/logK confidence profile and a higher default pass count are opt-in per request or per server flag and change only the reported concentration and the cost, never the winner gate; the corpus harness records winner agreement, Brier and ECE");
         common_json g = control_group({
-            control_case("no confidence_profile field", "local 1-H/logK, unchanged answer"),
-            control_case("confidence_profile=jev", "rescaled winner share, same probabilities"),
+            control_case("no confidence_profile field", "certainty-based Jev (N*p_max-1)/(N-1), unchanged answer"),
+            control_case("confidence_profile=local", "1-H/logK, same probabilities"),
             control_case("no permutations field at the default server", "one pass"),
             control_case("server default permutations=2", "two passes unless the request says otherwise"),
         });

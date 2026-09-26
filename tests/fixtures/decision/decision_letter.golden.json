@@ -3,28 +3,26 @@
   "answers": {
     "refund": {
       "type": "noul",
-      "noul": 0.02370418794453144
+      "noul": 0.9986239075660706
     },
     "dept": {
       "type": "choice",
-      "confidence": 0.9669143943225779,
-      "certainty": 0.994730532169342,
+      "confidence": 0.9991600215435028,
       "choice": "billing",
       "probabilities": {
-        "billing": 0.994730532169342,
-        "technical": 0.0019087205873802304,
-        "cancellation": 0.003360775765031576
+        "billing": 0.9994400143623352,
+        "technical": 0.0004623840795829892,
+        "cancellation": 9.757182851899415e-05
       }
     },
     "urgency": {
       "type": "score",
-      "confidence": 0.9586701083368754,
-      "certainty": 0.993151843547821,
-      "score": 0.011270887218415737,
+      "confidence": 0.7345951497554779,
+      "score": 0.9234400913119316,
       "probabilities": {
-        "0": 0.993151843547821,
-        "1": 0.0024254098534584045,
-        "2": 0.004422738682478666
+        "0": 0.1267482340335846,
+        "1": 0.8230634331703186,
+        "2": 0.0501883290708065
       },
       "legend": {
         "0": {
@@ -38,9 +36,7 @@
   },
   "usage": {
     "input_tokens": 0,
-    "output_tokens": 0,
-    "cached_tokens": 0,
-    "state_cache_hit": false
+    "output_tokens": 0
   },
-  "golden_model": "lfm2.5-2.6b-gguf/latest.gguf"
+  "golden_model": "qwen3.8-27b-tturbo-fcf-709/latest.gguf"
 }

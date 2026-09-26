@@ -112,14 +112,17 @@ silently default).
   audit fields, `certainty`, and the extra `usage` counters
   (`cached_tokens`, `state_cache_hit`, `head_mode`). The default `false` keeps
   the response to the strict Jev envelope (Section 3).
-* `confidence_profile` (optional, string, `"local"` (default) or `"jev"`): how
-  the `confidence` value on `choice`/`score` is computed. `"local"` keeps
-  `1 - H/log K` (normalized inverse entropy), so existing callers and goldens
-  are unchanged. `"jev"` selects the documented Jev compatibility value
-  `(N*p_max - 1)/(N - 1)`, clamped to [0,1], a rescaled winner share; Jev leaves
-  the Score definition open above three levels, so the same monotone rule is the
-  stated local value there. The profile changes only the reported concentration,
-  never an answer or a probability; it is opt-in and never gates anything.
+* `confidence_profile` (optional, string, `"jev"` (default) or `"local"`): how
+  the `confidence` value on `choice`/`score` is computed. `"jev"` (the default)
+  selects the documented Jev compatibility value `(N*p_max - 1)/(N - 1)`, clamped
+  to [0,1], a rescaled winner share built from `certainty`; it matches Jev's
+  official Choice confidence and is conservative at the low end (uniform -> 0),
+  so it is the right basis for fallback gating. Jev leaves the Score definition
+  open above three levels, so the same monotone rule is the stated local value
+  there. `"local"` selects `1 - H/log K` (normalized inverse entropy), which reads
+  the whole distribution and calibrates better on some model families (for example
+  Gemma). The profile changes only the reported concentration, never an answer or
+  a probability; it never gates anything on its own.
 
 Server flag: `--decision-permutations N` (env `LLAMA_ARG_DECISION_PERMUTATIONS`,
 default 1) sets the pass count for requests that omit `permutations`; an explicit
@@ -261,18 +264,20 @@ are byte-identical either way.
 * `score.score = sum(i * p_i)` (expected zero-based index, float in
   [0, K-1]); `probabilities` keys are STRINGS `"0".."K-1"`; `legend` echoes
   input criteria in order with string keys.
-* `confidence = 1 - H(p)/log(K)`, `H = -sum p log p` (normalized inverse
-  entropy). This is a deliberate LOCAL choice, not Jev's documented
-  distribution shape: Jev's Choice confidence is derived from the winner's
-  share, `(N*p_max - 1)/(N - 1)`, and its Score confidence above 3 levels is
-  undocumented. `confidence_profile: "jev"` selects that rescaled winner share
-  as an opt-in compatibility value (the same monotone rule above 3 levels), and
-  changes only the reported number. Do not claim parity for the default formula.
-  Clamp to [0,1].
-* `certainty = max(p)` (the winner's share). Both are returned on `choice` and
-  `score` when `diagnostics` is true; `confidence` is always returned. Both
-  measure concentration of the answer distribution; they are not calibrated
-  correctness and never gate admission, caching, routing, or persistence.
+* `confidence = (N*p_max - 1)/(N - 1)`, clamped to [0,1] (the default). This is
+  Jev's documented Choice confidence, a linear rescale of the winner's share
+  `certainty = max(p)`: uniform -> 0, one-hot -> 1. Because it is built from the
+  winner's share and is conservative at the low end, it is the recommended basis
+  for fallback gating. Jev leaves the Score confidence above 3 levels
+  undocumented, so the same monotone rule is the stated local value there.
+  `confidence_profile: "local"` selects `1 - H(p)/log(K)` (normalized inverse
+  entropy) instead, which reads the whole distribution and calibrates better on
+  some families; the profile changes only the reported number. Clamp to [0,1].
+* `certainty = max(p)` (the winner's share). `confidence` is always returned on
+  `choice` and `score`; `certainty` is additive and returned when `diagnostics`
+  is true. Both measure concentration of the answer distribution; they are not
+  calibrated correctness and never gate admission, caching, routing, or
+  persistence on their own.
 * `probabilities` are CONDITIONAL on the supplied options
   (`probability_status: "conditional option score; uncalibrated as decision
   confidence"`). `confidence`/`certainty` measure CONCENTRATION, not

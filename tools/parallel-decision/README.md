@@ -262,17 +262,19 @@ Every parity and calibration claim is only valid under the backend flag set reco
 softmax. Temperature never changes the winner; it only changes how sharply the distribution
 is concentrated.
 
-`confidence` is `1 - H/log(K)` (normalized inverse entropy) and `certainty` is `max(p)` (the
-winner's share). The entropy formula is a deliberate local choice, not Jev's documented shape
-(Jev derives Choice confidence from the winner's share, `(N*p_max - 1)/(N - 1)`), so do not claim
-parity for it. A request with `"confidence_profile": "jev"` opts into the rescaled winner share
-instead (the same monotone rule above three score levels, where Jev is undocumented); the default
-stays `1 - H/log(K)` and the profile changes only the reported number, not an answer or a
-probability. Both values measure how concentrated the answer is. They are **not**
-calibrated correctness, and they are **not** accuracy. The probabilities are conditional on the
-options you supplied: if the right answer is not among them, the distribution still sums to 1
-over the wrong set. Never gate admission, caching, routing or persistence on `confidence` or
-`certainty`, and never present them as probability of being correct. `tests/decision-baseline/accuracy_report.json`
+`confidence` is, by default, the certainty-based Jev value `(N*p_max - 1)/(N - 1)`
+(rescaled winner share: uniform -> 0, one-hot -> 1, conservative at the low end),
+which matches Jev's official Choice confidence and is the recommended basis for
+fallback gating. `certainty` is `max(p)` (the winner's share). A request with
+`confidence_profile: "local"` reports the entropy form `1 - H/log(K)` instead,
+which reads the whole distribution and calibrates better on some families; the
+profile changes only the reported number, not an answer or a probability. Both
+values measure how concentrated the answer is. They are **not**
+calibrated correctness, and they are **not** accuracy. The probabilities are
+conditional on the options you supplied: if the right answer is not among them,
+the distribution still sums to 1 over the wrong set. Never gate admission,
+caching, routing or persistence on `confidence` or `certainty` alone, and never
+present them as probability of being correct. `tests/decision-baseline/accuracy_report.json`
 reports winner agreement, Brier and ECE per model and framing; confidence never gates any of it.
 
 Admission is not part of this axis. `--decision-ctx-size` bounds the classifier context by token

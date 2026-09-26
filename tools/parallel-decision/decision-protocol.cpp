@@ -567,9 +567,9 @@ common_json assemble_decision_response(const decision_request & req,
                     best = i;
                 }
             }
-            a["confidence"] = req.confidence_profile == "jev"
-                                  ? jev_winner_share_confidence(p)   // opt-in Jev rescale of the winner share
-                                  : inverse_entropy_confidence(p);   // default 1 - H/log K
+a["confidence"] = req.confidence_profile == "local"
+                      ? inverse_entropy_confidence(p)   // opt-in 1 - H/log K
+                      : jev_winner_share_confidence(p); // default certainty-based (N*p_max-1)/(N-1)
             if (req.diagnostics) {
                 a["certainty"] = winner_share(p);             // max(p); additive
             }

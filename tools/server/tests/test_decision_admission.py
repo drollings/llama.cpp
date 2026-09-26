@@ -111,7 +111,7 @@ class Server:
             SERVER_BIN,
             "-m", self.model,
             "-c", "8192",
-            "-ngl", os.environ.get("LLAMA_SERVER_TEST_NGL", "0"),
+            "-ngl", os.environ.get("LLAMA_SERVER_TEST_NGL", "99"),
             "--decision-seqs", "8",
             "--slots",
             "--api-key", API_KEY,

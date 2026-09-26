@@ -419,7 +419,7 @@ int main(int argc, char ** argv) {
             auto assembled = llama_decision::assemble(cs, br.items[0]);
 
             // The two producer concentration scores for every tree field: `confidence` is the
-            // normalized inverse entropy, `certainty` is the winner's share.
+            // normalized inverse entropy (the opt-in local profile), `certainty` is the winner's share.
             auto field_metrics = [&](const llama_decision::result & r) {
                 common_json m = common_json::object();
                 for (size_t i = 0; i < cs.specs.size(); ++i) {

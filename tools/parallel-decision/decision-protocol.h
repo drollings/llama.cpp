@@ -99,7 +99,7 @@ struct decision_request {
     common_json               temperatures; // object or null
     int                       permutations = 1;
     std::string               head;         // "" (auto) | "selected" | "full"
-    std::string               confidence_profile = "local"; // "local" (1 - H/logK) | "jev" (opt-in)
+    std::string               confidence_profile = "jev"; // "jev" (certainty-based, Jev default) | "local" (1 - H/logK)
     bool                      diagnostics = false; // emit additive and audit fields
     session_ref               session;
 };

@@ -48,8 +48,8 @@
   "label_pool_size": 26
  },
  "timings": {
-  "prefill_ms": 342.987293,
-  "scoring_ms": 16.258419
+  "prefill_ms": 324.56994,
+  "scoring_ms": 15.969509
  },
  "note": "Frozen readout of the committed decision corpus. The deterministic core (probabilities, winners, confidence = 1 - H/log K, certainty = max p, head mode, label-pool size) is a contract; the timing block is recorded for context and excluded from the byte diff."
 }

@@ -631,16 +631,16 @@
         "answer key"
       ],
       "production_gate": false,
-      "verdict": "the local 1-H/logK confidence and permutations=1 stay the defaults; the Jev confidence profile (N*p_max-1)/(N-1) and a higher default pass count are opt-in per request or per server flag and change only the reported concentration and the cost, never the winner gate; the corpus harness records winner agreement, Brier and ECE",
+      "verdict": "the certainty-based Jev confidence (N*p_max-1)/(N-1) and permutations=1 stay the defaults; the local 1-H/logK confidence profile and a higher default pass count are opt-in per request or per server flag and change only the reported concentration and the cost, never the winner gate; the corpus harness records winner agreement, Brier and ECE",
       "control_group": {
         "cases": [
           {
             "input": "no confidence_profile field",
-            "expect": "local 1-H/logK, unchanged answer"
+            "expect": "certainty-based Jev (N*p_max-1)/(N-1), unchanged answer"
           },
           {
-            "input": "confidence_profile=jev",
-            "expect": "rescaled winner share, same probabilities"
+            "input": "confidence_profile=local",
+            "expect": "1-H/logK, same probabilities"
           },
           {
             "input": "no permutations field at the default server",
@@ -699,8 +699,8 @@
   },
   "model_measurements": {
     "environment": {
-      "model": "qwen3.5-2b-gguf/ud-q5_k_xl.gguf",
-      "model_bytes": 1466687744,
+      "model": "qwen3.8-27b-tturbo-fcf-709/latest.gguf",
+      "model_bytes": 12184906464,
       "quantization": "recorded per run; see model filename",
       "backend_flags": {
         "kv_unified": true,
@@ -723,19 +723,19 @@
       "bypass_off_ms": 0.0,
       "bypass_speedup": 1.0,
       "bypass_applicable": false,
-      "prefill_cached_ms": 130.838912,
-      "prefill_cold_ms": 243.870027,
+      "prefill_cached_ms": 201.32059,
+      "prefill_cold_ms": 1083.659324,
       "auto_at_tree_max_is_tree": true,
       "auto_above_tree_max_is_tree": false,
       "label_pool_size": 64,
       "head_vs_full_available": true,
       "head_vs_full_winner_agree": true,
-      "head_vs_full_tv": 0.036204785108566284,
-      "temperature_nll_t1": 0.4210483778644587,
-      "temperature_nll_t1_3": 0.5024737106302805,
-      "temperature_nll_delta": 0.08142533276582171,
+      "head_vs_full_tv": 0.021079439946333878,
+      "temperature_nll_t1": 0.06163100717673836,
+      "temperature_nll_t1_3": 0.10004203398274118,
+      "temperature_nll_delta": 0.038411026806002814,
       "hoist_argmax_agree": true,
-      "hoist_tv": 0.02950456610415131,
+      "hoist_tv": 0.018834382761269808,
       "hoist_fired": true,
       "wide_auto_default_is_tree": true
     }
