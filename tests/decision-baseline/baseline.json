@@ -255,7 +255,7 @@
  "cpu_oracle": {
   "model": "test-models/qwen35-dense.gguf",
   "pool": {
-   "count": 26,
+   "count": 36,
    "token_a": 65
   },
   "full": {

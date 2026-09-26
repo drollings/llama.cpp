@@ -19,6 +19,14 @@ namespace llama_decision {
 // Bump when the letter prompt layout changes; it is part of the prefix cache identity.
 inline constexpr const char * LETTER_PROMPT_VERSION = "letter-v2";
 
+// The text-readout prompt layout: options are scored as their own token paths, no label column.
+// Only entered when the realized label pool cannot cover the request's widest question. A distinct
+// version so its prefix cache entries and calibration identity cannot collide with the letter one.
+inline constexpr const char * LETTER_TEXT_PROMPT_VERSION = "letter-text-v1";
+
+// Longest clean token path a text-readout option key may take at the answer boundary.
+inline constexpr int LETTER_TEXT_MAX_PATH = 16;
+
 // Identity of the decision readout contract: the tokenizer identity, the framed prompt template,
 // and the label code. A template edit or a version bump changes it, so a mismatched expected hash
 // means the calibration is stale and the decision path must refuse it.
@@ -38,6 +46,9 @@ temperature_provenance decision_provenance_current(const std::string & model_nam
 
 // The fixed system instruction used by the letter readout.
 const char * letter_system_text();
+
+// The fixed system instruction used by the text readout (options scored as their own text).
+const char * letter_text_system_text();
 
 // The assistant-answer tail a label follows: `after` plus the fixed "Answer:\n" marker. One
 // definition, so the framer, the per-request gate and the server cannot drift apart.

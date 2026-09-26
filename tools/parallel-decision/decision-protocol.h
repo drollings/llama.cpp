@@ -19,12 +19,13 @@ struct common_chat_templates;
 namespace llama_decision {
 
 // Request shape limits. A request over a limit is rejected before any decode; it is never
-// truncated. The choice option cap matches the answer-label pool cap, so every option gets a label.
+// truncated. The choice option cap matches Jev's and the composed answer-label pool cap, so every
+// option gets a label (a label is a 1-2 token path over A-Z and 0-9).
 inline constexpr size_t DECISION_MIN_QUESTIONS        = 1;
 inline constexpr size_t DECISION_MAX_QUESTIONS        = 256;
 inline constexpr size_t DECISION_MAX_CONTEXTS         = 256;
 inline constexpr size_t DECISION_MIN_OPTIONS          = 2;
-inline constexpr size_t DECISION_MAX_CHOICE_OPTIONS   = 64;
+inline constexpr size_t DECISION_MAX_CHOICE_OPTIONS   = 255;
 inline constexpr size_t DECISION_MAX_SCORE_LEVELS     = 10;
 inline constexpr int    DECISION_MAX_PERMUTATIONS     = 8;
 

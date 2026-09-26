@@ -2,10 +2,10 @@
 
 // Answer-label handling for scored decision readouts.
 //
-// A label is one alphabetic answer ("A".."Z", "AA".."ZZ") that must map to a
-// single token at the assistant-answer boundary in the model vocabulary. The
-// tokenizer is abstracted so the pool and boundary logic can be unit tested
-// without a model.
+// A label is one answer ("A".."Z", "0".."9", "AA".."ZZ", "A0".."Z9", ...) that
+// maps to a 1-2 token path at the assistant-answer boundary in the model
+// vocabulary. The tokenizer is abstracted so the pool and boundary logic can
+// be unit tested without a model.
 
 #include <cstddef>
 #include <cstdint>
@@ -25,8 +25,9 @@ struct label_vocab {
 };
 
 struct label {
-    std::string text;
-    int32_t     token = -1;
+    std::string          text;
+    std::vector<int32_t> tokens; // 1-2 tokens the answer tail produces for `text`
+    int32_t              token  = -1; // first token when the path is length 1, else -1 (multi-token)
 };
 
 // Adapter over a llama.cpp vocabulary. Owns nothing; the vocab must outlive it.
@@ -39,9 +40,18 @@ std::unique_ptr<label_vocab> make_llama_label_vocab(const llama_vocab * vocab);
 // model emits after the framed tail.
 int32_t answer_label_token(const label_vocab & vocab, const std::string & tail, const std::string & text);
 
-// A-Z then AA-ZZ, kept only when the boundary resolution yields a unique, non-special token; at
-// most `cap` labels. Throws std::runtime_error if fewer than 2.
-inline constexpr size_t LABEL_POOL_CAP = 64;
+// The token path (1..max_len tokens) the model emits for `text` at the answer boundary `tail`,
+// else empty. Same authority as answer_label_token, generalized to multi-token answers: the
+// tokens before the extra count must equal tokenize(tail) and none of the extra tokens may be
+// special. The composed label pool uses this so a two-character label works whether the
+// tokenizer emits it as one token or as two.
+std::vector<int32_t> answer_label_path(const label_vocab & vocab, const std::string & tail,
+                                       const std::string & text, int max_len);
+
+// A-Z, then 0-9, then the two-character AA-ZZ, A0-Z9, 0A-9Z, 00-99, each kept only when the
+// boundary resolution yields a unique, non-special 1-2 token path; at most `cap` labels. Throws
+// std::runtime_error if fewer than 2.
+inline constexpr size_t LABEL_POOL_CAP = 255;
 
 std::vector<label> build_label_pool(const label_vocab & vocab, const std::string & tail, size_t cap = LABEL_POOL_CAP);
 

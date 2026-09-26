@@ -992,7 +992,7 @@ static void test_decision_parse(testing & t) {
         expect_decision_reject(t, R"({"state":5,"questions":{"q":{"type":"noul","instructions":"x"}}})", "state must be a string");
         expect_decision_reject(t, R"({"state":"s","questions":{}})", "1-256 entries");
         expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"mystery","instructions":"x"}}})", "unknown type");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"choice","criteria":{"a":"x"}}}})", "2-64 options");
+        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"choice","criteria":{"a":"x"}}}})", "2-255 options");
         expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"choice","instructions":"x"}}})", "choice needs an object");
         expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"score","criteria":["only"]}}})", "2-10 levels");
         expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","criteria":[1,2]}}})", "noul criteria must be an object");
@@ -1329,20 +1329,20 @@ static void test_letter_suffix(testing & t) {
             return llama_decision::parse_decision_request(body);
         };
 
-        // control group: a single-letter vocabulary yields only the 26 single-letter labels
+        // control group: an explicit small cap is honored, and one option above it is rejected
         const fake_vocab small      = make_fake_vocab(false);
-        const auto       small_pool = llama_decision::build_label_pool(small, "", 64);
-        t.assert_equal("the control pool is the 26 single letters", (size_t) 26, small_pool.size());
-        llama_decision::validate_label_capacity(make_choice_request(26), small_pool.size());  // must not throw
+        const auto       small_pool = llama_decision::build_label_pool(small, "", 5);
+        t.assert_equal("the control pool honors the explicit cap", (size_t) 5, small_pool.size());
+        llama_decision::validate_label_capacity(make_choice_request(5), small_pool.size());  // must not throw
         bool over = false;
         try {
-            llama_decision::validate_label_capacity(make_choice_request(27), small_pool.size());
+            llama_decision::validate_label_capacity(make_choice_request(6), small_pool.size());
         } catch (const llama_decision::semantic_error &) {
             over = true;
         }
         t.assert_true("one option above the control pool is rejected", over);
 
-        // positive group: a double-letter vocabulary fills the cap, and the cap itself is accepted
+        // positive group: a double-letter vocabulary fills the composed cap, and the cap is accepted
         const fake_vocab full      = make_fake_vocab(true);
         const auto       full_pool = llama_decision::build_label_pool(full, "", llama_decision::LABEL_POOL_CAP);
         t.assert_equal("the positive pool reaches the cap", llama_decision::LABEL_POOL_CAP, full_pool.size());
@@ -1396,15 +1396,17 @@ static void test_label_pool(testing & t) {
         t.assert_equal("cap respected", (size_t) 64, pool.size());
         t.assert_equal("first label is A", std::string("A"), pool[0].text);
         t.assert_equal("26th label is Z", std::string("Z"), pool[25].text);
-        t.assert_equal("then two-letter labels", std::string("AA"), pool[26].text);
+        t.assert_equal("then the single digits", std::string("0"), pool[26].text);
+        t.assert_equal("then two-character labels", std::string("AA"), pool[36].text);
 
-        bool all_alpha = true;
+        bool all_label_chars = true;
         for (const auto & l : pool) {
             for (char c : l.text) {
-                all_alpha = all_alpha && (std::isalpha((unsigned char) c) != 0);
+                all_label_chars = all_label_chars &&
+                    ((std::isalpha((unsigned char) c) != 0 && c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'));
             }
         }
-        t.assert_true("no numeric or symbol labels", all_alpha);
+        t.assert_true("only A-Z and 0-9 label characters", all_label_chars);
 
         t.assert_equal("AA resolves at the boundary", v.id_of("AA"), llama_decision::answer_label_token(v, "", "AA"));
         t.assert_equal("AAA is not a single label", -1, llama_decision::answer_label_token(v, "", "AAA"));
@@ -1430,6 +1432,7 @@ static void test_label_pool(testing & t) {
 
         fake_vocab tiny;
         tiny.pieces.push_back("A");
+        tiny.specials.insert(0); // the only resolvable token is special, so composition is blocked
         tiny.drop_unknown = true;
         bool threw = false;
         try {
@@ -1516,13 +1519,14 @@ static void test_label_pool_real(testing & t) {
             bool boundary = true;
             bool alpha    = true;
             for (const auto & l : pool) {
-                boundary = boundary && (llama_decision::answer_label_token(*vocab, tail, l.text) == l.token);
+                boundary = boundary &&
+                    (llama_decision::answer_label_path(*vocab, tail, l.text, (int) l.tokens.size()) == l.tokens);
                 for (char c : l.text) {
-                    alpha = alpha && (std::isalpha((unsigned char) c) != 0);
+                    alpha = alpha && ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'));
                 }
             }
             t.assert_true("every label resolves at the boundary", boundary);
-            t.assert_true("no numeric labels", alpha);
+            t.assert_true("only A-Z and 0-9 label characters", alpha);
 
             const auto base = vocab->tokenize(tail, true);
             const auto full = vocab->tokenize(tail + pool[0].text, true);
@@ -3833,8 +3837,8 @@ static void test_classifier_head_unbiased(testing & t) {
             return;
         }
         std::vector<llama_decision::label> labels;
-        labels.push_back({ "A", 0 });
-        labels.push_back({ "B", 1 });
+        labels.push_back({ "A", { 0 }, 0 });
+        labels.push_back({ "B", { 1 }, 1 });
         const auto head = llama_decision::build_classifier_head(te.model, labels);
         if (!head.available()) {
             t.skip("the generated model has no classifier output table: " + head.reason);

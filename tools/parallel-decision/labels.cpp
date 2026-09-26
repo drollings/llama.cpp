@@ -2,6 +2,7 @@
 
 #include "llama.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -51,54 +52,92 @@ std::unique_ptr<label_vocab> make_llama_label_vocab(const llama_vocab * vocab) {
 }
 
 int32_t answer_label_token(const label_vocab & vocab, const std::string & tail, const std::string & text) {
+    const std::vector<int32_t> path = answer_label_path(vocab, tail, text, 1);
+    return path.size() == 1 ? path[0] : -1;
+}
+
+std::vector<int32_t> answer_label_path(const label_vocab & vocab, const std::string & tail,
+                                       const std::string & text, int max_len) {
     const std::vector<int32_t> with_text = vocab.tokenize(tail + text, true);
     const std::vector<int32_t> tail_only = vocab.tokenize(tail, true);
-    if (with_text.size() != tail_only.size() + 1) {
-        return -1;
+    if (with_text.size() <= tail_only.size()) {
+        return {};
+    }
+    const size_t extra = with_text.size() - tail_only.size();
+    if ((int) extra > max_len) {
+        return {};
     }
     for (size_t i = 0; i < tail_only.size(); ++i) {
         if (with_text[i] != tail_only[i]) {
-            return -1;
+            return {};
         }
     }
-    const int32_t token = with_text.back();
-    if (vocab.is_special(token)) {
-        return -1;
+    std::vector<int32_t> path(with_text.begin() + (ptrdiff_t) tail_only.size(), with_text.end());
+    for (const int32_t token : path) {
+        if (vocab.is_special(token)) {
+            return {};
+        }
     }
-    return token;
+    return path;
 }
 
 std::vector<label> build_label_pool(const label_vocab & vocab, const std::string & tail, size_t cap) {
     std::vector<std::string> candidates;
+    auto one = [&](char c) { candidates.push_back(std::string(1, c)); };
     for (char a = 'A'; a <= 'Z'; ++a) {
-        candidates.push_back(std::string(1, a));
+        one(a);
     }
+    for (char d = '0'; d <= '9'; ++d) {
+        one(d);
+    }
+    auto two = [&](char a, char b) { candidates.push_back(std::string{ a, b }); };
     for (char a = 'A'; a <= 'Z'; ++a) {
         for (char b = 'A'; b <= 'Z'; ++b) {
-            candidates.push_back(std::string{ a, b });
+            two(a, b); // AA..ZZ
+        }
+    }
+    for (char a = 'A'; a <= 'Z'; ++a) {
+        for (char d = '0'; d <= '9'; ++d) {
+            two(a, d); // A0..Z9
+        }
+    }
+    for (char d = '0'; d <= '9'; ++d) {
+        for (char a = 'A'; a <= 'Z'; ++a) {
+            two(d, a); // 0A..9Z
+        }
+    }
+    for (char d1 = '0'; d1 <= '9'; ++d1) {
+        for (char d2 = '0'; d2 <= '9'; ++d2) {
+            two(d1, d2); // 00..99
         }
     }
 
     std::vector<label> pool;
-    for (const std::string & text : candidates) {
-        const int32_t token = answer_label_token(vocab, tail, text);
-        if (token < 0) {
-            continue;
+    auto add = [&](const std::string & text) {
+        const std::vector<int32_t> path = answer_label_path(vocab, tail, text, 2);
+        if (path.empty()) {
+            return;
         }
-        bool seen = false;
         for (const label & l : pool) {
-            if (l.token == token) {
-                seen = true;
-                break;
+            if (l.tokens == path) {
+                return;
             }
         }
-        if (seen) {
-            continue;
-        }
-        pool.push_back({ text, token });
-        if (pool.size() == cap) {
-            break;
-        }
+        label l;
+        l.text   = text;
+        l.tokens = path;
+        l.token  = path.size() == 1 ? path[0] : -1;
+        pool.push_back(std::move(l));
+    };
+    // single-token labels first, then two-token ones: the answer head can only score length-1
+    // paths, so ordering the pool this way keeps the cheap head path available for as many
+    // options as the tokenizer's single-token coverage allows
+    for (const std::string & text : candidates) {
+        add(text);
+    }
+    std::stable_partition(pool.begin(), pool.end(), [](const label & l) { return l.tokens.size() == 1; });
+    if (pool.size() > cap) {
+        pool.resize(cap);
     }
 
     if (pool.size() < 2) {

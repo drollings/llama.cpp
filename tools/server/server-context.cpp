@@ -2555,7 +2555,14 @@ private:
                     const auto parts = llama_decision::render_letter_prompt(
                         chat_params.tmpls.get(), chat_params.use_jinja, llama_decision::letter_system_text());
                     const std::string tail = llama_decision::letter_answer_tail(parts.second);
-                    decision.decision_labels = llama_decision::build_label_pool(*decision.decision_label_vocab, tail);
+                    size_t pool_cap = llama_decision::LABEL_POOL_CAP;
+                    if (const char * e = std::getenv("LLAMA_DECISION_POOL_CAP")) {
+                        const long v = std::atol(e);
+                        if (v >= 2) {
+                            pool_cap = (size_t) v;
+                        }
+                    }
+                    decision.decision_labels = llama_decision::build_label_pool(*decision.decision_label_vocab, tail, pool_cap);
                     llama_decision::verify_label_pool(*decision.decision_label_vocab, decision.decision_labels, tail);
                     SRV_INF("decision label pool: %zu labels (cap %zu)\n", decision.decision_labels.size(),
                             llama_decision::LABEL_POOL_CAP);
