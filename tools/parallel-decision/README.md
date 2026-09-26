@@ -310,7 +310,7 @@ task: single-pass decision / classification over a supplied state
 readout: letter labels resolved at the framed answer tail (SentencePiece and BPE), or token-path trie (schema)
 context: shared prefix + one state per request; branches forked on a unified KV cache
 output: probability distributions only, output_tokens always 0, closed over the supplied options
-confidence: 1 - H/log(K); certainty: max(p); concentration, NOT calibrated accuracy; opt-in jev profile is the rescaled winner share
+confidence: Jev value (N*p_max-1)/(N-1) by default, opt-in 1 - H/log(K); certainty: max(p); concentration, NOT calibrated accuracy
 calibration: deployment-specific; valid only under the recorded model, quantization, template hash and backend flags
 ```
 

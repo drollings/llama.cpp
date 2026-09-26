@@ -354,7 +354,6 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
         after  = turn.second;
     }
 
-    validate_label_capacity(req, labels.size());
     verify_letter_request(vocab, after, req, labels);
 
     // One scoring field per (question, pass): pass 0 keeps the caller's order, later passes

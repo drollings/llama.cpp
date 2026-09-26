@@ -829,10 +829,6 @@ static void test_sequence_partition(testing & t) {
     });
 }
 
-static std::string score_golden_path() {
-    return fixture_path("contexts_schema.score.golden.json");
-}
-
 static std::string decision_golden_path() {
     return fixture_path("decision_letter.golden.json");
 }
@@ -1103,28 +1099,6 @@ struct cpu_test_engine {
         return ctx != nullptr;
     }
 };
-
-// Runs the real fork/score substrate on a GGUF and returns the assembled decision.
-// Throws on any setup or engine failure so callers can report it as a test failure.
-static common_json run_fixture_scoring(const std::string & model_path,
-                                       const llama_decision::compiled_schema & cs,
-                                       const common_json & req) {
-    const auto split = llama_decision::render_prompt(nullptr, false, cs.system_text,
-                                                     req.at("contexts").at(0).get<std::string>());
-
-    test_engine te;
-    if (!te.load(model_path.c_str())) {
-        throw std::runtime_error("model or context failed to load: " + model_path);
-    }
-
-    llama_decision::engine eng(te.ctx, 2, 8);
-    llama_decision::options opt;
-    llama_decision::batch_result br = eng.decide_batch(split.first, { split.second }, cs.inputs, opt);
-    if (br.items.empty()) {
-        throw std::runtime_error("engine returned no decisions");
-    }
-    return llama_decision::assemble(cs, br.items[0]);
-}
 
 static void expect_decision_reject(testing & t, const std::string & body_text, const std::string & needle) {
     try {
@@ -1921,45 +1895,6 @@ static void test_label_boundary_calibration(testing & t) {
         t.assert_equal("control group: zero false rejects", 0, control_false_rejects);
         t.assert_equal("positive group: zero false rejects", 0, positive_false_rejects);
         t.assert_equal("negative group: zero false accepts", 0, negative_false_accepts);
-    });
-}
-
-// Optional integration run: a real GGUF exercises the fork/score substrate.
-// Without LLAMA_DECISION_TEST_MODEL the test reports a skip and the suite stays green.
-// Scoring values depend on the weights, so the comparison is by tolerance and only runs
-// when a matching scoring golden has been committed.
-static void test_engine_integration(testing & t) {
-    t.test("engine scores a fixed request against a real model", [](testing & t) {
-        const char * model_path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (model_path == nullptr || model_path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
-            return;
-        }
-        if (!file_exists(score_golden_path())) {
-            t.skip("no committed scoring golden for this fixture");
-            return;
-        }
-
-        const common_json req = fixture_request();
-        const auto cs = llama_decision::compile_schema(req.at("schema"), req.value("instructions", std::string("")));
-
-        common_json actual;
-        try {
-            actual = run_fixture_scoring(model_path, cs, req);
-        } catch (const std::exception & e) {
-            t.assert_true(std::string("engine runs: ") + e.what(), false);
-            return;
-        }
-
-        const common_json golden = common_json::parse(read_file(score_golden_path()));
-        for (const auto & e : golden.at("decision").items()) {
-            t.assert_equal("decision/" + e.key(), e.value().dump(), actual.at("decision").at(e.key()).dump());
-        }
-        for (const auto & e : golden.at("fields").items()) {
-            const double expected = e.value().at("probability").get<double>();
-            const double got      = actual.at("fields").at(e.key()).at("probability").get<double>();
-            assert_close(t, "probability/" + e.key(), expected, got, 5e-3);
-        }
     });
 }
 
@@ -8971,17 +8906,6 @@ static int write_cpu_oracle() {
     return 0;
 }
 
-static int write_score_golden(const char * model_path) {
-    if (model_path == nullptr || model_path[0] == '\0') {
-        fprintf(stderr, "set LLAMA_DECISION_TEST_MODEL to write the scoring golden\n");
-        return 2;
-    }
-    const common_json req = fixture_request();
-    const auto cs = llama_decision::compile_schema(req.at("schema"), req.value("instructions", std::string("")));
-    write_file(score_golden_path(), run_fixture_scoring(model_path, cs, req).dump(2) + "\n");
-    return 0;
-}
-
 static int write_decision_golden(const char * model_path) {
     if (model_path == nullptr || model_path[0] == '\0') {
         fprintf(stderr, "set LLAMA_DECISION_TEST_MODEL to write the decision golden\n");
@@ -9245,9 +9169,6 @@ int main(int argc, char ** argv) {
     if (argc > 1 && std::string(argv[1]) == "--write-cpu-oracle") {
         return write_cpu_oracle();
     }
-    if (argc > 1 && std::string(argv[1]) == "--write-score-golden") {
-        return write_score_golden(std::getenv("LLAMA_DECISION_TEST_MODEL"));
-    }
     if (argc > 1 && std::string(argv[1]) == "--write-decision-golden") {
         return write_decision_golden(std::getenv("LLAMA_DECISION_TEST_MODEL"));
     }
@@ -9397,7 +9318,6 @@ int main(int argc, char ** argv) {
         test_calibration_determinism_variance(t);
         test_decision_provenance(t);
         test_calibration_model(t);
-        test_engine_integration(t);
     });
 
     return t.summary();

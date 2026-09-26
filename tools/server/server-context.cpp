@@ -2608,9 +2608,6 @@ private:
             if (const char * fork = std::getenv("LLAMA_DECISION_FORK")) {
                 jopt.fork = fork;
             }
-            if (const char * optimize = std::getenv("LLAMA_DECISION_OPTIMIZE")) {
-                jopt.optimize = std::string(optimize) != "0" && std::string(optimize) != "false";
-            }
             if (cancel_flag) {
                 jopt.should_stop = [cancel_flag]() { return cancel_flag->load(); };
             }

@@ -39,10 +39,10 @@ struct semantic_error : std::invalid_argument {
 uint64_t fnv1a64(const std::string & s);
 
 // The producer concentration scores, pure functions of an option distribution. `confidence`
-// (default) is the normalized inverse entropy 1 - H/log K, sensitive to the whole shape.
-// `certainty` is the winner's share max(p), the quantity Jev's documented Choice confidence is
-// derived from. Both are 0 at a uniform distribution and 1 at a one-hot one; neither measures
-// whether the winner is correct.
+// (default) is the Jev compatibility value `(N*p_max - 1)/(N - 1)` (see
+// jev_winner_share_confidence); `certainty` is the winner's share max(p), the quantity Jev's
+// documented Choice confidence is derived from. The opt-in entropy form 1 - H/log K is available
+// via confidence_profile "local". Neither number measures whether the winner is correct.
 double inverse_entropy_confidence(const std::vector<float> & p);
 double winner_share(const std::vector<float> & p);
 
