@@ -38,6 +38,10 @@ struct semantic_error : std::invalid_argument {
 // The single hash primitive behind the decision prefix tag and the permutation seed.
 uint64_t fnv1a64(const std::string & s);
 
+// A seeded distinct permutation of `count` indices for `id` at `pass`; pass 0 (and any pass on a
+// single option) is the identity. Shared by the Jev and generic readouts for order-de-biasing.
+std::vector<size_t> permutation_order(size_t count, const std::string & id, int pass);
+
 // The producer concentration scores, pure functions of an option distribution. `confidence`
 // (default) is the Jev compatibility value `(N*p_max - 1)/(N - 1)` (see
 // jev_winner_share_confidence); `certainty` is the winner's share max(p), the quantity Jev's
@@ -98,7 +102,8 @@ struct session_ref {
 
 struct decision_request {
     std::string               model;
-    common_json               state;
+    common_json               state;       // single evidence document (Jev); unused when `contexts` is set
+    std::vector<common_json>  contexts;    // multi-context extension: the same questions against each
     std::vector<decision_question> questions;
     double                    temperature = 1.0;
     common_json               temperatures; // object or null

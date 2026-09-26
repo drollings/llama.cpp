@@ -291,11 +291,12 @@ With no file the default stays 1.0.
 
 ### Two readouts, one engine
 
-The same engine serves two readouts. The `contexts`/`schema` shape scores arbitrary token paths
-(trie or greedy) and is the general-purpose form. The decision `state`/`questions` shape scores declared
-answer labels and returns one closed distribution per typed question. Both share the prefix cache,
-the branch scorer, the softmax and the SWA clamp; the letter readout is a thin layer over the trie
-scorer, not a second implementation.
+The unified wire is Jev's: `state` (or `contexts` for the multi-context extension) plus typed
+`questions`, scored as declared answer labels and returned as one closed distribution per typed
+question. The engine also carries the trie scorer underneath (every option is a token path; the
+letter readout is a thin layer over it, not a second implementation). Both share the prefix cache,
+the branch scorer, the softmax and the SWA clamp. The legacy `contexts`+`schema` request form
+(boolean/enum/integer/number field types) is retired.
 
 Letter labels are resolved at the framed answer boundary, not in isolation. A SentencePiece /
 `add_space_prefix` vocabulary tokenizes a bare `A` as the space-prefixed form in isolation but
@@ -307,7 +308,7 @@ works on both SentencePiece and BPE tokenizers.
 ```yaml
 model: <base gguf>
 task: single-pass decision / classification over a supplied state
-readout: letter labels resolved at the framed answer tail (SentencePiece and BPE), or token-path trie (schema)
+readout: answer labels resolved at the framed answer tail (SentencePiece and BPE)
 context: shared prefix + one state per request; branches forked on a unified KV cache
 output: probability distributions only, output_tokens always 0, closed over the supplied options
 confidence: Jev value (N*p_max-1)/(N-1) by default, opt-in 1 - H/log(K); certainty: max(p); concentration, NOT calibrated accuracy
@@ -319,18 +320,6 @@ calibration: deployment-specific; valid only under the recorded model, quantizat
 `llama-parallel-decision` runs the same engine from a worker process (stdin/stdout protocol, one JSON request per
 line). Environment: `DECIDE_TREE`, `DECIDE_TREE_MAX`, `DECIDE_NSEQ`, `DECIDE_SPLIT_BOUNDARY`.
 It is a developer tool and is off by default; build it with `-DLLAMA_BUILD_DECISION_CLI=ON`.
-
-## Developer benchmarks
-
-`bench-decision` is also a developer tool (off by default; `-DLLAMA_BUILD_DECISION_BENCH=ON`).
-A local timing run with your own model looks like this:
-
-```bash
-cmake -B build -DLLAMA_BUILD_DECISION_BENCH=ON && cmake --build build --target bench-decision -j
-./build/bin/bench-decision --model <your-model.gguf> \
-  --fixture tests/fixtures/decision/contexts_schema.request.json \
-  --mode auto,tree,greedy --allow_cache true,false --json
-```
 
 ## A UI for it
 

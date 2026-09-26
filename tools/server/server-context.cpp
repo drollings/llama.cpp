@@ -2437,9 +2437,9 @@ private:
             throw std::invalid_argument("decisions are disabled: start the server with --decision-seqs N (N >= 3)");
         }
         const bool has_decision = body.contains("questions") || body.contains("state");
-        const bool has_generic = body.contains("contexts") || body.contains("schema");
+        const bool has_generic = body.contains("schema");
         if (has_decision && has_generic) {
-            throw llama_decision::semantic_error("request must be either state+questions or contexts+schema, not both");
+            throw llama_decision::semantic_error("request must be either questions or schema, not both");
         }
         // An optional live sessions reference: the slot holds the decoded evidence, so the request
         // is answered by forking it instead of re-prefilling. The checks below are capability
@@ -2496,6 +2496,9 @@ private:
             if (sess.slot != nullptr && req.head == "selected") {
                 throw std::invalid_argument(
                     "head \"selected\" is incompatible with a session request: the classifier-only context cannot fork a chat slot");
+            }
+            if (sess.slot != nullptr && !req.contexts.empty()) {
+                throw std::invalid_argument("a session decision scores exactly one context");
             }
             // An explicit request for an unavailable fast path is the only head case that errors;
             // the default path always falls back to full logits.
@@ -2619,17 +2622,18 @@ private:
             }
             llama_decision::letter_metrics metrics;
             llama_decision::answer_audit   audit;
-            std::vector<std::vector<float>> probs;
+            std::vector<std::vector<std::vector<float>>> all_probs;
             // run inside a yield so metrics/slot requests are served while the decision computes
             queue_tasks.yield_to_queue([&]() {
                 // the readout decodes on whichever context the plan picks; both are scoped to the base model
                 decision_scope_base_adapters();
-                probs = llama_decision::letter_readout(sources, decision.decision_head_cache,
-                                                       *decision.decision_label_vocab, chat_params.tmpls.get(),
-                                                       chat_params.use_jinja, req, decision.decision_labels, jopt,
-                                                       &metrics, want_audit ? &audit : nullptr);
+                all_probs = llama_decision::letter_readout_multi(sources, decision.decision_head_cache,
+                                                                 *decision.decision_label_vocab, chat_params.tmpls.get(),
+                                                                 chat_params.use_jinja, req, decision.decision_labels, jopt,
+                                                                 &metrics, want_audit ? &audit : nullptr);
             });
 
+            const bool multi = !req.contexts.empty();
             json usage = json::object();
             usage["input_tokens"]    = (long long) (metrics.shared_tokens + metrics.context_tokens);
             usage["output_tokens"]   = 0;
@@ -2637,7 +2641,19 @@ private:
             usage["state_cache_hit"] = metrics.cache_hit;
             usage["head_mode"]       = metrics.head_active ? "selected" : "full";
 
-            const std::string echo = req.model.empty() ? model_name : req.model;
+            json timings = json::object();
+            timings["prefill_ms"] = metrics.prefill_ms;
+            timings["scoring_ms"] = metrics.scoring_ms;
+            timings["total_ms"]   = metrics.prefill_ms + metrics.scoring_ms;
+            timings["rounds"]     = metrics.rounds;
+            timings["rows"]       = metrics.rows;
+            timings["per_decision_ms"] = all_probs.empty()
+                ? 0.0 : (metrics.prefill_ms + metrics.scoring_ms) / (double) all_probs.size();
+
+            // The echoed model identity: the Jev aliases resolve to the loaded (chat slot) model; any other
+            // requested id is echoed verbatim; an omitted model defaults to the loaded model.
+            const std::string echo = (req.model.empty() || req.model == "jev-latest" || req.model == "jev-preview")
+                ? model_name : req.model;
             json decision_diagnostics = json::object();
             if (want_audit) {
                 // the fast path is optional; report how the answer was actually read out
@@ -2679,125 +2695,40 @@ private:
                 decision_diagnostics["session_pos"]  = (long long) sess.pos;
             }
             const bool emit_diagnostics = want_audit || sess.slot != nullptr;
-            json out = llama_decision::assemble_decision_response(
-                req, probs, echo, usage, want_audit ? &audit : nullptr, emit_diagnostics ? &decision_diagnostics : nullptr);
+            if (!multi) {
+                json out = llama_decision::assemble_decision_response(
+                    req, all_probs.empty() ? std::vector<std::vector<float>>{} : all_probs[0],
+                    echo, usage, want_audit ? &audit : nullptr, emit_diagnostics ? &decision_diagnostics : nullptr);
+                out["timings"] = timings;
+                return out;
+            }
+            // Multi-context: answers grouped per context, in request order. The `contexts` key is the
+            // one extension over the Jev single-state envelope, so a single-state client is unchanged.
+            json contexts_resp = json::array();
+            for (size_t ci = 0; ci < all_probs.size(); ++ci) {
+                json cusage = json::object();
+                cusage["input_tokens"] = (long long) (metrics.shared_tokens +
+                    (ci < metrics.per_context_tokens.size() ? metrics.per_context_tokens[ci] : 0));
+                cusage["output_tokens"]   = 0;
+                cusage["cached_tokens"]   = (long long) (metrics.cache_hit ? metrics.shared_tokens : 0);
+                cusage["state_cache_hit"] = metrics.cache_hit;
+                cusage["head_mode"]       = metrics.head_active ? "selected" : "full";
+                json ans = llama_decision::assemble_decision_response(
+                    req, all_probs[ci], echo, cusage, want_audit ? &audit : nullptr, nullptr);
+                contexts_resp.push_back({ { "answers", ans.at("answers") }, { "usage", ans.at("usage") } });
+            }
+            json out = json::object();
+            out["model"]    = echo;
+            out["contexts"] = contexts_resp;
+            out["timings"]  = timings;
+            if (emit_diagnostics) {
+                for (auto it = decision_diagnostics.begin(); it != decision_diagnostics.end(); ++it) {
+                    out[it.key()] = it.value();
+                }
+            }
             return out;
         }
-        // one decision per context; all contexts share the schema, the instructions and the cached prefix
-        if (!body.contains("contexts") || !body.at("contexts").is_array() || body.at("contexts").empty() || body.at("contexts").size() > llama_decision::DECISION_MAX_CONTEXTS) {
-            throw std::invalid_argument("\"contexts\" must be an array of 1-" + std::to_string(llama_decision::DECISION_MAX_CONTEXTS) + " strings");
-        }
-        std::vector<std::string> contexts;
-        for (const auto & c : body.at("contexts")) {
-            if (!c.is_string() || c.get<std::string>().empty()) {
-                throw std::invalid_argument("every entry of \"contexts\" must be a non-empty string");
-            }
-            contexts.push_back(c.get<std::string>());
-        }
-        if (!body.contains("schema")) {
-            throw std::invalid_argument("\"schema\" must be provided");
-        }
-        const decision_session sess = resolve_session(llama_decision::parse_session_ref(body));
-        if (sess.slot != nullptr && contexts.size() != 1) {
-            throw std::invalid_argument("a session decision scores exactly one context");
-        }
-        if (!decision.decision_engine) {
-            decision.decision_engine = std::make_unique<llama_decision::engine>(ctx_tgt, (llama_seq_id) params_base.n_parallel,
-                                                                        params_base.n_seq_decision);
-        }
-        float temperature = 1.0f;
-        if (body.contains("temperature") && !body.at("temperature").is_null()) {
-            if (!body.at("temperature").is_number() || !(body.at("temperature").get<double>() > 0.0)) {
-                throw std::invalid_argument("\"temperature\" must be a number > 0");
-            }
-            temperature = body.at("temperature").get<float>();
-        }
-        std::string confidence_profile = "jev";
-        if (body.contains("confidence_profile") && !body.at("confidence_profile").is_null()) {
-            if (!body.at("confidence_profile").is_string()) {
-                throw std::invalid_argument("\"confidence_profile\" must be a string");
-            }
-            confidence_profile = body.at("confidence_profile").get<std::string>();
-            if (confidence_profile != "local" && confidence_profile != "jev") {
-                throw std::invalid_argument("\"confidence_profile\" must be local or jev");
-            }
-        }
-        const auto cs = llama_decision::compile_schema(body.at("schema"), body.value("instructions", std::string()),
-                                                       temperature);
-        std::string shared;
-        std::vector<std::string> dynamic;
-        for (const auto & c : contexts) {
-            auto [head, tail] = llama_decision::render_prompt(chat_params.tmpls.get(), chat_params.use_jinja, cs.system_text, c);
-            if (dynamic.empty()) {
-                shared = head;
-            } else if (head != shared) {
-                throw std::runtime_error("the chat template renders a different prefix per context");
-            }
-            dynamic.push_back(tail);
-        }
-        llama_decision::options opt;
-        opt.mode        = "tree"; // the generic shape always returns the exact distribution
-        opt.allow_cache = body.value("cache_prompt", true);
-        opt.fork        = body.value("fork", std::string("auto"));
-        if (cancel_flag) {
-            opt.should_stop = [cancel_flag]() { return cancel_flag->load(); };
-        }
-        opt.yield       = []() { std::this_thread::yield(); };
-        if (sess.slot != nullptr && !decision.decision_engine->session_fork_supported(opt.fork)) {
-            throw std::invalid_argument(
-                "a session decision needs an exact fork on this model; fork \"" + opt.fork +
-                "\" would not reproduce the slot state");
-        }
-
-        llama_decision::batch_result b;
-        // run inside a yield so metrics/slot requests are served while the decision computes
-        queue_tasks.yield_to_queue([&]() {
-            // the trie readout decodes on the shared context, scoped to the base model
-            decision_scope_base_adapters();
-            if (sess.slot != nullptr) {
-                // The slot holds the rendered static prefix; append this request's context tail and
-                // the schema suffix on a fork, so the transcript is not re-prefilled.
-                const auto plan = decision.decision_engine->compile_fields(cs.inputs, opt);
-                b = decision.decision_engine->decide_batch_from_seq(sess.seq, sess.pos, plan, opt, dynamic[0]);
-            } else {
-                b = decision.decision_engine->decide_batch(shared, dynamic, cs.inputs, opt);
-            }
-        });
-
-        size_t context_tokens = 0;
-        for (const auto & r : b.items) {
-            context_tokens += r.context_tokens;
-        }
-        json usage = json::object();
-        usage["prompt_tokens"]  = (long long) (b.shared_tokens + context_tokens);
-        usage["cached_tokens"]  = (long long) (b.cache_hit ? b.shared_tokens : 0);
-        usage["context_tokens"] = (long long) context_tokens;
-        usage["scored_rows"]    = b.rows;
-        json timings = json::object();
-        timings["prefill_ms"] = b.prefill_ms;
-        timings["scoring_ms"] = b.scoring_ms;
-        timings["total_ms"]   = b.prefill_ms + b.scoring_ms;
-        timings["rounds"]     = b.rounds;
-        timings["per_decision_ms"] = (b.prefill_ms + b.scoring_ms) / (double) b.items.size();
-
-        json results = json::array();
-        for (const auto & r : b.items) {
-            json item = llama_decision::assemble(cs, r, confidence_profile);
-            item["usage"] = { { "context_tokens", (long long) r.context_tokens }, { "scored_rows", r.rows } };
-            results.push_back(item);
-        }
-        json out = json::object();
-        out["object"]  = "decision";
-        out["results"] = results;
-        out["model"]   = model_name;
-        out["created"] = (long long) std::time(nullptr);
-        out["usage"]   = usage;
-        out["timings"] = timings;
-        if (sess.slot != nullptr) {
-            out["session"] = json::object({ { "fork", true }, { "id_slot", sess.slot->id },
-                                            { "session_pos", (long long) sess.pos } });
-        }
-        return out;
+        throw std::invalid_argument("request must be a decision request: questions with state or contexts");
     }
 
     bool process_single_task(server_task && task, bool is_yielding) {

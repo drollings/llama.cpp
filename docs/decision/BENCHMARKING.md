@@ -22,7 +22,7 @@ reproducibility-> frozen readout baselines, calibration ledger, frozen backend f
 
 | Question | Tool | Artifact |
 |---|---|---|
-| How fast is a decision warm and cold? | `bench-decision` | `tests/decision-baseline/bench-report*.json` |
+| How fast is a decision warm and cold? | `timings` on the `/v1/decision` response | response body |
 | How fast is it end to end? | `timings` on the `/v1/decision` response | response body |
 | Does the fork reproduce the parent state? | `test-decision-engine` fork oracle | `[fork control]` log line |
 | Does a refactor move the readout? | `test-decision-engine --check-readout` | `readout_{cpu,gpu}_baseline.json` |
@@ -33,9 +33,8 @@ reproducibility-> frozen readout baselines, calibration ledger, frozen backend f
 ## 2. Freeze the environment before you measure
 
 A decision number is only comparable to another decision number when the model,
-quantization, prompt template, and backend flags match. `bench-decision` records
-all of them in the report `environment` block, and the readout/calibration
-artifacts record the flags they were measured under.
+quantization, prompt template, and backend flags match. The frozen readout and
+calibration artifacts record the flags they were measured under.
 
 The frozen set:
 
@@ -45,7 +44,7 @@ The frozen set:
 | `template_hash` | `make_prefix_tag(...)` | the framed prompt moves the label boundary |
 | `kv_unified` | `true` | decisions fork on a unified cache |
 | `swa_full` | `false` | sliding-window layout changes retained cells |
-| `n_ctx` | `2048` in `bench-decision`, server defaults otherwise | changes whether a request fits |
+| `n_ctx` | `2048` in the server decision tests, server defaults otherwise | changes whether a request fits |
 | `n_batch` / `n_ubatch` | `512` / `512` | batch split changes rounding and pass count |
 | `n_seq_max` | `10` | number of live branches |
 | `gpu_layers` | `-1` | CPU vs GPU changes producer numerics |
@@ -62,89 +61,44 @@ Two lanes:
   generated dummy model from the `generate-models` fixture, or falls back to
   `LLAMA_DECISION_TEST_MODEL`.
 
-`bench-decision` refuses to run without a GPU backend: it prints
-`no GPU backend available; the decision benchmarks run on GPU only` and exits 1.
+## 3. Decision latency
 
-## 3. Engine-level latency with bench-decision
+The unified shape reports its own phases on every response `timings` object
+(`prefill_ms`, `scoring_ms`, `total_ms`, `rounds`, `rows`,
+`per_decision_ms`). Warm and cold are compared through `cache_hit` (true only on
+the warm call) and the cold cost in the first run. `rows` is the number of
+scored branch rows and `rounds` the number of decode waves: the letter readout
+always scores the exact tree, so `rows` is the trie's divergence-node count.
 
-Build the developer tool (off by default):
-
-```sh
-cmake -B build -DLLAMA_BUILD_DECISION_BENCH=ON
-cmake --build build --target bench-decision -j
-```
-
-A report run over the committed fixture:
-
-```sh
-./build/bin/bench-decision \
-  --bench \
-  --model <model.gguf> \
-  --fixture tests/fixtures/decision/contexts_schema.request.json
-```
-
-`--bench` runs the matrix: modes `auto`, `tree`, `greedy`, cache on and off, and
-the context counts `1` and `4` (pass `--contexts N` to run one tier, for example
-`--contexts 64`; the full matrix is expensive). It writes a report with 12
-entries by default.
-
-Report rules:
-
-- Every run writes a fresh timestamped file,
-  `tests/decision-baseline/bench-report-<YYYYmmdd-HHMMSS>-<ms>.json`, so a run
-  never overwrites an earlier take. To target the committed baseline, pass
-  `--report tests/decision-baseline/bench-report.json`.
-- The environment block carries model identity (last two path components only,
-  so private model roots are not committed), model bytes, quantization,
-  `backend_flags`, `template_hash`, and `git_rev`.
-- Each timing entry carries `prefill_ms`, `scoring_ms`, `total_ms`, `rounds`,
-  `rows`, `shared_tokens`, `cache_hit`, and `prefill_cold_ms`.
-
-Reading the matrix:
-
-- `cache_hit` is true only on the warm call. A cache-enabled cell needs a cold
-  run plus at least one warm run; the tool forces `--iters` to at least 2 for
-  cache-on. With `--iters > 1` it picks the run whose total is closest to the
-  median of the warm runs, so a single scheduling spike does not become the
-  result.
-- `prefill_cold_ms` is always the first run, so the cold cost is recorded next to
-  the warm result. Comparing a cold run on one branch against a warm run on
-  another is the classic false-regression trap.
-- `rows` is the number of scored branch rows and `rounds` the number of decode
-  waves. They are shape checks: `tree` scores every divergence node, `greedy`
-  walks the trie, and `auto` picks per `tree_max`.
-
-A single deep run with the raw probabilities and per-field metrics (for parity
-checks against another engine, or for a quick look):
-
-```sh
-./build/bin/bench-decision --model <model.gguf> \
-  --fixture tests/fixtures/decision/contexts_schema.request.json \
-  --mode auto,tree,greedy --allow_cache true,false --json
-```
-
-`--json` emits `timings`, raw `probabilities` per field, and a `metrics` block
-with `confidence` (`1 - H/log K`) and `certainty` (`max p`) per field.
-
-## 4. End-to-end server latency
-
-The engine report excludes the HTTP path. The server reports the same phases on
-the response `timings` object (generic `contexts`/`schema` shape):
+A quick latency probe:
 
 ```sh
 curl -s http://localhost:8096/v1/decision -H 'Content-Type: application/json' -d @request.json \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["timings"])'
 ```
 
-Compare `prefill_ms` and `scoring_ms` here with the engine report to separate an
-engine cost from a server cost. With `"diagnostics": true` the Jev shape also
-reports `prefill_ms`, `scoring_ms`, `suffix_tokens`, and `common_suffix_tokens`
-under `diagnostics`.
+Compare the same request with and without `"cache_prompt": true` to separate
+the cold prefill cost from the warm path. A cold run on one branch against a
+warm run on another is the classic false-regression trap.
+
+## 4. End-to-end server latency
+
+The response `timings` object is the engine report (unified `questions` shape);
+there is no separate engine-side tool, so engine cost and server cost are the
+same phases:
+
+```sh
+curl -s http://localhost:8096/v1/decision -H 'Content-Type: application/json' -d @request.json \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["timings"])'
+```
+
+With `"diagnostics": true` the same response also reports `prefill_ms`,
+`scoring_ms`, `suffix_tokens`, and `common_suffix_tokens` under `diagnostics`.
 
 ## 5. Accuracy and framing
 
-The labeled corpus is `tests/decision-baseline/accuracy_corpus.json`. It has 12
-letter (Jev) cases and 2 schema cases, each with an `expected` answer. It can
+The labeled corpus is `tests/decision-baseline/accuracy_corpus.json`. It has 16
+letter (Jev) cases, each with an `expected` answer. It can
 optionally be replaced by a Jev-distill corpus: point `LLAMA_DECISION_CORPUS` at
 a `.jsonl` file (or a directory of them) whose rows carry
 `id/kind/options/target/state/question`. Each line is one self-contained row, so
@@ -273,8 +227,6 @@ baseline to make a test pass without understanding the drift.
 | `readout_gpu_baseline.json` | `LLAMA_DECISION_TEST_MODEL=... test-decision-engine --record-readout gpu` | GPU lane |
 | `readout_cpu_baseline.json` | `test-decision-engine --record-readout cpu` | CPU lane |
 | `decision_letter.golden.json` | `LLAMA_DECISION_TEST_MODEL=... test-decision-engine --write-decision-golden` | letter readout |
-| score golden | `LLAMA_DECISION_TEST_MODEL=... test-decision-engine --write-score-golden` | trie scoring |
-| `bench-report.json` | `bench-decision --bench --report tests/decision-baseline/bench-report.json` | engine speed |
 | `accuracy_report.json` | `LLAMA_DECISION_ACCURACY_REPORT=... test_decision_accuracy.py` | accuracy |
 | `fairness.json` bound | manual, with a matching code change | fairness |
 
@@ -307,15 +259,12 @@ place.
   reorder reductions on CUDA, Metal, and ROCm, and flash attention changes them
   further. Compare with a tolerance; keep bit equality for the state-byte fork
   oracle and the deterministic readout core.
-- Do not compare a cold run against a warm run. Use `cache_hit` and
-  `prefill_cold_ms` from the report.
+- Do not compare a cold run against a warm run. Use `cache_hit` and the cold
+  prefill cost from the response `timings`.
 - Do not present `confidence`/`certainty` as accuracy. They measure
   concentration, not correctness, and they never gate anything.
 - `usage.output_tokens` is always 0. A non-zero value is a bug, not a benchmark
   result.
-- Keep reports additive. The committed `bench-report.json` and the timestamped
-  takes both live in `tests/decision-baseline/`; a new run must not erase an
-  older one unless it is an intentional refresh.
 - A changed `template_hash`, quantization, or any frozen backend flag
   invalidates every prior parity, calibration, and accuracy claim. Re-measure.
 - The accuracy harness is not a gate. Read `winner_agreement`, `Brier`, and `ECE`
@@ -325,16 +274,6 @@ place.
 ## 12. Quick reference
 
 ```sh
-# build
-cmake -B build -DLLAMA_BUILD_DECISION_BENCH=ON
-cmake --build build -j
-
-# engine speed (warm + cold matrix)
-LLAMA_DECISION_TEST_MODEL=<model.gguf> ./build/bin/bench-decision --bench --model <model.gguf>
-
-# engine raw parity
-./build/bin/bench-decision --model <model.gguf> --mode auto,tree,greedy --allow_cache both --json
-
 # decision suites
 ctest --test-dir build --output-on-failure -R "decision|fork|permut|calibration|head"
 

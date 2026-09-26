@@ -46,7 +46,8 @@ std::string letter_answer_tail(const std::string & after);
 struct letter_metrics {
     bool   cache_hit      = false;
     size_t shared_tokens  = 0;
-    size_t context_tokens = 0;
+    size_t context_tokens = 0;         // sum over contexts
+    std::vector<size_t> per_context_tokens; // one entry per context
     int    rows           = 0;
     int    rounds         = 0;
     double prefill_ms     = 0;
@@ -84,11 +85,6 @@ std::string format_option_line(const label & l, const decision_option & opt);
 
 // Throws semantic_error when a question needs more labels than the pool provides.
 void validate_label_capacity(const decision_request & req, size_t label_count);
-
-// Deterministic option order for one de-bias pass: pass 0 is the identity, later passes are
-// distinct seeded shuffles of the option indices. Seeded by the question id, so a question always
-// sees the same orders across runs and languages.
-std::vector<size_t> permutation_order(size_t count, const std::string & question_id, int pass);
 
 // Selected-head capability, resolved once per process. A populated `reason` means the projection
 // of only the answer rows is not usable, so the readout must fall back to full logits (never a
@@ -187,7 +183,8 @@ struct readout_sources {
 
 // The layered readout: one scoring-source decision made from the compiled plan, so the server does
 // not duplicate the head-usability rule. The single-engine overload above is a thin wrapper that
-// treats a classifier-only engine as the classifier source.
+// treats a classifier-only engine as the classifier source. This overload scores the request's
+// single state (or one session fork) and returns one probability vector per question.
 std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
                                                answer_head_cache & head_cache,
                                                const label_vocab & vocab,
@@ -197,5 +194,20 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
                                                const options & opt,
                                                letter_metrics * metrics = nullptr,
                                                answer_audit * audit = nullptr);
+
+// The multi-context form: the same questions scored against every context of a `contexts`
+// request (or the single `state`, when that is set) in one batched pass. Returns one
+// probability matrix per context (question x option), in request order. `metrics` is batch
+// level; `per_context_tokens` reports each context's token count. `audit` describes the first
+// context and is additive only. A session fork scores exactly one context.
+std::vector<std::vector<std::vector<float>>> letter_readout_multi(const readout_sources & sources,
+                                                                  answer_head_cache & head_cache,
+                                                                  const label_vocab & vocab,
+                                                                  const common_chat_templates * tmpls, bool use_jinja,
+                                                                  const decision_request & req,
+                                                                  const std::vector<label> & labels,
+                                                                  const options & opt,
+                                                                  letter_metrics * metrics = nullptr,
+                                                                  answer_audit * audit = nullptr);
 
 } // namespace llama_decision

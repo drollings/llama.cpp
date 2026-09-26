@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Accuracy and framing harness for the decision endpoint.
 
-Runs a labeled corpus through the letter (Jev) readout and the trie (contexts/schema)
+Runs a labeled corpus through the letter (Jev) readout
 readout and reports winner agreement, Brier and expected calibration error (ECE) per
 model. It also compares the stateless `State:` framing against the session
 chat-template framing, and the default (certainty-based Jev) confidence profile
@@ -331,26 +331,7 @@ def prefill_slot(server, id_slot, state):
     check(status == 200, f"slot prefill status {status}: {text[:200]}")
 
 
-def run_schema_cases(server, cases):
-    hits = 0
-    total = 0
-    for case in cases:
-        body = {"contexts": [case["context"]], "schema": case["schema"],
-                "instructions": case.get("instructions", "")}
-        status, text = server.post("/v1/decision", json.dumps(body))
-        check(status == 200, f"schema case {case['id']} status {status}: {text[:200]}")
-        fields = json.loads(text)["results"][0]["fields"]
-        for name, expected in case["expected"].items():
-            total += 1
-            if fields[name]["value"] == expected:
-                hits += 1
-    return {"cases": total, "winner_agreement": (hits / total) if total else 0.0}
-
-
 def run_checks(model):
-    schema_cases = []
-    if os.path.isfile(CORPUS):
-        schema_cases = json.load(open(CORPUS)).get("schema", [])
     if CORPUS_JSONL:
         letter_cases = load_corpus_cases(CORPUS_JSONL)
         if not letter_cases:
@@ -368,7 +349,6 @@ def run_checks(model):
         stateless = letter_metrics(run_letter_cases(server, letter_cases))
         stateless_local = letter_metrics(run_letter_cases(server, letter_cases, confidence_profile="local"))
         stateless_p2 = letter_metrics(run_letter_cases(server, letter_cases, permutations=2))
-        schema = run_schema_cases(server, schema_cases) if schema_cases else {"cases": 0}
     finally:
         server.stop()
 
@@ -418,7 +398,6 @@ def run_checks(model):
             "framing_winner": framing,
             "framing_axis": "winner agreement, Brier tie-break",
         },
-        "schema": schema,
     }
     print(f"accuracy {model_identity(model)}: letter stateless={stateless}")
     if session is not None:

@@ -34,13 +34,6 @@ std::string render_state(const common_json & state) {
     return "State:\n" + safe_data(text) + "\n";
 }
 
-uint64_t permutation_seed(const std::string & question_id, int pass) {
-    uint64_t h = fnv1a64(question_id);
-    h ^= (uint64_t) (uint32_t) pass * 0x9e3779b97f4a7c15ull;
-    h *= 1099511628211ull;
-    return h != 0 ? h : 1;
-}
-
 std::string format_letter_suffix_ordered(const decision_question & q, const std::vector<label> & labels,
                                          const std::string & before, const std::string & after,
                                          const std::vector<size_t> & order) {
@@ -55,34 +48,6 @@ std::string format_letter_suffix_ordered(const decision_question & q, const std:
 }
 
 } // namespace
-
-std::vector<size_t> permutation_order(size_t count, const std::string & question_id, int pass) {
-    std::vector<size_t> order(count);
-    for (size_t i = 0; i < count; ++i) {
-        order[i] = i;
-    }
-    if (pass <= 0 || count < 2) {
-        return order;
-    }
-    uint64_t s = permutation_seed(question_id, pass);
-    for (size_t i = count - 1; i > 0; --i) {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        std::swap(order[i], order[(size_t) (s % (i + 1))]);
-    }
-    bool identity = true;
-    for (size_t i = 0; i < count; ++i) {
-        if (order[i] != i) {
-            identity = false;
-            break;
-        }
-    }
-    if (identity) {
-        std::swap(order[count - 2], order[count - 1]); // a pass must actually reorder to de-bias
-    }
-    return order;
-}
 
 std::string decision_contract_hash(const std::string & model_name, const std::string & template_hash, int vocab_size) {
     return sha256_hex("decision-contract-v1|" + template_hash + "|" + std::string(LETTER_PROMPT_VERSION) + "|" +
@@ -328,15 +293,15 @@ std::string format_letter_suffix(const decision_question & q, const std::vector<
     return format_letter_suffix_ordered(q, labels, "", after, order);
 }
 
-std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
-                                               answer_head_cache & head_cache,
-                                               const label_vocab & vocab,
-                                               const common_chat_templates * tmpls, bool use_jinja,
-                                               const decision_request & req,
-                                               const std::vector<label> & labels,
-                                               const options & opt,
-                                               letter_metrics * metrics,
-                                               answer_audit * audit) {
+std::vector<std::vector<std::vector<float>>> letter_readout_multi(const readout_sources & sources,
+                                                                   answer_head_cache & head_cache,
+                                                                   const label_vocab & vocab,
+                                                                   const common_chat_templates * tmpls, bool use_jinja,
+                                                                   const decision_request & req,
+                                                                   const std::vector<label> & labels,
+                                                                   const options & opt,
+                                                                   letter_metrics * metrics,
+                                                                   answer_audit * audit) {
     if (sources.full == nullptr) {
         throw std::invalid_argument("the letter readout needs a full-logits engine");
     }
@@ -426,9 +391,23 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
         }
     }
 
+    // The evidence set: a single `state` (Jev) or the request's `contexts`. A session fork ignores
+    // the text and continues the transcript, so the list is empty there.
+    std::vector<std::string> states;
+    if (!session) {
+        if (!req.contexts.empty()) {
+            states.reserve(req.contexts.size());
+            for (const auto & c : req.contexts) {
+                states.push_back(render_state(c));
+            }
+        } else {
+            states.push_back(render_state(req.state));
+        }
+    }
+
     const batch_result b = session
         ? sources.full->decide_batch_from_seq(sources.session->seq, sources.session->base_pos, plan, readout_opt)
-        : chosen->decide_batch(plan, split.first, { render_state(req.state) }, readout_opt);
+        : chosen->decide_batch(plan, split.first, states, readout_opt);
 
     if (metrics) {
         metrics->cache_hit      = b.cache_hit;
@@ -437,7 +416,13 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
         metrics->scoring_ms     = b.scoring_ms;
         metrics->rows           = b.rows;
         metrics->rounds         = b.rounds;
-        metrics->context_tokens = b.items.empty() ? 0 : b.items[0].context_tokens;
+        metrics->context_tokens = 0;
+        metrics->per_context_tokens.clear();
+        metrics->per_context_tokens.reserve(b.items.size());
+        for (const auto & item : b.items) {
+            metrics->context_tokens += item.context_tokens;
+            metrics->per_context_tokens.push_back(item.context_tokens);
+        }
         metrics->head_active    = b.head_active;
         metrics->head_reason    = b.head_reason;
         if (!b.head_active && req.head != "full" && metrics->head_reason.empty()) {
@@ -449,31 +434,35 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
         metrics->label_pool_size      = labels.size();
     }
 
-    std::vector<std::vector<float>> probs;
-    probs.reserve(req.questions.size());
+    std::vector<std::vector<std::vector<float>>> all;
     if (b.items.empty()) {
-        return probs;
+        return all;
     }
-    probs.assign(req.questions.size(), {});
-    for (size_t f = 0; f < fields.size(); ++f) {
-        const std::vector<float> & p = b.items[0].fields[f].probs;
-        const size_t qi = field_question[f];
-        const size_t k  = req.questions[qi].options.size();
-        if (p.size() != k) {
-            throw std::runtime_error("the readout returned an unexpected number of scores");
+    all.reserve(b.items.size());
+    for (const auto & item : b.items) {
+        std::vector<std::vector<float>> probs;
+        probs.assign(req.questions.size(), {});
+        for (size_t f = 0; f < fields.size(); ++f) {
+            const std::vector<float> & p = item.fields[f].probs;
+            const size_t qi = field_question[f];
+            const size_t k  = req.questions[qi].options.size();
+            if (p.size() != k) {
+                throw std::runtime_error("the readout returned an unexpected number of scores");
+            }
+            auto & acc = probs[qi];
+            if (acc.empty()) {
+                acc.assign(k, 0.0f);
+            }
+            for (size_t i = 0; i < k; ++i) {
+                acc[field_order[f][i]] += p[i]; // map the permuted position back to its option
+            }
         }
-        auto & acc = probs[qi];
-        if (acc.empty()) {
-            acc.assign(k, 0.0f);
+        for (auto & acc : probs) {
+            for (float & v : acc) {
+                v /= (float) n_perm;
+            }
         }
-        for (size_t i = 0; i < k; ++i) {
-            acc[field_order[f][i]] += p[i]; // map the permuted position back to its option
-        }
-    }
-    for (auto & acc : probs) {
-        for (float & v : acc) {
-            v /= (float) n_perm;
-        }
+        all.push_back(std::move(probs));
     }
 
     if (audit != nullptr) {
@@ -482,7 +471,7 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
         audit->prompt_sha256      = session
             ? sha256_hex(std::string("session|") + std::to_string(sources.session->seq) + "|" +
                          std::to_string(sources.session->base_pos) + "|" + letter_system_text())
-            : sha256_hex(split.first + render_state(req.state) + split.second);
+            : sha256_hex(split.first + states[0] + split.second);
         audit->prompt_version     = LETTER_PROMPT_VERSION;
         audit->probability_status = "conditional option score over quantized weights; uncalibrated as decision confidence";
         audit->full_vocab_audit   = !b.head_active;
@@ -506,7 +495,20 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
             audit->option_logits[qi]         = b.items[0].fields[f0].logits;
         }
     }
-    return probs;
+    return all;
+}
+
+std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
+                                               answer_head_cache & head_cache,
+                                               const label_vocab & vocab,
+                                               const common_chat_templates * tmpls, bool use_jinja,
+                                               const decision_request & req,
+                                               const std::vector<label> & labels,
+                                               const options & opt,
+                                               letter_metrics * metrics,
+                                               answer_audit * audit) {
+    auto all = letter_readout_multi(sources, head_cache, vocab, tmpls, use_jinja, req, labels, opt, metrics, audit);
+    return all.empty() ? std::vector<std::vector<float>>{} : std::move(all[0]);
 }
 
 std::vector<std::vector<float>> letter_readout(engine & eng,

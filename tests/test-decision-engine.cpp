@@ -92,46 +92,6 @@ static std::string model_identity(const std::string & path) {
     return prev == std::string::npos ? file : path.substr(prev + 1, slash - prev - 1) + "/" + file;
 }
 
-static common_json fixture_request() {
-    return common_json::parse(read_file(fixture_path("contexts_schema.request.json")));
-}
-
-// Deterministic view of the compiled schema: what the trie engine will score.
-static common_json compiled_to_json(const llama_decision::compiled_schema & cs) {
-    common_json out = common_json::object();
-    out["system_text"] = cs.system_text;
-
-    common_json specs = common_json::array();
-    for (const auto & sp : cs.specs) {
-        common_json s = common_json::object();
-        s["name"]        = sp.name;
-        s["type"]        = sp.type;
-        s["description"] = sp.description;
-        s["aggregate"]   = sp.aggregate;
-        common_json enc  = common_json::array();
-        for (const auto & e : sp.encoded) {
-            enc.push_back(e);
-        }
-        s["encoded"] = enc;
-        specs.push_back(s);
-    }
-    out["specs"] = specs;
-
-    common_json inputs = common_json::array();
-    for (const auto & in : cs.inputs) {
-        common_json i    = common_json::object();
-        i["suffix"]      = in.suffix;
-        common_json cand = common_json::array();
-        for (const auto & c : in.candidates) {
-            cand.push_back(c);
-        }
-        i["candidates"] = cand;
-        inputs.push_back(i);
-    }
-    out["inputs"] = inputs;
-    return out;
-}
-
 static const char * decision_valid_body() {
     return R"({
       "model": "m",
@@ -148,79 +108,6 @@ static const char * decision_valid_body() {
       "temperatures": {"noul": 1.0},
       "permutations": 1
     })";
-}
-
-static void test_compiled_schema_golden(testing & t) {
-    t.test("compiled schema matches the committed golden", [](testing & t) {
-        const common_json req = fixture_request();
-        const auto cs = llama_decision::compile_schema(req.at("schema"), req.value("instructions", std::string("")));
-        const std::string actual = compiled_to_json(cs).dump(2) + "\n";
-        const std::string golden = read_file(fixture_path("compiled_schema.golden.json"));
-        t.assert_equal("compiled schema is byte-identical", golden, actual);
-    });
-}
-
-static void test_json_schema_form(testing & t) {
-    t.test("JSON Schema properties form compiles and needs no descriptions", [](testing & t) {
-        const common_json schema = common_json::parse(
-            "{\"properties\":{\"a\":{\"type\":\"boolean\"},"
-            "\"b\":{\"type\":\"string\",\"enum\":[\"x\",\"y\"]},"
-            "\"c\":{\"type\":\"number\",\"minimum\":0,\"maximum\":1,\"multipleOf\":0.5}}}");
-        const auto cs = llama_decision::compile_schema(schema, "note");
-        t.assert_equal("three fields", (size_t) 3, cs.specs.size());
-        t.assert_equal("enum type", std::string("enum"), cs.specs[1].type);
-        t.assert_equal("number grid", (size_t) 3, cs.specs[2].encoded.size());
-        t.assert_true("instructions kept", cs.system_text.find("note") != std::string::npos);
-    });
-}
-
-static void expect_reject(testing & t, const std::string & schema_text, const std::string & needle) {
-    try {
-        const common_json schema = common_json::parse(schema_text);
-        (void) llama_decision::compile_schema(schema, std::string());
-        t.assert_true("schema is rejected: " + schema_text, false);
-    } catch (const std::invalid_argument & e) {
-        const std::string what = e.what();
-        t.assert_true("reject reason contains needle: " + schema_text, what.find(needle) != std::string::npos);
-    }
-}
-
-static void test_compile_rejects(testing & t) {
-    t.test("invalid schemas are rejected with a clear reason", [](testing & t) {
-        expect_reject(t, "[]", "must be an object");
-        expect_reject(t, "{}", "1-32 fields");
-        expect_reject(t, R"({"a":{"type":"boolean"}})", "needs a description");
-        expect_reject(t, R"({"a":{"type":"enum","description":"d"}})", "list of choices");
-        expect_reject(t, R"({"a":{"type":"integer","description":"d"}})", "minimum and maximum");
-        expect_reject(t, R"({"a":{"type":"integer","minimum":0,"maximum":300,"description":"d"}})", "1-255 values");
-        expect_reject(t, R"({"a":{"type":"number","minimum":0,"maximum":1,"description":"d"}})", "minimum, maximum and step");
-        expect_reject(t, R"({"a":{"type":"number","minimum":0,"maximum":1,"step":0.3,"description":"d"}})", "grid must include both ends");
-        expect_reject(t, R"({"a":{"type":"enum","choices":["x","x"],"description":"d"}})", "duplicate allowed values");
-        expect_reject(t, R"({"a":{"type":"string","description":"d"}})", "supported types are");
-        expect_reject(t, R"({"a":{"type":"boolean","aggregate":"mean","description":"d"}})", "aggregate must be mode");
-
-        common_json wide = common_json::object();
-        for (int i = 0; i < 33; ++i) {
-            common_json f = common_json::object();
-            f["type"]        = "boolean";
-            f["description"] = "d";
-            wide["f" + std::to_string(i)] = f;
-        }
-        try {
-            (void) llama_decision::compile_schema(wide, std::string());
-            t.assert_true("33 fields rejected", false);
-        } catch (const std::invalid_argument & e) {
-            t.assert_true("33 fields rejected with range reason", std::string(e.what()).find("1-32 fields") != std::string::npos);
-        }
-    });
-}
-
-static void test_render_prompt_fallback(testing & t) {
-    t.test("raw prompt fallback splits system and dynamic parts", [](testing & t) {
-        const auto split = llama_decision::render_prompt(nullptr, false, "SYS", "CTX");
-        t.assert_equal("head", std::string("SYS\nContext:\n"), split.first);
-        t.assert_equal("tail", std::string("CTX\nOutput:\n{\n"), split.second);
-    });
 }
 
 static size_t count_substring(const std::string & hay, const std::string & needle) {
@@ -273,10 +160,6 @@ static void test_split_chat_template_primitive(testing & t) {
         const auto letter = llama_decision::render_letter_prompt(tmpls.get(), true, "SYS", false);
         t.assert_equal("render_letter_prompt returns the primitive split head", parts.first, letter.first);
         t.assert_equal("render_letter_prompt returns the primitive split tail", parts.second, letter.second);
-        const auto prompt = llama_decision::render_prompt(tmpls.get(), true, "SYS", "CTX", false);
-        t.assert_equal("render_prompt keeps the primitive head", parts.first, prompt.first);
-        t.assert_equal("render_prompt embeds context after the sentinel",
-                       std::string("CTX") + parts.second + "{\n", prompt.second);
     });
 }
 
@@ -298,10 +181,6 @@ static void test_thinking_off(testing & t) {
             t.assert_true("thinking on emits the marker", count_substring(join_split(on), "<think>") == 1);
             t.assert_true("thinking on adds tokens", join_split(on).size() > join_split(off).size());
 
-            const auto trie_off = llama_decision::render_prompt(probe.get(), true, sys, "ctx", false);
-            const auto trie_on  = llama_decision::render_prompt(probe.get(), true, sys, "ctx", true);
-            t.assert_true("the trie framer defaults off too", count_substring(join_split(trie_off), "<think>") == 0);
-            t.assert_true("the trie framer can turn thinking on", count_substring(join_split(trie_on), "<think>") == 1);
         } catch (const std::exception & e) {
             t.assert_true(std::string("thinking probe renders: ") + e.what(), false);
         }
@@ -310,8 +189,6 @@ static void test_thinking_off(testing & t) {
     t.test("a raw decision prefix carries no thinking marker", [](testing & t) {
         const auto raw = llama_decision::render_letter_prompt(nullptr, false, "SYS");
         t.assert_true("raw letter prefix is thinking free", count_substring(join_split(raw), "<think>") == 0);
-        const auto raw_ctx = llama_decision::render_prompt(nullptr, false, "SYS", "CTX");
-        t.assert_true("raw context prefix is thinking free", count_substring(join_split(raw_ctx), "<think>") == 0);
     });
 }
 
@@ -347,55 +224,6 @@ static void test_thinking_control(testing & t) {
                           count_substring(preserved, "<think>") == 1);
         } catch (const std::exception & e) {
             t.assert_true(std::string("preserve control renders: ") + e.what(), false);
-        }
-    });
-}
-
-static void test_assemble(testing & t) {
-    t.test("assemble maps winners, probabilities and numeric aggregates", [](testing & t) {
-        {
-            const common_json schema = common_json::parse(R"({"mode":{"type":"boolean","description":"d"}})");
-            const auto cs = llama_decision::compile_schema(schema, std::string());
-            llama_decision::result r;
-            r.fields.resize(1);
-            // boolean candidate order is [true, false]
-            r.fields[0].winner       = 0;
-            r.fields[0].probs        = { 0.75f, 0.25f };
-            r.fields[0].tree         = true;
-            r.fields[0].scored_nodes = 1;
-            const common_json out = llama_decision::assemble(cs, r);
-            t.assert_equal("boolean decision", true, out.at("decision").at("mode").get<bool>());
-            assert_close(t, "boolean probability", 0.75, out.at("fields").at("mode").at("probability").get<double>());
-            t.assert_equal("scored nodes", (int) 1, out.at("fields").at("mode").at("scored_nodes").get<int>());
-        }
-        {
-            const common_json schema = common_json::parse(
-                R"({"level":{"type":"integer","minimum":1,"maximum":3,"description":"d"}})");
-            const auto cs = llama_decision::compile_schema(schema, std::string());
-            llama_decision::result r;
-            r.fields.resize(1);
-            r.fields[0].winner       = 2;
-            r.fields[0].probs        = { 0.2f, 0.3f, 0.5f };
-            r.fields[0].tree         = true;
-            r.fields[0].scored_nodes = 1;
-            const common_json out = llama_decision::assemble(cs, r);
-            t.assert_equal("numeric mode value", 3, out.at("decision").at("level").get<int>());
-            const auto interval = out.at("fields").at("level").at("interval_p10_p90");
-            t.assert_equal("p10", 1, interval.at(0).get<int>());
-            t.assert_equal("p90", 3, interval.at(1).get<int>());
-        }
-        {
-            const common_json schema = common_json::parse(
-                R"({"level":{"type":"integer","minimum":1,"maximum":3,"aggregate":"median","description":"d"}})");
-            const auto cs = llama_decision::compile_schema(schema, std::string());
-            llama_decision::result r;
-            r.fields.resize(1);
-            r.fields[0].winner       = 2;
-            r.fields[0].probs        = { 0.2f, 0.3f, 0.5f };
-            r.fields[0].tree         = true;
-            r.fields[0].scored_nodes = 1;
-            const common_json out = llama_decision::assemble(cs, r);
-            t.assert_equal("median aggregate", 2, out.at("decision").at("level").get<int>());
         }
     });
 }
@@ -1158,7 +986,7 @@ static void test_decision_parse(testing & t) {
     });
 
     t.test("invalid decision requests are rejected with a clear reason", [](testing & t) {
-        expect_decision_reject(t, R"({"questions":{"q":{"type":"noul","instructions":"x"}}})", "state is required");
+        expect_decision_reject(t, R"({"questions":{"q":{"type":"noul","instructions":"x"}}})", "state (or contexts) is required");
         expect_decision_reject(t, R"({"state":"","questions":{"q":{"type":"noul","instructions":"x"}}})", "state must not be empty");
         expect_decision_reject(t, R"({"state":[],"questions":{"q":{"type":"noul","instructions":"x"}}})", "state must not be empty");
         expect_decision_reject(t, R"({"state":5,"questions":{"q":{"type":"noul","instructions":"x"}}})", "state must be a string");
@@ -6878,7 +6706,7 @@ static void test_decision_default_envelope(testing & t) {
         t.assert_equal("choice answer keys",
                        std::string("choice,confidence,probabilities,type"), key_set(answers.at("dept")));
         t.assert_equal("score answer keys",
-                       std::string("confidence,legend,probabilities,score,type"), key_set(answers.at("urgency")));
+                       std::string("confidence,interval_p10_p90,legend,median,probabilities,score,type"), key_set(answers.at("urgency")));
     });
 
     t.test("diagnostics opt-in adds the additive and audit key sets", [](testing & t) {
@@ -6901,8 +6729,8 @@ static void test_decision_default_envelope(testing & t) {
                        key_set(answers.at("dept")));
         t.assert_equal("score answer keys",
                        std::string("allowed_token_mass,answer_token_ids,certainty,confidence,full_vocab_argmax_id,"
-                                   "legend,option_logits,probabilities,probability_status,prompt_sha256,"
-                                   "prompt_version,score,type"),
+                                   "interval_p10_p90,legend,median,option_logits,probabilities,probability_status,"
+                                   "prompt_sha256,prompt_version,score,type"),
                        key_set(answers.at("urgency")));
     });
 
@@ -8885,9 +8713,6 @@ static int write_calibration_rows() {
 }
 
 static int write_goldens() {
-    const common_json req = fixture_request();
-    const auto cs = llama_decision::compile_schema(req.at("schema"), req.value("instructions", std::string("")));
-    write_file(fixture_path("compiled_schema.golden.json"), compiled_to_json(cs).dump(2) + "\n");
     write_file(fixture_path("decision_basic.golden.json"), decision_basic_from_fixed_scores().dump(2) + "\n");
     return 0;
 }
@@ -9201,15 +9026,10 @@ int main(int argc, char ** argv) {
     }
 
     t.test("decision engine harness", [](testing & t) {
-        test_compiled_schema_golden(t);
-        test_json_schema_form(t);
-        test_compile_rejects(t);
-        test_render_prompt_fallback(t);
         test_split_chat_template_primitive(t);
         test_thinking_off(t);
         test_thinking_off_model(t);
         test_thinking_control(t);
-        test_assemble(t);
         test_decision_shape_contract(t);
         test_decision_parse(t);
         test_decision_assemble(t);

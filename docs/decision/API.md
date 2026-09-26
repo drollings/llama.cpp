@@ -166,46 +166,42 @@ answers with; when the rendered description is empty the line is
 `label: <key>` only (no trailing separator). Keys are `false`/`true` for noul,
 the option names for choice, and `"0".."K-1"` for score.
 
-### 2.3 Generic-schema request (trie mode)
+### 2.3 Unified shape: questions + state or contexts
 
-The branch also implements a non-Jev flat-JSON form. It stays supported
-byte-identically; the Jev form is added beside it.
+The wire converges on Jev's shape: a map of typed questions (`noul` /
+`choice` / `score`), answered against one `state` (Jev) or, as this branch's
+extension, against a list of `contexts` in one batched pass.
 
 ```json
-{"contexts": ["ctx1", ...], "schema": {...}, "instructions": "...",
- "cache_prompt": true, "temperature": 1.0, "confidence_profile": "jev|local"}
+{"state": "...", "questions": {"qid": {"type": "noul|choice|score",
+    "instructions": ..., "criteria": ...}},
+ "temperature": 1.0, "temperatures": {"noul": 1.0, "choice": 1.0, "score": 1.0},
+ "confidence_profile": "jev|local", "permutations": 1}
 ```
 
-* `contexts`: 1-`DECISION_MAX_CONTEXTS` non-empty strings, decided in order,
-  sharing one schema.
-* `schema`: compact `{name: {type, description, choices/enum, minimum,
-  maximum, step, aggregate}}` or JSON-Schema `{properties: {...}}`, 1-32
-  fields. Types: `boolean`, `enum` (1-255), `integer`/`number` (1-255 grid
-  points, fixed-width decimals). Numeric `aggregate: mode|median|mean`.
-* `temperature` (optional, float > 0, default 1.0): the global softmax
-  temperature applied to every field's trie scores. There is no per-type
-  override; ship `1.0` and fit per deployment offline (Section 6).
-* `confidence_profile` (optional, `"jev"` default or `"local"`): the
-  concentration formula for each field's `confidence`, matching the Jev shape
-  semantics (Section 2.1). It never changes a value or a probability.
-* This shape always scores every field exactly (the token trie), so every
-  field's response carries the full `probabilities`, `confidence`, `certainty`
-  and `legend`. There is no greedy/approximate mode; a request whose trie needs
-  more rows than the configured budget is rejected (Section 5), never silently
-  approximated.
-* Response: `{object:"decision", model, created, results:[{decision, fields,
-  usage}], usage, timings}`. Each field entry carries `value` (the winner),
-  `probability` (the winner's share), `probabilities` (the full distribution,
-  keyed by each value's canonical string), `confidence`, `certainty`, `legend`
-  (same keys -> the typed value), and for numeric fields `interval_p10_p90`.
+* `questions`: 1-`DECISION_MAX_QUESTIONS` entries, Jev-typed. Each question
+  carries its own `instructions` (string/object/array) and `criteria`
+  (noul `{true,false}` map, choice option->description map up to the label-pool
+  cap, score ordered-level array). Question keys are the answer keys.
+* Evidence: exactly one of `state` (string/object/array, Jev) or `contexts`
+  (1-`DECISION_MAX_CONTEXTS` non-empty strings, answered in order against the
+  same questions). Session fork scores exactly one context.
+* `temperature` (global, float > 0, default 1.0) with per-type `temperatures`
+  overrides; `confidence_profile` (`"jev"` default / `"local"`); `permutations`
+  (1-8, order-de-biasing, capped, not on a session fork). All match Section 2.1
+  semantics.
+* Response, single `state`: `{model, answers: {qid: {...}}, usage, timings}`.
+  `answers` is the strict Jev envelope (Section 2.2); `timings` is additive.
+* Response, `contexts`: `{model, contexts: [{answers, usage}, ...], timings}`.
+  The per-context `answers`/`usage` match the single-state shapes; `timings` is
+  batch level. The `contexts` key is the one extension over Jev.
 
-When both shapes are supported, negotiate by request shape: presence of
-`state`+`questions` selects the letter readout; presence of `contexts`+`schema`
-selects the trie readout. Never mix both in one call.
+The legacy `contexts`+`schema` request form (boolean/enum/integer/number field
+types) is retired; the unified shape above is the contract.
 
 ### 2.4 Live-session request (`id_slot`, `session_pos`)
 
-Both shapes accept an optional `id_slot` (int) so the decision is answered about
+The unified shape accepts an optional `id_slot` (int) so the decision is answered about
 a chat slot that already holds decoded state, without re-prefilling the
 transcript. `session_pos` (int) optionally pins the continuation position; it
 requires `id_slot` and must equal the slot's next position exactly, otherwise the
@@ -215,23 +211,21 @@ request is a 422 (a shifted position is never scored silently).
   capability checks only: an unknown, released, or empty slot is a 4xx with a
   reason. The server never inspects a confidence value to accept or reject a
   session.
-* The generic shape scores exactly one context per session request; a
-  multi-context session is a 400. It forks the slot and appends this request's
-  context tail plus the schema suffix.
-* The Jev shape appends the questions as a fresh user turn rendered through the
-  slot's chat template; the transcript is not re-injected as `state`, and the
-  request `state` is still required by the shape but not re-decoded. Session
-  readout runs full-logits on the shared context, because the classifier-only
-  context has its own cache and cannot fork a chat slot. An explicit
-  `head: "selected"` on a session is a 400.
+* A session scores exactly one context: a `contexts` request with more than one
+  entry is a 400. The readout appends the questions as a fresh user turn
+  rendered through the slot's chat template; the transcript is not re-injected
+  as `state`, and the request `state` is still required by the shape but not
+  re-decoded.
+* Session readout runs full-logits on the shared context, because the
+  classifier-only context has its own cache and cannot fork a chat slot. An
+  explicit `head: "selected"` on a session is a 400.
 * A session fork is exact: `copy` is refused on a recurrent/hybrid model (it
   would not reproduce the slot state), `hybrid`/`restore`/`auto` are accepted.
 * The source slot is never mutated: a decision reads it only to fork. After the
   request, chat on that slot and a repeat decision both keep working.
 * The response reports the fork additively: `session_fork: true`, `source_slot`,
-  and `session_pos` on the Jev envelope, or a top-level `session` object on the
-  generic shape. With `diagnostics: true`, `diagnostics.permutations` reports the
-  pass count used.
+  and `session_pos`. With `diagnostics: true`, `diagnostics.permutations`
+  reports the pass count used.
 
 ---
 
@@ -426,8 +420,7 @@ Notes:
   observable guarantee is that no partial answer is produced).
 * `x-decision-latency-ms` and `Server-Timing: prepare,prefill,branches` are
   proposed instrumentation, not currently emitted. Per-request timings are
-  available via the audit fields and the generic `timings` object on the
-  `contexts`/`schema` shape.
+  available via the audit fields and the response `timings` object.
 
 ---
 

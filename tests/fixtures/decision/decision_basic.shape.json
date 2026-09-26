@@ -1,53 +1,55 @@
 {
-  "request": {
-    "model": "string? (routing/echo only)",
-    "state": "string|object|array (required, non-empty, treated as data)",
-    "questions": {
-      "<qid>": {
-        "type": "noul|choice|score (bool and scale accepted as input aliases)",
-        "instructions": "string|object|array?",
-        "criteria": "noul: {true,false}?; choice: {key: desc|null} 2-64; score: [desc] 2-64 low->high"
-      }
-    },
-    "temperature": "number? default 1.0",
-    "temperatures": "object? {noul,choice,score}",
-    "permutations": "integer? default 1, 1-8"
+ "request": {
+  "model": "string? (routing/echo only)",
+  "state": "string|object|array (required, non-empty, treated as data)",
+  "questions": {
+   "<qid>": {
+    "type": "noul|choice|score (bool and scale accepted as input aliases)",
+    "instructions": "string|object|array?",
+    "criteria": "noul: {true,false}?; choice: {key: desc|null} 2-64; score: [desc] 2-64 low->high"
+   }
   },
-  "response": {
-    "model": "string (echo)",
-    "answers": {
-      "<qid>": "one of answer_shapes"
-    },
-    "usage": {
-      "input_tokens": "integer",
-      "output_tokens": 0,
-      "cached_tokens": "integer?",
-      "state_cache_hit": "boolean?"
-    }
+  "temperature": "number? default 1.0",
+  "temperatures": "object? {noul,choice,score}",
+  "permutations": "integer? default 1, 1-8"
+ },
+ "response": {
+  "model": "string (echo)",
+  "answers": {
+   "<qid>": "one of answer_shapes"
   },
-  "answer_shapes": {
-    "noul": {
-      "type": "noul",
-      "noul": "number in [0,1] = P(true); no confidence field"
-    },
-    "choice": {
-      "type": "choice",
-      "choice": "option key (argmax)",
-      "probabilities": "object keyed by option key, sums to 1",
-      "confidence": "number = 1 - H/log(K)",
-      "certainty": "number = max(p)"
-    },
-    "score": {
-      "type": "score",
-      "score": "number = sum(i*p_i), zero-based expected level",
-      "probabilities": "object with string keys \"0\"..\"K-1\"",
-      "legend": "object mapping level index string to description, in order",
-      "confidence": "number = 1 - H/log(K)",
-      "certainty": "number = max(p)"
-    }
-  },
-  "limits": {
-    "questions": "1-256",
-    "options": "2-64 per question"
+  "usage": {
+   "input_tokens": "integer",
+   "output_tokens": 0,
+   "cached_tokens": "integer?",
+   "state_cache_hit": "boolean?"
   }
+ },
+ "answer_shapes": {
+  "noul": {
+   "type": "noul",
+   "noul": "number in [0,1] = P(true); no confidence field"
+  },
+  "choice": {
+   "type": "choice",
+   "choice": "option key (argmax)",
+   "probabilities": "object keyed by option key, sums to 1",
+   "confidence": "number = (N*p_max-1)/(N-1), Jev default; opt-in 1 - H/log(K) via confidence_profile",
+   "certainty": "number = max(p)"
+  },
+  "score": {
+   "type": "score",
+   "score": "number = sum(i*p_i), zero-based expected level",
+   "probabilities": "object with string keys \"0\"..\"K-1\"",
+   "legend": "object mapping level index string to description, in order",
+   "confidence": "number = (N*p_max-1)/(N-1), Jev default; opt-in 1 - H/log(K) via confidence_profile",
+   "certainty": "number = max(p)",
+   "median": "number = median level index (additive)",
+   "interval_p10_p90": "array [p10, p90] level indices (additive)"
+  }
+ },
+ "limits": {
+  "questions": "1-256",
+  "options": "2-64 per question"
+ }
 }

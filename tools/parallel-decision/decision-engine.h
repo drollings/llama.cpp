@@ -349,43 +349,4 @@ class engine {
     bool head_covers(const classifier_head & head, const tokens_t & cands) const;
 };
 
-// ---- schema compiler (the C++ counterpart of llama-mojo's tools/prepare_decisions.py)
-
-struct field_spec {
-    std::string              name;
-    std::string              type;        // boolean | enum | integer | number
-    std::string              description;
-    std::string              aggregate;   // mode | median | mean (median/mean: numeric fields)
-    std::vector<common_json> values;      // typed values; index = candidate index
-    std::vector<double>      numbers;     // numeric fields: the same values as doubles
-    std::vector<std::string> encoded;     // JSON text of each value
-};
-
-struct compiled_schema {
-    std::string              system_text; // fixed instructions + field catalogue (cacheable)
-    std::vector<field_spec>  specs;
-    std::vector<field_input> inputs;
-};
-
-// Accepts compact field specs {"name": {"type": ..., "description": ..., ...}} or a JSON Schema
-// object with "properties" (boolean, string+enum, integer min/max, number min/max/multipleOf).
-// `temperature` is the global softmax temperature applied to every field; default 1.0.
-compiled_schema compile_schema(const common_json & schema, const std::string & instructions,
-                               float temperature = 1.0f);
-
-// Renders system + user messages with the model's chat template and splits the prompt into the
-// static prefix (cached across requests) and the per-request part: the context, the generation
-// prompt and the opening brace of the JSON answer. The decision readout is thinking-off, so the
-// template's thinking toggle stays false unless a caller explicitly opts in.
-std::pair<std::string, std::string> render_prompt(const common_chat_templates * tmpls, bool use_jinja,
-                                                  const std::string & system_text, const std::string & context,
-                                                  bool enable_thinking = false);
-
-// {"decision": {...}, "fields": {...}} from the scores, applying each numeric field's aggregate.
-// When a field's full distribution is available (small fields scored at every trie node) the field
-// also carries `probabilities`, `confidence`, `certainty` and `legend`. `confidence_profile` picks
-// the concentration formula: "jev" (default) or "local" (see decision-protocol.h).
-common_json assemble(const compiled_schema & cs, const result & r,
-                     const std::string & confidence_profile = "jev");
-
 } // namespace llama_decision

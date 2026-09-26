@@ -27,8 +27,7 @@ struct server_decision_state {
         return false;
     }
 
-    std::unique_ptr<llama_decision::engine> decision_engine; // trie readout, created on first use
-    // Separate engine per letter-readout context: one on the shared full-logits context (seq ids
+    // One engine per letter-readout context: one on the shared full-logits context (seq ids
     // above the chat slots) and one on the classifier-only context (its own cache, seq ids from
     // zero). The readout picks between them from the compiled plan, so both stay alive together.
     std::unique_ptr<llama_decision::engine> decision_letter_engine;
@@ -54,7 +53,6 @@ struct server_decision_state {
             llama_free(ctx_decision);
             ctx_decision = nullptr;
         }
-        decision_engine.reset();
         decision_letter_engine.reset();
         decision_letter_engine_classifier.reset();
         decision_label_vocab.reset();

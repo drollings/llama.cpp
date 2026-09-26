@@ -20,6 +20,45 @@ uint64_t fnv1a64(const std::string & s) {
     return h;
 }
 
+// The stable per-(id, pass) shuffle seed. Distinct passes get distinct orders; pass 0 is identity.
+static uint64_t permutation_seed(const std::string & id, int pass) {
+    uint64_t h = fnv1a64(id);
+    h ^= (uint64_t) (uint32_t) pass * 0x9e3779b97f4a7c15ull;
+    h *= 1099511628211ull;
+    return h != 0 ? h : 1;
+}
+
+// A seeded distinct permutation of `count` indices for `id` at `pass`. Pass 0 (and any pass on a
+// single option) is the identity; a later pass is a Fisher-Yates shuffle that is forced to differ
+// from the identity so every pass actually de-biases order. Shared by the Jev and generic readouts.
+std::vector<size_t> permutation_order(size_t count, const std::string & id, int pass) {
+    std::vector<size_t> order(count);
+    for (size_t i = 0; i < count; ++i) {
+        order[i] = i;
+    }
+    if (pass <= 0 || count < 2) {
+        return order;
+    }
+    uint64_t s = permutation_seed(id, pass);
+    for (size_t i = count - 1; i > 0; --i) {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        std::swap(order[i], order[(size_t) (s % (i + 1))]);
+    }
+    bool identity = true;
+    for (size_t i = 0; i < count; ++i) {
+        if (order[i] != i) {
+            identity = false;
+            break;
+        }
+    }
+    if (identity) {
+        std::swap(order[count - 2], order[count - 1]); // a pass must actually reorder to de-bias
+    }
+    return order;
+}
+
 std::pair<std::string, std::string> split_chat_template(const common_chat_templates * tmpls, bool use_jinja,
                                                         const std::string & system_text, bool enable_thinking) {
     static const std::string sentinel = "\x1f<<decision-context>>\x1f";
@@ -398,11 +437,27 @@ decision_request parse_decision_request(const common_json & body) {
         req.model = body.at("model").get<std::string>();
     }
 
-    if (!body.contains("state")) {
-        throw semantic_error("state is required");
+    if (body.contains("contexts") && !body.at("contexts").is_null()) {
+        if (!body.at("contexts").is_array() || body.at("contexts").empty() ||
+            body.at("contexts").size() > DECISION_MAX_CONTEXTS) {
+            throw semantic_error("contexts must hold 1-" + std::to_string(DECISION_MAX_CONTEXTS) + " entries");
+        }
+        if (body.contains("state") && !body.at("state").is_null()) {
+            throw semantic_error("provide either state or contexts, not both");
+        }
+        for (const auto & c : body.at("contexts")) {
+            if (!c.is_string() || c.get<std::string>().empty()) {
+                throw semantic_error("every entry of contexts must be a non-empty string");
+            }
+            req.contexts.push_back(c);
+        }
+    } else {
+        if (!body.contains("state")) {
+            throw semantic_error("state (or contexts) is required");
+        }
+        req.state = body.at("state");
+        validate_state(req.state);
     }
-    req.state = body.at("state");
-    validate_state(req.state);
 
     if (!body.contains("questions") || !body.at("questions").is_object()) {
         throw semantic_error("questions must be an object");
@@ -542,6 +597,24 @@ std::string sha256_hex(const std::string & text) {
     return std::string(buf);
 }
 
+// The ordered level index at quantile `q` of a score distribution over levels 0..K-1, with linear
+// interpolation across the mass-bearing level. Jev's `score` is the mean; this is the skew-robust
+// spread summary the branch adds (median, and the p10/p90 band).
+static double score_quantile(const std::vector<float> & p, double q) {
+    double cum = 0.0;
+    for (size_t i = 0; i < p.size(); ++i) {
+        const double prev = cum;
+        cum += p[i];
+        if (cum >= q) {
+            if (i > 0 && p[i] > 0.0) {
+                return (double) (i - 1) + (q - prev) / (double) p[i];
+            }
+            return (double) i;
+        }
+    }
+    return (double) (p.size() - 1);
+}
+
 common_json assemble_decision_response(const decision_request & req,
                                   const std::vector<std::vector<float>> & probs,
                                   const std::string & model,
@@ -594,7 +667,14 @@ const common_json conc = concentration_metrics(p, req.confidence_profile);
                     expected += (double) i * (double) p[i];
                     legend[q.options[i].key] = q.options[i].original;
                 }
-                a["score"]         = expected;
+                a["score"]           = expected;
+                // additive spread summaries the branch adds over Jev: the skew-robust median and
+                // the 10th-90th percentile band, both over the same distribution as `score`
+                common_json band = common_json::array();
+                band.push_back(score_quantile(p, 0.10));
+                band.push_back(score_quantile(p, 0.90));
+                a["median"]          = score_quantile(p, 0.5);
+                a["interval_p10_p90"] = band;
                 a["probabilities"] = probs_obj;
                 a["legend"]        = legend;
             }

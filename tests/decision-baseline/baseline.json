@@ -22,9 +22,9 @@
   "cache_type_v": "q8_0 (production preset)"
  },
  "fixtures": [
-  "contexts_schema.request.json",
-  "compiled_schema.golden.json",
-  "decision_basic.shape.json"
+  "decision_basic.golden.json",
+  "decision_basic.shape.json",
+  "decision_letter.golden.json"
  ],
  "reference": {
   "note": "Reference /v1/decision request -> response pairs recorded on the reference model with a bit-reproducible flag set (flash attention off) and a fixed --alias so the contract hash is machine-independent. Values are the frozen oracle for byte-identity proofs: a refactor must not change these answers, and the template/contract hashes must not drift. Run-to-run timing fields are excluded.",
@@ -105,7 +105,7 @@
       "allowed_token_mass": 1.0,
       "full_vocab_argmax_id": -1,
       "option_logits": [
-       26.464126586914063,
+       26.464126586914062,
        31.677522659301758,
        31.164581298828125
       ]
