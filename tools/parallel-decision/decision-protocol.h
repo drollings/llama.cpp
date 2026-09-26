@@ -52,6 +52,11 @@ double winner_share(const std::vector<float> & p);
 // local value. It reads only the winner, unlike the entropy confidence.
 double jev_winner_share_confidence(const std::vector<float> & p);
 
+// The two producer-concentration numbers for a distribution, keyed for JSON: `confidence` (Jev or
+// opt-in entropy per `confidence_profile`) and `certainty` (winner's share). Shared by the Jev and
+// generic readouts.
+common_json concentration_metrics(const std::vector<float> & p, const std::string & confidence_profile);
+
 // Renders the chat template with a sentinel user message and returns the text before and after
 // the sentinel. `render_prompt` and `render_letter_prompt` share it and differ only in how they
 // use the split; `tmpls` must be non-null.

@@ -173,7 +173,7 @@ byte-identically; the Jev form is added beside it.
 
 ```json
 {"contexts": ["ctx1", ...], "schema": {...}, "instructions": "...",
- "mode": "auto|tree|greedy", "tree_max": 128, "cache_prompt": true}
+ "cache_prompt": true, "temperature": 1.0, "confidence_profile": "jev|local"}
 ```
 
 * `contexts`: 1-`DECISION_MAX_CONTEXTS` non-empty strings, decided in order,
@@ -182,9 +182,22 @@ byte-identically; the Jev form is added beside it.
   maximum, step, aggregate}}` or JSON-Schema `{properties: {...}}`, 1-32
   fields. Types: `boolean`, `enum` (1-255), `integer`/`number` (1-255 grid
   points, fixed-width decimals). Numeric `aggregate: mode|median|mean`.
-* `mode` default `auto` (tree if values <= `tree_max` else greedy).
-* Response for this form stays `{object:"decision", model, created,
-  results:[{decision, fields, usage}], usage, timings}` (unchanged).
+* `temperature` (optional, float > 0, default 1.0): the global softmax
+  temperature applied to every field's trie scores. There is no per-type
+  override; ship `1.0` and fit per deployment offline (Section 6).
+* `confidence_profile` (optional, `"jev"` default or `"local"`): the
+  concentration formula for each field's `confidence`, matching the Jev shape
+  semantics (Section 2.1). It never changes a value or a probability.
+* This shape always scores every field exactly (the token trie), so every
+  field's response carries the full `probabilities`, `confidence`, `certainty`
+  and `legend`. There is no greedy/approximate mode; a request whose trie needs
+  more rows than the configured budget is rejected (Section 5), never silently
+  approximated.
+* Response: `{object:"decision", model, created, results:[{decision, fields,
+  usage}], usage, timings}`. Each field entry carries `value` (the winner),
+  `probability` (the winner's share), `probabilities` (the full distribution,
+  keyed by each value's canonical string), `confidence`, `certainty`, `legend`
+  (same keys -> the typed value), and for numeric fields `interval_p10_p90`.
 
 When both shapes are supported, negotiate by request shape: presence of
 `state`+`questions` selects the letter readout; presence of `contexts`+`schema`

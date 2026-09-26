@@ -369,7 +369,9 @@ struct compiled_schema {
 
 // Accepts compact field specs {"name": {"type": ..., "description": ..., ...}} or a JSON Schema
 // object with "properties" (boolean, string+enum, integer min/max, number min/max/multipleOf).
-compiled_schema compile_schema(const common_json & schema, const std::string & instructions);
+// `temperature` is the global softmax temperature applied to every field; default 1.0.
+compiled_schema compile_schema(const common_json & schema, const std::string & instructions,
+                               float temperature = 1.0f);
 
 // Renders system + user messages with the model's chat template and splits the prompt into the
 // static prefix (cached across requests) and the per-request part: the context, the generation
@@ -380,6 +382,10 @@ std::pair<std::string, std::string> render_prompt(const common_chat_templates * 
                                                   bool enable_thinking = false);
 
 // {"decision": {...}, "fields": {...}} from the scores, applying each numeric field's aggregate.
-common_json assemble(const compiled_schema & cs, const result & r);
+// When a field's full distribution is available (small fields scored at every trie node) the field
+// also carries `probabilities`, `confidence`, `certainty` and `legend`. `confidence_profile` picks
+// the concentration formula: "jev" (default) or "local" (see decision-protocol.h).
+common_json assemble(const compiled_schema & cs, const result & r,
+                     const std::string & confidence_profile = "jev");
 
 } // namespace llama_decision

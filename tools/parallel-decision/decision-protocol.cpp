@@ -276,6 +276,17 @@ double jev_winner_share_confidence(const std::vector<float> & p) {
     return std::min(1.0, std::max(0.0, v));
 }
 
+// The two producer-concentration numbers for a distribution, keyed for JSON. `confidence` is the
+// Jev value or the opt-in entropy value per `confidence_profile`; `certainty` is the winner's
+// share. Shared by the Jev and generic readouts so the profile selection lives in one place.
+common_json concentration_metrics(const std::vector<float> & p, const std::string & confidence_profile) {
+    common_json out = common_json::object();
+    out["confidence"] = confidence_profile == "local" ? inverse_entropy_confidence(p)
+                                                      : jev_winner_share_confidence(p);
+    out["certainty"]  = winner_share(p);
+    return out;
+}
+
 bool temperature_provenance::operator==(const temperature_provenance & other) const {
     return model == other.model && quantization == other.quantization &&
            template_hash == other.template_hash && backend_flags == other.backend_flags;
@@ -567,11 +578,10 @@ common_json assemble_decision_response(const decision_request & req,
                     best = i;
                 }
             }
-a["confidence"] = req.confidence_profile == "local"
-                      ? inverse_entropy_confidence(p)   // opt-in 1 - H/log K
-                      : jev_winner_share_confidence(p); // default certainty-based (N*p_max-1)/(N-1)
+const common_json conc = concentration_metrics(p, req.confidence_profile);
+            a["confidence"] = conc.at("confidence");
             if (req.diagnostics) {
-                a["certainty"] = winner_share(p);             // max(p); additive
+                a["certainty"] = conc.at("certainty");             // max(p); additive
             }
 
             if (q.type == "choice") {

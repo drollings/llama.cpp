@@ -2705,7 +2705,25 @@ private:
             decision.decision_engine = std::make_unique<llama_decision::engine>(ctx_tgt, (llama_seq_id) params_base.n_parallel,
                                                                         params_base.n_seq_decision);
         }
-        const auto cs = llama_decision::compile_schema(body.at("schema"), body.value("instructions", std::string()));
+        float temperature = 1.0f;
+        if (body.contains("temperature") && !body.at("temperature").is_null()) {
+            if (!body.at("temperature").is_number() || !(body.at("temperature").get<double>() > 0.0)) {
+                throw std::invalid_argument("\"temperature\" must be a number > 0");
+            }
+            temperature = body.at("temperature").get<float>();
+        }
+        std::string confidence_profile = "jev";
+        if (body.contains("confidence_profile") && !body.at("confidence_profile").is_null()) {
+            if (!body.at("confidence_profile").is_string()) {
+                throw std::invalid_argument("\"confidence_profile\" must be a string");
+            }
+            confidence_profile = body.at("confidence_profile").get<std::string>();
+            if (confidence_profile != "local" && confidence_profile != "jev") {
+                throw std::invalid_argument("\"confidence_profile\" must be local or jev");
+            }
+        }
+        const auto cs = llama_decision::compile_schema(body.at("schema"), body.value("instructions", std::string()),
+                                                       temperature);
         std::string shared;
         std::vector<std::string> dynamic;
         for (const auto & c : contexts) {
@@ -2718,8 +2736,7 @@ private:
             dynamic.push_back(tail);
         }
         llama_decision::options opt;
-        opt.mode        = body.value("mode", std::string("auto"));
-        opt.tree_max    = (size_t) body.value("tree_max", 128);
+        opt.mode        = "tree"; // the generic shape always returns the exact distribution
         opt.allow_cache = body.value("cache_prompt", true);
         opt.fork        = body.value("fork", std::string("auto"));
         if (cancel_flag) {
@@ -2765,7 +2782,7 @@ private:
 
         json results = json::array();
         for (const auto & r : b.items) {
-            json item = llama_decision::assemble(cs, r);
+            json item = llama_decision::assemble(cs, r, confidence_profile);
             item["usage"] = { { "context_tokens", (long long) r.context_tokens }, { "scored_rows", r.rows } };
             results.push_back(item);
         }

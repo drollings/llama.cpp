@@ -1304,6 +1304,26 @@ std::string json_text(const std::string & s) {
     return common_json::make(s).dump();
 }
 
+// The wire key for one allowed value: its canonical scalar form. Strings stay unquoted so enum,
+// boolean and numeric keys are symmetric; `legend` carries the typed value for exact recovery.
+std::string scalar_key(const common_json & v) {
+    if (v.is_string()) {
+        return v.get<std::string>();
+    }
+    if (v.is_boolean()) {
+        return v.get<bool>() ? "true" : "false";
+    }
+    if (v.is_number_integer()) {
+        return std::to_string(v.get<long long>());
+    }
+    if (v.is_number_float()) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%g", v.get<double>());
+        return buf;
+    }
+    return v.dump();
+}
+
 field_spec make_field(const std::string & name, const std::string & type, const std::string & description,
                       const common_json & spec, bool json_schema) {
     field_spec f;
@@ -1392,7 +1412,8 @@ field_spec make_field(const std::string & name, const std::string & type, const 
 
 } // namespace
 
-compiled_schema compile_schema(const common_json & schema, const std::string & instructions) {
+compiled_schema compile_schema(const common_json & schema, const std::string & instructions,
+                               float temperature) {
     if (!schema.is_object()) {
         throw std::invalid_argument("\"schema\" must be an object");
     }
@@ -1434,6 +1455,7 @@ compiled_schema compile_schema(const common_json & schema, const std::string & i
         for (const auto & v : f.encoded) {
             in.candidates.push_back(v.substr(common.size()));
         }
+        in.temperature = temperature;
         cs.inputs.push_back(in);
 
         std::string allowed;
@@ -1459,7 +1481,7 @@ std::pair<std::string, std::string> render_prompt(const common_chat_templates * 
     return { parts.first, safe_ctx + parts.second + "{\n" };
 }
 
-common_json assemble(const compiled_schema & cs, const result & r) {
+common_json assemble(const compiled_schema & cs, const result & r, const std::string & confidence_profile) {
     common_json decision = common_json::object();
     common_json fields   = common_json::object();
     for (size_t i = 0; i < cs.specs.size(); ++i) {
@@ -1511,6 +1533,23 @@ common_json assemble(const compiled_schema & cs, const result & r) {
         f["probability"]  = (double) (fr.probs.size() == sp.values.size() ? fr.probs[idx] : fr.path_score);
         f["scored_nodes"] = fr.scored_nodes;
         f["tree"]         = fr.tree;
+        // The generic shape always scores every field exactly (tree), so this is always reached on the
+// server path. The guard stays for bench-decision, which can still run a greedy walk for
+// calibration and has no distribution to report.
+        if (fr.probs.size() == sp.values.size()) {
+            common_json probabilities = common_json::object();
+            common_json legend        = common_json::object();
+            for (size_t k = 0; k < sp.values.size(); ++k) {
+                const std::string key = scalar_key(sp.values[k]);
+                probabilities[key]    = (double) fr.probs[k];
+                legend[key]           = sp.values[k];
+            }
+            f["probabilities"] = probabilities;
+            const common_json conc = concentration_metrics(fr.probs, confidence_profile);
+            f["confidence"]    = conc.at("confidence");
+            f["certainty"]     = conc.at("certainty");
+            f["legend"]        = legend;
+        }
         fields[sp.name]   = f;
     }
     common_json out = common_json::object();
