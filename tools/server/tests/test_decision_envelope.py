@@ -134,15 +134,18 @@ def run_checks(server, captured):
     check(set(answers["urgency"]["legend"]) == {"0", "1", "2"}, "score legend keys")
     check(body["usage"]["output_tokens"] == 0, "output_tokens is always 0")
     check(set(body["usage"]) == {"input_tokens", "output_tokens"}, f"default usage is the Jev shape: {body['usage']}")
-    check(set(body) == {"model", "answers", "usage", "timings"}, f"default top-level key set: {set(body)}")
+    check(set(body) == {"model", "answers", "usage"}, f"default top-level key set: {set(body)}")
+    check("timings" not in body, "default response has no timings object")
     check(set(answers["refund"]) == {"type", "noul"}, f"default noul key set: {set(answers['refund'])}")
     check(set(answers["dept"]) == {"type", "choice", "probabilities", "confidence"},
           f"default choice key set: {set(answers['dept'])}")
-    check(set(answers["urgency"]) == {"type", "score", "probabilities", "legend", "confidence", "median", "interval_p10_p90"},
+    check(set(answers["urgency"]) == {"type", "score", "probabilities", "legend", "confidence"},
           f"default score key set: {set(answers['urgency'])}")
     check("head" not in body, "default response has no additive head object")
     check("diagnostics" not in body, "default response has no additive diagnostics object")
     check("certainty" not in answers["dept"], "default response has no additive certainty")
+    check("median" not in answers["urgency"], "default response has no additive score median")
+    check("interval_p10_p90" not in answers["urgency"], "default response has no additive score interval")
 
     # 1a. diagnostics opt-in restores the additive envelope
     # compare against a warm repeat so a cold-vs-warm fp difference cannot mask a real change
@@ -201,6 +204,15 @@ def run_checks(server, captured):
     payload = json.loads(text)
     check(payload["error"]["code"] == 422, "semantic error code 422")
 
+    # 3a. model is required (Jev requires it; the external router selects the model)
+    no_model = {k: v for k, v in DECISION_VALID.items() if k != "model"}
+    status, text = server.post("/v1/decision", json.dumps(no_model))
+    check(status == 422, f"missing model status {status}: {text}")
+    check("model" in text, f"missing model rejection names the field: {text}")
+    status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, model=7)))
+    check(status == 422, f"non-string model status {status}: {text}")
+    check("model" in text, f"non-string model rejection names the field: {text}")
+
     # 3a. a non-boolean diagnostics is a semantic error, not a truthy coercion
     status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, diagnostics="yes")))
     check(status == 422, f"non-bool diagnostics status {status}: {text}")
@@ -210,7 +222,7 @@ def run_checks(server, captured):
     #     never truncated, on both the array and legend-object criteria forms
     for levels in (1, 11):
         for crit in ([f"level {i}" for i in range(levels)], {str(i): f"level {i}" for i in range(levels)}):
-            bad_score = {"state": "s", "questions": {"q": {"type": "score", "instructions": "rate", "criteria": crit}}}
+            bad_score = {"model": "test", "state": "s", "questions": {"q": {"type": "score", "instructions": "rate", "criteria": crit}}}
             status, text = server.post("/v1/decision", json.dumps(bad_score))
             check(status == 422, f"score with {levels} levels status {status}: {text}")
             check("2-10" in text, f"score rejection names the 2-10 cap: {text}")
@@ -241,7 +253,7 @@ def run_checks(server, captured):
             check(abs(tolerant_answers[qid]["score"] - warm[qid]["score"]) < 1e-4, f"{qid} score unchanged")
 
     # an unknown field inside a question is still a semantic error
-    bad_q = {"state": "s", "questions": {"q": {"type": "noul", "instructions": "x", "bogus": 1}}}
+    bad_q = {"model": "test", "state": "s", "questions": {"q": {"type": "noul", "instructions": "x", "bogus": 1}}}
     status, text = server.post("/v1/decision", json.dumps(bad_q))
     check(status == 422, f"unknown question field status {status}: {text}")
 
@@ -251,13 +263,13 @@ def run_checks(server, captured):
         ("choice", {"type": "choice", "criteria": {"a": "x", "b": "y"}}),
         ("score", {"type": "score", "criteria": ["lo", "hi"]}),
     ):
-        status, text = server.post("/v1/decision", json.dumps({"state": "s", "questions": {"q": qbody}}))
+        status, text = server.post("/v1/decision", json.dumps({"model": "test", "state": "s", "questions": {"q": qbody}}))
         check(status == 422, f"{qtype} without instructions status {status}: {text}")
         check("instructions" in text, f"{qtype} rejection names instructions: {text}")
 
         nulled = dict(qbody)
         nulled["instructions"] = None
-        status, text = server.post("/v1/decision", json.dumps({"state": "s", "questions": {"q": nulled}}))
+        status, text = server.post("/v1/decision", json.dumps({"model": "test", "state": "s", "questions": {"q": nulled}}))
         check(status == 422, f"{qtype} with null instructions status {status}: {text}")
         check("instructions" in text, f"{qtype} null rejection names instructions: {text}")
 

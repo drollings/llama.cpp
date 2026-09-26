@@ -184,10 +184,6 @@ class engine {
 
     const llama_model * get_model() const { return model; }
 
-    // Bounded, per-engine tokenization cache: repeated prompts and candidates are encoded once.
-    size_t token_cache_size() const { return token_cache_.size(); }
-    size_t token_cache_hits() const { return token_cache_hits_; }
-
     // True when this engine's context stops the graph at the post-norm hidden state.
     bool classifier_only() const;
 
@@ -281,7 +277,6 @@ class engine {
     std::string         cached_tag;
 
     mutable std::unordered_map<std::string, tokens_t> token_cache_;
-    mutable size_t                                    token_cache_hits_ = 0;
     static constexpr size_t                           token_cache_limit_ = 1024;
 
     std::function<bool()> stop_;

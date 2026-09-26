@@ -421,7 +421,6 @@ tokens_t engine::tokenize(const std::string & text, bool add_special) const {
     const std::string key = (add_special ? "\x01" : "\x00") + text;
     const auto it = token_cache_.find(key);
     if (it != token_cache_.end()) {
-        ++token_cache_hits_;
         return it->second;
     }
     tokens_t toks = common_tokenize(vocab, text, add_special, /*parse_special=*/ true);

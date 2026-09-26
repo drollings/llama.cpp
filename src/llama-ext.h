@@ -155,7 +155,7 @@ LLAMA_API bool llama_model_classifier_supported(const struct llama_model * model
 
 // Dequantize the output (classifier) rows for the given token ids into dst. Returns the row
 // width, or zero when the model's output table is unsupported or a required id is out of range.
-// count must be in (0, 64]: a zero count or a count above 64 returns zero, so a caller can never
+// count must be in (0, 255]: a zero count or a count above 255 returns zero, so a caller can never
 // request an unbounded number of rows. dst must hold exactly count * width floats and dst_count
 // is checked against that exact size (an undersized or oversized dst_count returns zero). On
 // success the row width is returned and softcap is always written: it is the model's final logit

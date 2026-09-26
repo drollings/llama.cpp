@@ -48,20 +48,14 @@ int32_t answer_label_token(const label_vocab & vocab, const std::string & tail, 
 std::vector<int32_t> answer_label_path(const label_vocab & vocab, const std::string & tail,
                                        const std::string & text, int max_len);
 
-// A-Z, then 0-9, then the two-character AA-ZZ, A0-Z9, 0A-9Z, 00-99, each kept only when the
-// boundary resolution yields a unique, non-special 1-2 token path; at most `cap` labels. Throws
-// std::runtime_error if fewer than 2.
+// Single characters first (A-Z, a-z, 0-9, printable ASCII symbols, then accented Latin, Greek
+// and Cyrillic), then the two-character AA-ZZ, A0-Z9, 0A-9Z, 00-99, each kept only when the
+// boundary resolution yields a unique, non-special 1-2 token path; at most `cap` labels. A model
+// whose tokenizer resolves the single characters as single tokens realizes the full 255 labels.
+// Throws std::runtime_error if fewer than 2.
 inline constexpr size_t LABEL_POOL_CAP = 255;
 
 std::vector<label> build_label_pool(const label_vocab & vocab, const std::string & tail, size_t cap = LABEL_POOL_CAP);
-
-// True when encode(prompt + label) equals encode(prompt) followed by exactly
-// `label_token`. A false result means the scored slot would sit on a different
-// boundary than the caller assumes.
-bool check_boundary(const label_vocab & vocab,
-                    const std::string & prompt,
-                    const std::string & label,
-                    int32_t label_token);
 
 // Escapes "<" so state or option text cannot inject chat-template special
 // tokens (for example "<|turn>" or "<__media__>").

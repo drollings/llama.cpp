@@ -430,12 +430,15 @@ decision_request parse_decision_request(const common_json & body) {
 
     decision_request req;
 
-    if (body.contains("model") && !body.at("model").is_null()) {
-        if (!body.at("model").is_string()) {
-            throw semantic_error("model must be a string");
-        }
-        req.model = body.at("model").get<std::string>();
+    // The model is required: an external router in front of this server selects the model, and
+    // the response echoes it back. Jev requires it too, so a missing field is a 422 naming it.
+    if (!body.contains("model") || body.at("model").is_null()) {
+        throw semantic_error("model is required");
     }
+    if (!body.at("model").is_string()) {
+        throw semantic_error("model must be a string");
+    }
+    req.model = body.at("model").get<std::string>();
 
     if (body.contains("contexts") && !body.at("contexts").is_null()) {
         if (!body.at("contexts").is_array() || body.at("contexts").empty() ||
@@ -667,13 +670,16 @@ const common_json conc = concentration_metrics(p, req.confidence_profile);
                     legend[q.options[i].key] = q.options[i].original;
                 }
                 a["score"]           = expected;
-                // additive spread summaries the branch adds over Jev: the skew-robust median and
-                // the 10th-90th percentile band, both over the same distribution as `score`
-                common_json band = common_json::array();
-                band.push_back(score_quantile(p, 0.10));
-                band.push_back(score_quantile(p, 0.90));
-                a["median"]          = score_quantile(p, 0.5);
-                a["interval_p10_p90"] = band;
+                // additive spread summaries over Jev: the skew-robust median and the 10th-90th
+                // percentile band. They are diagnostics-only, so the default envelope stays the
+                // strict Jev ScoreAnswer shape.
+                if (req.diagnostics) {
+                    common_json band = common_json::array();
+                    band.push_back(score_quantile(p, 0.10));
+                    band.push_back(score_quantile(p, 0.90));
+                    a["median"]          = score_quantile(p, 0.5);
+                    a["interval_p10_p90"] = band;
+                }
                 a["probabilities"] = probs_obj;
                 a["legend"]        = legend;
             }

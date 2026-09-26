@@ -384,7 +384,7 @@
         "admission"
       ],
       "production_gate": false,
-      "verdict": "a choice keeps 2 to 64 options; over-limit is rejected before decode, never truncated",
+      "verdict": "a choice keeps 2 to 255 options; over-limit is rejected before decode, never truncated",
       "control_group": {
         "cases": [
           {
@@ -396,16 +396,16 @@
             "expect": "accepted"
           },
           {
-            "input": "64 options",
+            "input": "255 options",
             "expect": "accepted"
           },
           {
-            "input": "65 options",
+            "input": "256 options",
             "expect": "rejected"
           }
         ],
         "min_options": 2,
-        "max_options": 64
+        "max_options": 255
       }
     },
     "label_pool_capacity": {
@@ -420,7 +420,7 @@
         "caching"
       ],
       "production_gate": false,
-      "verdict": "the protocol cap is 64 (LABEL_POOL_CAP, equal to DECISION_MAX_CHOICE_OPTIONS); the realized pool is model-dependent and may be smaller; a request whose widest question needs more labels than the realized pool is a 422",
+      "verdict": "the protocol cap is 255 (LABEL_POOL_CAP, equal to DECISION_MAX_CHOICE_OPTIONS); the realized pool is model-dependent and may be smaller; a request whose widest question needs more labels than the realized pool is a 422, never a text-mode workaround",
       "control_group": {
         "cases": [
           {
@@ -433,10 +433,10 @@
           },
           {
             "input": "a double-letter vocabulary at the cap",
-            "expect": "realized pool reaches 64"
+            "expect": "realized pool reaches 255"
           }
         ],
-        "protocol_cap": 64,
+        "protocol_cap": 255,
         "realized_source": "diagnostics.label_pool_size; recorded per model in model_measurements"
       }
     },

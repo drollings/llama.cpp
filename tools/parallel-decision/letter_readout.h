@@ -19,14 +19,6 @@ namespace llama_decision {
 // Bump when the letter prompt layout changes; it is part of the prefix cache identity.
 inline constexpr const char * LETTER_PROMPT_VERSION = "letter-v2";
 
-// The text-readout prompt layout: options are scored as their own token paths, no label column.
-// Only entered when the realized label pool cannot cover the request's widest question. A distinct
-// version so its prefix cache entries and calibration identity cannot collide with the letter one.
-inline constexpr const char * LETTER_TEXT_PROMPT_VERSION = "letter-text-v1";
-
-// Longest clean token path a text-readout option key may take at the answer boundary.
-inline constexpr int LETTER_TEXT_MAX_PATH = 16;
-
 // Identity of the decision readout contract: the tokenizer identity, the framed prompt template,
 // and the label code. A template edit or a version bump changes it, so a mismatched expected hash
 // means the calibration is stale and the decision path must refuse it.
@@ -46,9 +38,6 @@ temperature_provenance decision_provenance_current(const std::string & model_nam
 
 // The fixed system instruction used by the letter readout.
 const char * letter_system_text();
-
-// The fixed system instruction used by the text readout (options scored as their own text).
-const char * letter_text_system_text();
 
 // The assistant-answer tail a label follows: `after` plus the fixed "Answer:\n" marker. One
 // definition, so the framer, the per-request gate and the server cannot drift apart.
@@ -85,17 +74,10 @@ std::pair<std::string, std::string> render_letter_prompt(const common_chat_templ
 std::pair<std::string, std::string> split_user_turn(const common_chat_templates * tmpls, bool use_jinja,
                                                     bool enable_thinking = false);
 
-// The per-question branch text, ending just before the label is generated.
-std::string format_letter_suffix(const decision_question & q, const std::vector<label> & labels,
-                                 const std::string & after);
-
 // The one option-line formatter (`label: key`, plus ` - description` only when the rendered
 // description is non-empty). The framer builds every scored option line through this, so the
 // prompt layout has a single source and an empty description never leaves a trailing separator.
 std::string format_option_line(const label & l, const decision_option & opt);
-
-// Throws semantic_error when a question needs more labels than the pool provides.
-void validate_label_capacity(const decision_request & req, size_t label_count);
 
 // Selected-head capability, resolved once per process. A populated `reason` means the projection
 // of only the answer rows is not usable, so the readout must fall back to full logits (never a
@@ -155,19 +137,10 @@ void verify_label_pool(const label_vocab & vocab, const std::vector<label> & lab
 
 // Per-request tokenizer gate: the same boundary check applied to the labels the request actually
 // uses. A mismatch throws semantic_error naming the question (HTTP 422), never a silent score.
+// This is also the hard capacity check: a question whose widest option count exceeds the realized
+// label pool is rejected, never silently truncated or worked around.
 void verify_letter_request(const label_vocab & vocab, const std::string & tail,
                            const decision_request & req, const std::vector<label> & labels);
-
-// One probability vector per question, index-aligned with q.options. Throws
-// semantic_error when a question needs more labels than the pool provides.
-std::vector<std::vector<float>> letter_readout(engine & eng,
-                                               answer_head_cache & head_cache,
-                                               const label_vocab & vocab,
-                                               const common_chat_templates * tmpls, bool use_jinja,
-                                               const decision_request & req,
-                                               const std::vector<label> & labels,
-                                               const options & opt,
-                                               letter_metrics * metrics = nullptr);
 
 // A live chat sequence to answer about instead of a stateless prompt. The readout forks `seq` at
 // `base_pos` and appends only the decision turn, so the transcript is never re-prefilled and the
@@ -189,19 +162,6 @@ struct readout_sources {
     std::string classifier_unavailable; // reason the classifier context is not usable, when null
     const session_source * session = nullptr; // live-session fork source, null for a stateless readout
 };
-
-// The layered readout: one scoring-source decision made from the compiled plan, so the server does
-// not duplicate the head-usability rule. The single-engine overload above is a thin wrapper that
-// treats a classifier-only engine as the classifier source. This overload scores the request's
-// single state (or one session fork) and returns one probability vector per question.
-std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
-                                               answer_head_cache & head_cache,
-                                               const label_vocab & vocab,
-                                               const common_chat_templates * tmpls, bool use_jinja,
-                                               const decision_request & req,
-                                               const std::vector<label> & labels,
-                                               const options & opt,
-                                               letter_metrics * metrics = nullptr);
 
 // The multi-context form: the same questions scored against every context of a `contexts`
 // request (or the single `state`, when that is set) in one batched pass. Returns one

@@ -2705,7 +2705,9 @@ private:
                 json out = llama_decision::assemble_decision_response(
                     req, all_probs.empty() ? std::vector<std::vector<float>>{} : all_probs[0],
                     echo, usage, emit_diagnostics ? &decision_diagnostics : nullptr);
-                out["timings"] = timings;
+                if (emit_diagnostics) {
+                    out["timings"] = timings;
+                }
                 return out;
             }
             // Multi-context: answers grouped per context, in request order. The `contexts` key is the
@@ -2726,8 +2728,8 @@ private:
             json out = json::object();
             out["model"]    = echo;
             out["contexts"] = contexts_resp;
-            out["timings"]  = timings;
             if (emit_diagnostics) {
+                out["timings"] = timings;
                 for (auto it = decision_diagnostics.begin(); it != decision_diagnostics.end(); ++it) {
                     out[it.key()] = it.value();
                 }

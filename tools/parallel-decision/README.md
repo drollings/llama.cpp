@@ -295,6 +295,14 @@ Letter labels are resolved at the framed answer boundary, not in isolation. A Se
 emits the bare token after the tail, so the pool is built from the tail and the letter readout
 works on both SentencePiece and BPE tokenizers.
 
+The label pool is single-character-first: A-Z, a-z, 0-9, printable ASCII symbols, then accented
+Latin, Greek and Cyrillic single characters, then the two-character composed fallback. A model
+whose tokenizer resolves the single characters as single tokens realizes the full 255-label pool
+(`LABEL_POOL_CAP`, equal to `DECISION_MAX_CHOICE_OPTIONS`). The realized pool is the hard
+capacity for a model: a request whose widest question needs more labels than the realized pool is
+a 422, never a truncated option set and never a silent text-mode workaround - the user must pick
+a model whose tokenizer resolves enough single tokens.
+
 ## Model card snippet
 
 ```yaml

@@ -14,7 +14,7 @@ returns probabilities, e.g.  "this ticket is 92% a refund question."
 The request has two mutually exclusive shapes (a body using both is a 422).
 The primary "state + questions" shape carries a `state` and a `questions`
 map; each question carries required `instructions` and is typed `noul`
-(true/false), `choice` (pick one of 2-64 options), or `score` (pick a 0..K-1
+(true/false), `choice` (pick one of 2-255 options), or `score` (pick a 0..K-1
 level on a 2-10 scale), and the server scores one
 next-token choice over verified single-token letter labels, sharing one
 framed state prefix across all questions.  The legacy "contexts + schema"

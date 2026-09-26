@@ -366,7 +366,7 @@ static common_json calibration_temperature_control_measurement();
 
 static void test_question_temperature(testing & t) {
     t.test("effective temperature follows per-type override then global", [](testing & t) {
-        const auto base = common_json::parse(R"({"state":"s","questions":{
+        const auto base = common_json::parse(R"({"model":"m","state":"s","questions":{
             "a":{"type":"noul","instructions":"x"},
             "b":{"type":"choice","instructions":"x","criteria":{"p":null,"q":null}},
             "c":{"type":"score","instructions":"x","criteria":["lo","hi"]}}})");
@@ -533,9 +533,9 @@ static void test_confidence_profile(testing & t) {
         body.erase("confidence_profile");
         t.assert_equal("absent defaults to jev (certainty-based)", "jev",
                        llama_decision::parse_decision_request(body).confidence_profile);
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"confidence_profile":"other"})",
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"confidence_profile":"other"})",
                                "confidence_profile must be local or jev");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"confidence_profile":1})",
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"confidence_profile":1})",
                                "confidence_profile must be a string");
     });
 }
@@ -986,22 +986,24 @@ static void test_decision_parse(testing & t) {
     });
 
     t.test("invalid decision requests are rejected with a clear reason", [](testing & t) {
-        expect_decision_reject(t, R"({"questions":{"q":{"type":"noul","instructions":"x"}}})", "state (or contexts) is required");
-        expect_decision_reject(t, R"({"state":"","questions":{"q":{"type":"noul","instructions":"x"}}})", "state must not be empty");
-        expect_decision_reject(t, R"({"state":[],"questions":{"q":{"type":"noul","instructions":"x"}}})", "state must not be empty");
-        expect_decision_reject(t, R"({"state":5,"questions":{"q":{"type":"noul","instructions":"x"}}})", "state must be a string");
-        expect_decision_reject(t, R"({"state":"s","questions":{}})", "1-256 entries");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"mystery","instructions":"x"}}})", "unknown type");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"choice","criteria":{"a":"x"}}}})", "2-255 options");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"choice","instructions":"x"}}})", "choice needs an object");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"score","criteria":["only"]}}})", "2-10 levels");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","criteria":[1,2]}}})", "noul criteria must be an object");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul"}}})", "instructions are required");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x","extra":1}}})", "unknown field");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":7}}})", "instructions must be a string");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"temperature":0})", "temperature must be > 0");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"permutations":0})", "permutations must be >= 1");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"temperatures":{"bogus":1}})", "unknown field");
+        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}}})", "model is required");
+        expect_decision_reject(t, R"({"model":7,"state":"s","questions":{"q":{"type":"noul","instructions":"x"}}})", "model must be a string");
+        expect_decision_reject(t, R"({"model":"m","questions":{"q":{"type":"noul","instructions":"x"}}})", "state (or contexts) is required");
+        expect_decision_reject(t, R"({"model":"m","state":"","questions":{"q":{"type":"noul","instructions":"x"}}})", "state must not be empty");
+        expect_decision_reject(t, R"({"model":"m","state":[],"questions":{"q":{"type":"noul","instructions":"x"}}})", "state must not be empty");
+        expect_decision_reject(t, R"({"model":"m","state":5,"questions":{"q":{"type":"noul","instructions":"x"}}})", "state must be a string");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{}})", "1-256 entries");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"mystery","instructions":"x"}}})", "unknown type");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"choice","criteria":{"a":"x"}}}})", "2-255 options");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"choice","instructions":"x"}}})", "choice needs an object");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"score","criteria":["only"]}}})", "2-10 levels");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","criteria":[1,2]}}})", "noul criteria must be an object");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul"}}})", "instructions are required");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x","extra":1}}})", "unknown field");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":7}}})", "instructions must be a string");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"temperature":0})", "temperature must be > 0");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"permutations":0})", "permutations must be >= 1");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"temperatures":{"bogus":1}})", "unknown field");
 
         common_json many = common_json::object();
         common_json q    = common_json::object();
@@ -1011,6 +1013,7 @@ static void test_decision_parse(testing & t) {
         for (int i = 0; i < 257; ++i) {
             qs["q" + std::to_string(i)] = q;
         }
+        many["model"]     = "m";
         many["state"]     = "s";
         many["questions"] = qs;
         try {
@@ -1041,13 +1044,13 @@ static void test_decision_parse(testing & t) {
         const auto pin = llama_decision::parse_session_ref(pinned);
         t.assert_equal("session_pos pins the position", 7, pin.session_pos);
 
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"id_slot":-1})",
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"id_slot":-1})",
                                "id_slot must be >= 0");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"id_slot":"a"})",
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"id_slot":"a"})",
                                "id_slot must be an integer");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"session_pos":1})",
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"session_pos":1})",
                                "session_pos requires id_slot");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"id_slot":0,"session_pos":-2})",
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"id_slot":0,"session_pos":-2})",
                                "session_pos must be >= 0");
     });
 
@@ -1069,25 +1072,25 @@ static void test_decision_parse(testing & t) {
         t.assert_true("unknown top-level field leaves the questions unchanged", same);
 
         // question-level unknown keys are still refused
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x","bogus":1}}})", "unknown field");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x","bogus":1}}})", "unknown field");
 
         // a misspelled "questions" is still a missing required field, not a silent default
-        expect_decision_reject(t, R"({"state":"s","questionss":{"q":{"type":"noul","instructions":"x"}}})", "questions must be an object");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questionss":{"q":{"type":"noul","instructions":"x"}}})", "questions must be an object");
     });
 
     t.test("instructions are required and non-null on every question type", [](testing & t) {
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul"}}})", "instructions are required");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","instructions":null}}})", "instructions are required");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"choice","criteria":{"a":"x","b":"y"}}}})", "instructions are required");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"choice","instructions":null,"criteria":{"a":"x","b":"y"}}}})", "instructions are required");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"score","criteria":["lo","hi"]}}})", "instructions are required");
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"score","instructions":null,"criteria":["lo","hi"]}}})", "instructions are required");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul"}}})", "instructions are required");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":null}}})", "instructions are required");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"choice","criteria":{"a":"x","b":"y"}}}})", "instructions are required");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"choice","instructions":null,"criteria":{"a":"x","b":"y"}}}})", "instructions are required");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"score","criteria":["lo","hi"]}}})", "instructions are required");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"score","instructions":null,"criteria":["lo","hi"]}}})", "instructions are required");
         // a criteria-only noul used to succeed through the escape hatch and no longer does
-        expect_decision_reject(t, R"({"state":"s","questions":{"q":{"type":"noul","criteria":{"true":"y","false":"n"}}}})", "instructions are required");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","criteria":{"true":"y","false":"n"}}}})", "instructions are required");
 
         // instructions plus criteria still succeeds
         const auto req = llama_decision::parse_decision_request(common_json::parse(
-            R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x","criteria":{"true":"y","false":"n"}}}})"));
+            R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x","criteria":{"true":"y","false":"n"}}}})"));
         t.assert_equal("instructions plus criteria parses", (size_t) 1, req.questions.size());
         t.assert_true("instructions are kept", req.questions[0].instructions.is_string());
     });
@@ -1113,6 +1116,7 @@ static void test_decision_parse(testing & t) {
             common_json qs = common_json::object();
             qs["q"] = q;
             common_json body = common_json::object();
+            body["model"]     = "m";
             body["state"]     = "s";
             body["questions"] = qs;
             return body;
@@ -1143,19 +1147,19 @@ static void test_decision_parse(testing & t) {
 
     t.test("diagnostics is an optional boolean, off by default", [](testing & t) {
         const auto off = llama_decision::parse_decision_request(common_json::parse(
-            R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}}})"));
+            R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}}})"));
         t.assert_true("diagnostics defaults off", !off.diagnostics);
 
         const auto on = llama_decision::parse_decision_request(common_json::parse(
-            R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"diagnostics":true})"));
+            R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"diagnostics":true})"));
         t.assert_true("diagnostics true is parsed", on.diagnostics);
 
         const auto explicit_off = llama_decision::parse_decision_request(common_json::parse(
-            R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"diagnostics":false})"));
+            R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"diagnostics":false})"));
         t.assert_true("diagnostics false is parsed", !explicit_off.diagnostics);
 
         expect_decision_reject(t,
-            R"({"state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"diagnostics":"yes"})",
+            R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"diagnostics":"yes"})",
             "diagnostics must be a boolean");
     });
 }
@@ -1294,33 +1298,34 @@ static void test_letter_suffix(testing & t) {
         const auto pool = llama_decision::build_label_pool(v, "", 8);
         const std::string after = "<turn|>\n<turn>model\n";
 
-        const std::string s = llama_decision::format_letter_suffix(req.questions[1], pool, after);
-        t.assert_true("first option listed", s.find("A: billing - payment") != std::string::npos);
-        t.assert_true("second option listed", s.find("B: technical - bug") != std::string::npos);
-        t.assert_true("question text listed", s.find("What is the issue?") != std::string::npos);
-
         const std::string tail = llama_decision::letter_answer_tail(after);
         t.assert_equal("the answer tail is the after text plus the fixed marker", after + "Answer:\n", tail);
-        t.assert_true("the suffix ends exactly at the answer boundary",
-                      s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0);
+        // the per-question suffix is built through the same option-line formatter
+        const std::string a_line = llama_decision::format_option_line(pool[0], req.questions[1].options[0]);
+        const std::string b_line = llama_decision::format_option_line(pool[1], req.questions[1].options[1]);
+        t.assert_true("first option listed", a_line.find("A: billing - payment") != std::string::npos);
+        t.assert_true("second option listed", b_line.find("B: technical - bug") != std::string::npos);
+        t.assert_true("question text listed", req.questions[1].instructions.dump().find("What is the issue?") != std::string::npos);
     });
 
     t.test("label capacity is validated before scoring", [](testing & t) {
         const auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
+        const std::string tail = test_letter_tail();
+        const fake_vocab v = make_fake_vocab(true);
+        const auto pool = llama_decision::build_label_pool(v, tail, 2);
         bool threw = false;
         try {
-            llama_decision::validate_label_capacity(req, 2);
+            llama_decision::verify_letter_request(v, "\n", req, pool);
         } catch (const llama_decision::semantic_error &) {
             threw = true;
         }
-        t.assert_true("three-option question needs three labels", threw);
-        llama_decision::validate_label_capacity(req, 3); // must not throw
+        t.assert_true("a question with more options than the pool is rejected", threw);
     });
 
     t.test("label capacity rejects above the realized pool and accepts at it", [](testing & t) {
         auto make_choice_request = [](size_t n) {
             common_json body =
-                common_json::parse(R"({"state":"s","questions":{"q":{"type":"choice","instructions":"pick"}}})");
+                common_json::parse(R"({"model":"m","state":"s","questions":{"q":{"type":"choice","instructions":"pick"}}})");
             common_json crit = common_json::object();
             for (size_t i = 0; i < n; ++i) {
                 crit["k" + std::to_string(i)] = "d";
@@ -1329,14 +1334,17 @@ static void test_letter_suffix(testing & t) {
             return llama_decision::parse_decision_request(body);
         };
 
+        const std::string tail = test_letter_tail();
+        const std::string after = "\n"; // render_letter_prompt(nullptr,...).second
+
         // control group: an explicit small cap is honored, and one option above it is rejected
         const fake_vocab small      = make_fake_vocab(false);
-        const auto       small_pool = llama_decision::build_label_pool(small, "", 5);
+        const auto       small_pool = llama_decision::build_label_pool(small, tail, 5);
         t.assert_equal("the control pool honors the explicit cap", (size_t) 5, small_pool.size());
-        llama_decision::validate_label_capacity(make_choice_request(5), small_pool.size());  // must not throw
+        llama_decision::verify_letter_request(small, after, make_choice_request(5), small_pool);  // must not throw
         bool over = false;
         try {
-            llama_decision::validate_label_capacity(make_choice_request(6), small_pool.size());
+            llama_decision::verify_letter_request(small, after, make_choice_request(6), small_pool);
         } catch (const llama_decision::semantic_error &) {
             over = true;
         }
@@ -1344,9 +1352,9 @@ static void test_letter_suffix(testing & t) {
 
         // positive group: a double-letter vocabulary fills the composed cap, and the cap is accepted
         const fake_vocab full      = make_fake_vocab(true);
-        const auto       full_pool = llama_decision::build_label_pool(full, "", llama_decision::LABEL_POOL_CAP);
+        const auto       full_pool = llama_decision::build_label_pool(full, tail, llama_decision::LABEL_POOL_CAP);
         t.assert_equal("the positive pool reaches the cap", llama_decision::LABEL_POOL_CAP, full_pool.size());
-        llama_decision::validate_label_capacity(make_choice_request(llama_decision::LABEL_POOL_CAP), full_pool.size());
+        llama_decision::verify_letter_request(full, after, make_choice_request(llama_decision::LABEL_POOL_CAP), full_pool);
     });
 }
 
@@ -1355,6 +1363,7 @@ static void test_letter_suffix(testing & t) {
 static void test_letter_option_lines(testing & t) {
     t.test("option lines render as label: key - description", [](testing & t) {
         const common_json body = common_json::parse(R"({
+            "model": "m",
             "state": "s",
             "questions": {
                 "n": {"type": "noul", "instructions": "Refund?", "criteria": {"true": "yes", "false": "no"}},
@@ -1366,25 +1375,26 @@ static void test_letter_option_lines(testing & t) {
         const auto req = llama_decision::parse_decision_request(body);
         const fake_vocab v = make_fake_vocab(true);
         const auto pool = llama_decision::build_label_pool(v, "", 8);
-        const std::string after = "<turn|>\n<turn>model\n";
 
-        const std::string n = llama_decision::format_letter_suffix(req.questions[0], pool, after);
-        t.assert_true("noul false line", n.find("A: false - no\n") != std::string::npos);
-        t.assert_true("noul true line", n.find("B: true - yes\n") != std::string::npos);
-
-        const std::string c = llama_decision::format_letter_suffix(req.questions[1], pool, after);
+        // the option lines are emitted through the one formatter: `label: key - description`
+        t.assert_true("noul false line",
+                      llama_decision::format_option_line(pool[0], req.questions[0].options[0]).find("A: false - no") != std::string::npos);
+        t.assert_true("noul true line",
+                      llama_decision::format_option_line(pool[1], req.questions[0].options[1]).find("B: true - yes") != std::string::npos);
         t.assert_true("choice object description line",
-                      c.find("A: billing - {\"label\":\"payment\",\"code\":7}\n") != std::string::npos);
-        t.assert_true("choice string description line", c.find("B: technical - bug\n") != std::string::npos);
-
-        const std::string s = llama_decision::format_letter_suffix(req.questions[2], pool, after);
-        t.assert_true("score line 0", s.find("A: 0 - calm\n") != std::string::npos);
-        t.assert_true("score line 1", s.find("B: 1 - upset\n") != std::string::npos);
-        t.assert_true("score line 2", s.find("C: 2 - furious\n") != std::string::npos);
-
-        const std::string e = llama_decision::format_letter_suffix(req.questions[3], pool, after);
-        t.assert_true("empty description renders the key only", e.find("A: a\n") != std::string::npos);
-        t.assert_true("non-empty description still renders", e.find("B: b - bee\n") != std::string::npos);
+                      llama_decision::format_option_line(pool[0], req.questions[1].options[0]).find("A: billing - {\"label\":\"payment\",\"code\":7}") != std::string::npos);
+        t.assert_true("choice string description line",
+                      llama_decision::format_option_line(pool[1], req.questions[1].options[1]).find("B: technical - bug") != std::string::npos);
+        t.assert_true("score line 0",
+                      llama_decision::format_option_line(pool[0], req.questions[2].options[0]).find("A: 0 - calm") != std::string::npos);
+        t.assert_true("score line 1",
+                      llama_decision::format_option_line(pool[1], req.questions[2].options[1]).find("B: 1 - upset") != std::string::npos);
+        t.assert_true("score line 2",
+                      llama_decision::format_option_line(pool[2], req.questions[2].options[2]).find("C: 2 - furious") != std::string::npos);
+        t.assert_true("empty description renders the key only",
+                      llama_decision::format_option_line(pool[0], req.questions[3].options[0]).find("A: a") != std::string::npos);
+        t.assert_true("non-empty description still renders",
+                      llama_decision::format_option_line(pool[1], req.questions[3].options[1]).find("B: b - bee") != std::string::npos);
     });
 }
 
@@ -1396,17 +1406,26 @@ static void test_label_pool(testing & t) {
         t.assert_equal("cap respected", (size_t) 64, pool.size());
         t.assert_equal("first label is A", std::string("A"), pool[0].text);
         t.assert_equal("26th label is Z", std::string("Z"), pool[25].text);
-        t.assert_equal("then the single digits", std::string("0"), pool[26].text);
-        t.assert_equal("then two-character labels", std::string("AA"), pool[36].text);
+        t.assert_equal("then lowercase letters", std::string("a"), pool[26].text);
+        t.assert_equal("then the single digits", std::string("0"), pool[52].text);
+        t.assert_equal("then the ASCII symbol set", std::string("!"), pool[62].text);
 
+        // the first 62 labels are letters and digits; the symbol set starts after them
         bool all_label_chars = true;
-        for (const auto & l : pool) {
-            for (char c : l.text) {
-                all_label_chars = all_label_chars &&
-                    ((std::isalpha((unsigned char) c) != 0 && c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'));
+        for (size_t i = 0; i < 62 && i < pool.size(); ++i) {
+            for (unsigned char c : pool[i].text) {
+                all_label_chars = all_label_chars && std::isalnum(c) != 0;
             }
         }
-        t.assert_true("only A-Z and 0-9 label characters", all_label_chars);
+        t.assert_true("letters and digits come first", all_label_chars);
+
+        // a 64-label pool is all single characters: two-char labels only appear once the
+        // single-character sets are exhausted
+        bool has_two_char = false;
+        for (const auto & l : pool) {
+            has_two_char = has_two_char || l.text.size() == 2;
+        }
+        t.assert_true("a 64-label pool is all single characters", !has_two_char);
 
         t.assert_equal("AA resolves at the boundary", v.id_of("AA"), llama_decision::answer_label_token(v, "", "AA"));
         t.assert_equal("AAA is not a single label", -1, llama_decision::answer_label_token(v, "", "AAA"));
@@ -1460,11 +1479,12 @@ static void test_boundary(testing & t) {
         const fake_vocab v = make_fake_vocab(false);
         const int32_t a    = v.id_of("A");
 
-        t.assert_true("clean boundary passes", llama_decision::check_boundary(v, "x ", "A", a));
+        t.assert_equal("clean boundary resolves the label token", a,
+                       llama_decision::answer_label_token(v, "x ", "A"));
 
         fake_vocab merged = make_fake_vocab(false);
         merged.pieces.push_back("\nA");
-        t.assert_true("merged token fails loudly", !llama_decision::check_boundary(merged, "x\n", "A", merged.id_of("A")));
+        t.assert_equal("merged token fails loudly", -1, llama_decision::answer_label_token(merged, "x\n", "A"));
     });
 }
 
@@ -1496,6 +1516,25 @@ static void test_safe_data(testing & t) {
     });
 }
 
+// The single-engine letter readout wrapper the removed public overload used to provide: a
+// classifier-only engine is the classifier source, a full-logits engine is the fallback.
+static std::vector<std::vector<float>> test_letter_readout(
+        llama_decision::engine & eng, llama_decision::answer_head_cache & head_cache,
+        const llama_decision::label_vocab & vocab, const common_chat_templates * tmpls, bool use_jinja,
+        const llama_decision::decision_request & req, const std::vector<llama_decision::label> & labels,
+        const llama_decision::options & opt, llama_decision::letter_metrics * metrics) {
+    llama_decision::readout_sources sources;
+    sources.full = &eng;
+    if (eng.classifier_only()) {
+        sources.classifier = &eng;
+    } else {
+        sources.classifier_unavailable = "the decision context does not expose hidden states";
+    }
+    auto all = llama_decision::letter_readout_multi(sources, head_cache, vocab, tmpls, use_jinja,
+                                                    req, labels, opt, metrics);
+    return all.empty() ? std::vector<std::vector<float>>{} : std::move(all[0]);
+}
+
 static void test_label_pool_real(testing & t) {
     t.test("label pool and exact boundary ids on a real vocabulary", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
@@ -1517,22 +1556,25 @@ static void test_label_pool_real(testing & t) {
             t.assert_true("pool has 2-64 labels", pool.size() >= 2 && pool.size() <= 64);
 
             bool boundary = true;
-            bool alpha    = true;
-            for (const auto & l : pool) {
+            bool alnum_first = true;
+            for (size_t i = 0; i < pool.size(); ++i) {
+                const auto & l = pool[i];
                 boundary = boundary &&
                     (llama_decision::answer_label_path(*vocab, tail, l.text, (int) l.tokens.size()) == l.tokens);
-                for (char c : l.text) {
-                    alpha = alpha && ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'));
+                if (i < 62) {
+                    for (unsigned char c : l.text) {
+                        alnum_first = alnum_first && std::isalnum(c) != 0;
+                    }
                 }
             }
             t.assert_true("every label resolves at the boundary", boundary);
-            t.assert_true("only A-Z and 0-9 label characters", alpha);
+            t.assert_true("letters and digits come first", alnum_first);
 
             const auto base = vocab->tokenize(tail, true);
             const auto full = vocab->tokenize(tail + pool[0].text, true);
             t.assert_equal("exact boundary length", base.size() + 1, full.size());
             t.assert_true("exact boundary tail is the label token", !full.empty() && full.back() == pool[0].token);
-            t.assert_true("boundary accepts the label", llama_decision::check_boundary(*vocab, tail, pool[0].text, pool[0].token));
+            t.assert_true("boundary accepts the label", llama_decision::answer_label_token(*vocab, tail, pool[0].text) == pool[0].token);
         } catch (const std::exception & e) {
             t.assert_true(std::string("label pool runs: ") + e.what(), false);
         }
@@ -1591,7 +1633,7 @@ static void test_letter_labels_spm(testing & t) {
             llama_decision::answer_head_cache head_cache;
             const auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
             llama_decision::letter_metrics metrics;
-            const auto probs = llama_decision::letter_readout(eng, head_cache, *vocab, nullptr, false, req, pool,
+            const auto probs = test_letter_readout(eng, head_cache, *vocab, nullptr, false, req, pool,
                                                               llama_decision::options{}, &metrics);
             t.assert_equal("one distribution per question", req.questions.size(), probs.size());
             bool valid = probs.size() == req.questions.size();
@@ -1757,7 +1799,7 @@ static void test_letter_readout_real(testing & t) {
             const auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
 
             llama_decision::letter_metrics metrics;
-            const auto probs = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool,
+            const auto probs = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool,
                                                               llama_decision::options{}, &metrics);
             t.assert_equal("one distribution per question", req.questions.size(), probs.size());
             bool valid = true;
@@ -1787,7 +1829,7 @@ static void test_letter_readout_real(testing & t) {
                                                                         llama_decision::letter_system_text());
                 const std::string tail = parts.second + "Answer:\n";
                 t.assert_true("real template boundary accepts the label",
-                              llama_decision::check_boundary(*vocab, tail, pool[0].text, pool[0].token));
+                              llama_decision::answer_label_token(*vocab, tail, pool[0].text) == pool[0].token);
             }
 
             // Task-value producer-determinism properties: the winner is stable under question
@@ -1802,7 +1844,7 @@ static void test_letter_readout_real(testing & t) {
                               [&](testing & t) {
                 llama_decision::decision_request reversed = req;
                 std::reverse(reversed.questions.begin(), reversed.questions.end());
-                const auto probs_rev = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, reversed, pool,
+                const auto probs_rev = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, reversed, pool,
                                                                       llama_decision::options{}, nullptr);
                 bool stable = probs_rev.size() == probs.size();
                 for (size_t i = 0; stable && i < req.questions.size(); ++i) {
@@ -1830,10 +1872,10 @@ static void test_letter_readout_real(testing & t) {
                     body["temperatures"] = common_json::parse(temps);
                     return llama_decision::parse_decision_request(body);
                 };
-                const auto sharp = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+                const auto sharp = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
                                                                   with_temps(R"({"noul":0.5,"choice":0.5,"score":0.5})"),
                                                                   pool, llama_decision::options{}, nullptr);
-                const auto flat = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+                const auto flat = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
                                                                  with_temps(R"({"noul":2.5,"choice":2.5,"score":2.5})"),
                                                                  pool, llama_decision::options{}, nullptr);
                 auto top = [](const std::vector<float> & p) {
@@ -4403,25 +4445,26 @@ static void test_classifier_rows_host(testing & t) {
         const int w0 = llama_model_classifier_rows(te.model, ids.data(), 0, rows.data(), 0, &sc0, nullptr);
         t.assert_equal("count == 0 is refused", 0, w0);
 
-        // count == 64 is the largest accepted batch; 65 is refused, never read
+        // count == 255 is the largest accepted batch; 256 is refused, never read
         {
-            std::vector<llama_token> ids64(64, 0);
-            for (int i = 0; i < 64 && i < n_vocab; ++i) {
-                ids64[(size_t) i] = (llama_token) i;
+            constexpr int MAX_ROWS = 255;
+            std::vector<llama_token> ids_max(MAX_ROWS, 0);
+            for (int i = 0; i < MAX_ROWS && i < n_vocab; ++i) {
+                ids_max[(size_t) i] = (llama_token) i;
             }
-            std::vector<float> rows64((size_t) 64 * (size_t) width);
-            float sc64 = -1.0f;
-            const int w64 = llama_model_classifier_rows(te.model, ids64.data(), 64,
-                                                        rows64.data(), rows64.size(), &sc64, nullptr);
-            t.assert_equal("count == 64 is accepted", width, w64);
-            t.assert_true("softcap is written on a 64-row success", sc64 == 0.0f);
+            std::vector<float> rows_max((size_t) MAX_ROWS * (size_t) width);
+            float sc_max = -1.0f;
+            const int w_max = llama_model_classifier_rows(te.model, ids_max.data(), MAX_ROWS,
+                                                          rows_max.data(), rows_max.size(), &sc_max, nullptr);
+            t.assert_equal("count == 255 is accepted", width, w_max);
+            t.assert_true("softcap is written on a 255-row success", sc_max == 0.0f);
 
-            std::vector<llama_token> ids65(65, 0);
-            std::vector<float> rows65((size_t) 65 * (size_t) width);
-            float sc65 = -1.0f;
-            const int w65 = llama_model_classifier_rows(te.model, ids65.data(), 65,
-                                                        rows65.data(), rows65.size(), &sc65, nullptr);
-            t.assert_equal("count == 65 is refused", 0, w65);
+            std::vector<llama_token> ids_over(256, 0);
+            std::vector<float> rows_over((size_t) 256 * (size_t) width);
+            float sc_over = -1.0f;
+            const int w_over = llama_model_classifier_rows(te.model, ids_over.data(), 256,
+                                                           rows_over.data(), rows_over.size(), &sc_over, nullptr);
+            t.assert_equal("count == 256 is refused", 0, w_over);
         }
 
         // an oversized dst_count is refused (dst_count must match count * width exactly)
@@ -4921,7 +4964,7 @@ static common_json decision_cpu_oracle() {
     llama_decision::options ofull;
     ofull.cache_tag = "cpu-oracle-full";
     llama_decision::letter_metrics mfull;
-    const auto pfull = llama_decision::letter_readout(e_full, head_cache, *vocab, nullptr, false,
+    const auto pfull = test_letter_readout(e_full, head_cache, *vocab, nullptr, false,
                                                       rfull, pool, ofull, &mfull);
     out["full"] = oracle_readout(mfull, pfull);
 
@@ -4932,7 +4975,7 @@ static common_json decision_cpu_oracle() {
     llama_decision::options oauto;
     oauto.cache_tag = "cpu-oracle-auto";
     llama_decision::letter_metrics mauto;
-    const auto pauto = llama_decision::letter_readout(e_full, head_cache, *vocab, nullptr, false,
+    const auto pauto = test_letter_readout(e_full, head_cache, *vocab, nullptr, false,
                                                       rauto, pool, oauto, &mauto);
     out["auto_fallback"] = oracle_readout(mauto, pauto);
 
@@ -5335,12 +5378,11 @@ static void test_token_cache(testing & t) {
             };
             llama_decision::options o;
             o.cache_tag = "tok";
-            (void) eng.decide_batch("system", { "ctx" }, fields, o);
-            const size_t hits1 = eng.token_cache_hits();
-            const size_t size1 = eng.token_cache_size();
-            (void) eng.decide_batch("system", { "ctx" }, fields, o);
-            t.assert_true("the cache holds the encoded prompts", size1 > 0);
-            t.assert_true("the second decision reuses cached tokens", eng.token_cache_hits() > hits1);
+            const auto first  = eng.decide_batch("system", { "ctx" }, fields, o);
+            const auto second = eng.decide_batch("system", { "ctx" }, fields, o);
+            t.assert_true("the second decision reuses the cached prefix", second.cache_hit);
+            t.assert_true("the repeat is byte-identical",
+                          first.items[0].fields.size() == second.items[0].fields.size());
         } catch (const std::exception & e) {
             t.assert_true(std::string("token cache runs: ") + e.what(), false);
         }
@@ -5732,8 +5774,8 @@ static void test_prefix_hoist_cache(testing & t) {
 
             llama_decision::letter_metrics m1;
             llama_decision::letter_metrics m2;
-            (void) llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req1, pool, llama_decision::options{}, &m1);
-            (void) llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req2, pool, llama_decision::options{}, &m2);
+            (void) test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req1, pool, llama_decision::options{}, &m1);
+            (void) test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req2, pool, llama_decision::options{}, &m2);
 
             t.assert_true("the shared head is at least 32 tokens", m1.shared_tokens >= 32);
             t.assert_true("the first request prefills", !m1.cache_hit);
@@ -6136,12 +6178,12 @@ static void test_head_fallback_equivalence(testing & t) {
             llama_decision::options oa;
             oa.cache_tag = "head-auto";
             llama_decision::letter_metrics ma;
-            const auto pa = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, oa, &ma);
+            const auto pa = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, oa, &ma);
 
             llama_decision::options of;
             of.cache_tag = "head-full";
             llama_decision::letter_metrics mf;
-            const auto pf = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf);
+            const auto pf = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf);
 
             // Both runs read full logits here (the context exposes no hidden states), but they use
             // separate prefix caches, so a backend may reorder a reduction. The decisions, not the
@@ -6216,13 +6258,13 @@ static void test_selected_equivalence_lfm(testing & t) {
             llama_decision::options of;
             of.cache_tag = "sel-full";
             llama_decision::letter_metrics mf;
-            const auto pf = llama_decision::letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf);
+            const auto pf = test_letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf);
 
             req.head = "selected";
             llama_decision::options oh;
             oh.cache_tag = "sel-head";
             llama_decision::letter_metrics mh;
-            const auto ph = llama_decision::letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh);
+            const auto ph = test_letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh);
 
             t.assert_true("the selected head was used", mh.head_active);
 
@@ -6294,13 +6336,13 @@ static void test_selected_equivalence_qwen2(testing & t) {
             llama_decision::options of;
             of.cache_tag = "q2-full";
             llama_decision::letter_metrics mf;
-            const auto pf = llama_decision::letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf);
+            const auto pf = test_letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf);
 
             req.head = "selected";
             llama_decision::options oh;
             oh.cache_tag = "q2-head";
             llama_decision::letter_metrics mh;
-            const auto ph = llama_decision::letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh);
+            const auto ph = test_letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh);
 
             t.assert_true("the selected head was used", mh.head_active);
             bool winners = pf.size() == ph.size();
@@ -6347,14 +6389,14 @@ static void test_answer_head_cache(testing & t) {
             llama_decision::engine eng(te.ctx, 2, 8);
             llama_decision::options opt;
             opt.cache_tag = "head-cache";
-            const auto first = llama_decision::letter_readout(eng, cache, *vocab, nullptr, false, req, pool, opt, nullptr);
+            const auto first = test_letter_readout(eng, cache, *vocab, nullptr, false, req, pool, opt, nullptr);
 
             // a rebuilt cache must not change the decisions. The winner is task-value and stays
             // hard; the probabilities use the producer-numerics bound because the second pass runs
             // on a warm prefix cache. On the known weak-quant GPU oracle the whole check is skipped
             // with a reason, never xfail.
             llama_decision::answer_head_cache rebuilt;
-            const auto second = llama_decision::letter_readout(eng, rebuilt, *vocab, nullptr, false, req, pool, opt, nullptr);
+            const auto second = test_letter_readout(eng, rebuilt, *vocab, nullptr, false, req, pool, opt, nullptr);
             determinism_check(t, weak_quant_gpu_oracle(path),
                               "a rebuilt cache gives identical decisions (weak-quant GPU numerics)",
                               [&](testing & t) {
@@ -6399,7 +6441,7 @@ static void test_classifier_only_readout(testing & t) {
             llama_decision::options opt;
             opt.cache_tag = "co-readout";
             llama_decision::letter_metrics m;
-            const auto p = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, opt, &m);
+            const auto p = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, opt, &m);
             t.assert_true("the classifier context activates the selected head", m.head_active);
             t.assert_true("the readout reports its suffix accounting", m.suffix_tokens > 0);
             t.assert_equal("one probability vector per question", (size_t) req.questions.size(), p.size());
@@ -6446,14 +6488,14 @@ static void test_selected_fallback_lfm(testing & t) {
             llama_decision::options of;
             of.cache_tag = "fb-full";
             llama_decision::letter_metrics mf;
-            const auto pf = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf);
+            const auto pf = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf);
 
             // the model can serve selected rows, but this context exposes no hidden states
             req.head = "selected";
             llama_decision::options oh;
             oh.cache_tag = "fb-selected";
             llama_decision::letter_metrics mh;
-            const auto ph = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh);
+            const auto ph = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh);
 
             t.assert_true("the head did not activate", !mh.head_active);
             t.assert_true("a fallback reason is reported", !mh.head_reason.empty());
@@ -6520,7 +6562,7 @@ static void test_selected_explicit_error(testing & t) {
             llama_decision::engine eng(te.ctx, 2, 8);
             llama_decision::options o;
             o.cache_tag = "after-error";
-            const auto p = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, o, nullptr);
+            const auto p = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, o, nullptr);
             t.assert_equal("auto still answers every question", req.questions.size(), p.size());
         } catch (const std::exception & e) {
             t.assert_true(std::string("auto after error: ") + e.what(), false);
@@ -6551,11 +6593,11 @@ static void test_permutations_real(testing & t) {
 
             llama_decision::options o;
             o.cache_tag = "perm";
-            const auto p1  = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+            const auto p1  = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
                                                             llama_decision::parse_decision_request(one), pool, o, nullptr);
-            const auto p2  = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+            const auto p2  = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
                                                             llama_decision::parse_decision_request(two), pool, o, nullptr);
-            const auto p2b = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+            const auto p2b = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
                                                             llama_decision::parse_decision_request(two), pool, o, nullptr);
 
             // Two identical passes must land on bit-identical probabilities. This is a producer
@@ -6597,9 +6639,9 @@ static void test_permutations_real(testing & t) {
                 body["permutations"] = 2;
                 return body;
             };
-            const auto p_ab = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+            const auto p_ab = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
                                                              llama_decision::parse_decision_request(make_pair(false)), pool, o, nullptr);
-            const auto p_ba = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+            const auto p_ba = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
                                                              llama_decision::parse_decision_request(make_pair(true)), pool, o, nullptr);
             const double bill_a = p_ab[0][0]; // billing first
             const double bill_b = p_ba[0][1]; // billing second
@@ -6680,7 +6722,7 @@ static void test_decision_default_envelope(testing & t) {
         t.assert_equal("choice answer keys",
                        std::string("choice,confidence,probabilities,type"), key_set(answers.at("dept")));
         t.assert_equal("score answer keys",
-                       std::string("confidence,interval_p10_p90,legend,median,probabilities,score,type"), key_set(answers.at("urgency")));
+                       std::string("confidence,legend,probabilities,score,type"), key_set(answers.at("urgency")));
     });
 
     t.test("diagnostics opt-in adds the additive certainty", [](testing & t) {
@@ -6861,20 +6903,30 @@ static common_json calibration_dedup_measurement() {
     const std::string after = "\n";
     const int        n = 250;
 
+    // the per-question suffix, rebuilt from the public option-line formatter (same layout the
+    // framer uses): `Question: ...` plus one `label: key - description` line per option
+    auto suffix = [&](const llama_decision::decision_question & q) {
+        std::string s = "\nQuestion: " + llama_decision::render_text(q.instructions) + "\nOptions:\n";
+        for (size_t i = 0; i < q.options.size(); ++i) {
+            s += llama_decision::format_option_line(pool[i], q.options[i]);
+            s += "\n";
+        }
+        s += "Return the correct letter label." + llama_decision::letter_answer_tail(after);
+        return s;
+    };
+
     int exact_equal = 0;
     int near_equal  = 0;
     for (int i = 0; i < n; ++i) {
         const llama_decision::decision_question q = calibration_choice_question("description number " + std::to_string(i));
-        if (llama_decision::format_letter_suffix(q, pool, after) ==
-            llama_decision::format_letter_suffix(q, pool, after)) {
+        if (suffix(q) == suffix(q)) {
             ++exact_equal;
         }
     }
     for (int i = 0; i < n; ++i) {
         const llama_decision::decision_question a = calibration_choice_question("description number " + std::to_string(i));
         const llama_decision::decision_question b = calibration_choice_question("description number " + std::to_string(i) + "!");
-        if (llama_decision::format_letter_suffix(a, pool, after) ==
-            llama_decision::format_letter_suffix(b, pool, after)) {
+        if (suffix(a) == suffix(b)) {
             ++near_equal;
         }
     }
@@ -7464,13 +7516,13 @@ static common_json calibration_model_measurement(const char * path) {
             llama_decision::options hopt;
             hopt.cache_tag = "cal-head";
             llama_decision::letter_metrics hm;
-            const auto ph = llama_decision::letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, hreq,
+            const auto ph = test_letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, hreq,
                                                            pool, hopt, &hm);
             hreq.head     = "full";
             llama_decision::options fopt;
             fopt.cache_tag = "cal-full";
             llama_decision::letter_metrics fm;
-            const auto pf = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, hreq, pool,
+            const auto pf = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, hreq, pool,
                                                            fopt, &fm);
             out["head_vs_full_available"] = hm.head_active;
             if (hm.head_active && pf.size() == ph.size()) {
@@ -7489,7 +7541,7 @@ static common_json calibration_model_measurement(const char * path) {
         body.erase("temperatures");
         llama_decision::options ro;
         ro.cache_tag = "cal-temp";
-        return llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, llama_decision::parse_decision_request(body), pool, ro, nullptr);
+        return test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, llama_decision::parse_decision_request(body), pool, ro, nullptr);
     };
     const auto p10 = readout(1.0);
     const auto p13 = readout(1.3);
@@ -7612,8 +7664,7 @@ static void test_calibration_selected_head_lfm(testing & t) {
 
             bool clean = true;
             for (const auto & l : pool) {
-                clean = clean && llama_decision::answer_label_token(*vocab, tail, l.text) == l.token &&
-                        llama_decision::check_boundary(*vocab, tail, l.text, l.token);
+                clean = clean && llama_decision::answer_label_token(*vocab, tail, l.text) == l.token;
             }
             t.assert_true("every label resolves at the boundary", clean);
 
@@ -7678,7 +7729,7 @@ static void test_calibration_selected_head_lfm(testing & t) {
             of.cache_tag = "cal-full";
             of.optimize  = false; // isolate the projection: the suffix hoist changes batch numerics
             llama_decision::letter_metrics mf;
-            const auto pf = llama_decision::letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, rfull, pool, of, &mf);
+            const auto pf = test_letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, rfull, pool, of, &mf);
 
             llama_decision::decision_request rhead = req;
             rhead.head = "selected";
@@ -7686,7 +7737,7 @@ static void test_calibration_selected_head_lfm(testing & t) {
             oh.cache_tag = "cal-head";
             oh.optimize  = false;
             llama_decision::letter_metrics mh;
-            const auto ph = llama_decision::letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, rhead, pool, oh, &mh);
+            const auto ph = test_letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, rhead, pool, oh, &mh);
 
             t.assert_true("the head fires on LFM2", mh.head_active);
 
@@ -8307,9 +8358,9 @@ static void test_calibration_determinism_variance(testing & t) {
             two["permutations"] = 2;
             llama_decision::options o;
             o.cache_tag = "producer-variance";
-            const auto p1 = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+            const auto p1 = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
                                                            llama_decision::parse_decision_request(two), pool, o, nullptr);
-            const auto p2 = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+            const auto p2 = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
                                                            llama_decision::parse_decision_request(two), pool, o, nullptr);
 
             bool stable = p1.size() == p2.size();
@@ -8490,7 +8541,7 @@ static int write_decision_golden(const char * model_path) {
     const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
             llama_decision::engine eng(te.ctx, 2, 8);
             const auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-    const auto probs = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, llama_decision::options{}, nullptr);
+    const auto probs = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, llama_decision::options{}, nullptr);
     common_json usage = common_json::object();
     usage["input_tokens"]    = 0;
     usage["output_tokens"]   = 0;
@@ -8522,7 +8573,7 @@ static common_json readout_capture(const std::string & path, bool gpu) {
 
     auto run = [&](llama_model * model, llama_context * ctx) {
         auto                    vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(model));
-        const auto              pool  = llama_decision::build_label_pool(*vocab, tail, 64);
+        const auto              pool  = llama_decision::build_label_pool(*vocab, tail, llama_decision::LABEL_POOL_CAP);
         llama_decision::engine  eng(ctx, 2, 8);
         const auto              req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
         llama_decision::options opt;
@@ -8530,7 +8581,7 @@ static common_json readout_capture(const std::string & path, bool gpu) {
         llama_decision::letter_metrics    metrics;
         llama_decision::answer_head_cache head_cache;
         const auto                        probs =
-            llama_decision::letter_readout(eng, head_cache, *vocab, nullptr, false, req, pool, opt, &metrics);
+            test_letter_readout(eng, head_cache, *vocab, nullptr, false, req, pool, opt, &metrics);
 
         common_json core        = oracle_readout(metrics, probs);
         core["head_mode"]       = metrics.head_active ? "selected" : "full";

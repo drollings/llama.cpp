@@ -76,9 +76,10 @@ silently default).
 
 ### 2.1 Fields
 
-* `model` (optional, string): routing/echo only. Accept any string including
+* `model` (required, string): routing/echo only. Accept any string including
   `jev-latest` (treat as alias for the loaded weights). Never load weights
-  per-request. Echo back in the response.
+  per-request. Echo back in the response. An external router in front of this
+  server selects the model, so a request without `model` is a 422 naming it.
 * `state` (required): string, JSON object, or JSON array; must be non-empty
   and finite (`allow_nan=False`). Chat-transcript states
   (`[{role, content}]` / `{"messages": [...]}`) MAY be accepted and are
@@ -128,8 +129,8 @@ Server flag: `--decision-permutations N` (env `LLAMA_ARG_DECISION_PERMUTATIONS`,
 default 1) sets the pass count for requests that omit `permutations`; an explicit
 request field always wins and the pass cap still applies.
 
-Local-only notes: `model` is optional here and echoed back verbatim; Jev
-requires it. `GET /v1/models` keeps the OpenAI model-list shape
+Local-only notes: `model` is required here (the external router selects it) and echoed back
+verbatim, matching Jev. `GET /v1/models` keeps the OpenAI model-list shape
 (`{"object":"list","data":[...]}`), not Jev's `{"models":[...]}` shape.
 
 ### 2.2 Question types (canonical names)
@@ -250,15 +251,18 @@ The default response is exactly the Jev envelope:
 ```
 
 With `diagnostics: true` the same answers are returned with additive fields:
-`certainty` on choice/score, the `head` and `diagnostics` objects, and the
-  extra `usage` counters. The answers themselves
+`certainty` on choice/score, the `head` and `diagnostics` objects, the extra
+`usage` counters, the `timings` object, and the score spread summaries
+(`median`, `interval_p10_p90`). The answers themselves
 are byte-identical either way.
 
 ```json
 {
   "usage": {"input_tokens": N, "output_tokens": 0,
             "cached_tokens": M, "state_cache_hit": true|false,
-            "head_mode": "selected"|"full"}
+            "head_mode": "selected"|"full"},
+  "timings": {"prefill_ms": ..., "scoring_ms": ..., "total_ms": ...,
+              "rounds": ..., "rows": ...}
 }
 ```
 
@@ -285,6 +289,11 @@ are byte-identical either way.
   is true. Both measure concentration of the answer distribution; they are not
   calibrated correctness and never gate admission, caching, routing, or
   persistence on their own.
+* Score `median` and `interval_p10_p90` (skew-robust spread summaries) are
+  additive and only present when `diagnostics: true`; the default score answer
+  is the strict Jev `{type, score, probabilities, legend, confidence}` shape.
+* The `timings` object is additive and only present when `diagnostics: true`
+  (or on a session fork, which reports its diagnostics additively).
 * `probabilities` are CONDITIONAL on the supplied options (they are a
   conditional option score, not a calibrated correctness). `confidence`/
   `certainty` measure CONCENTRATION, not correctness. Document this in every
@@ -434,13 +443,17 @@ same value.
 | concurrent decisions | `LLAMA_DECISION_MAX_QUEUE` (default 4), then 429/529 |
 | trie fields / values per field | 1-32 fields, 1-255 values |
 
-The protocol option cap is `DECISION_MAX_CHOICE_OPTIONS` (64); the label-pool
-cap is `LABEL_POOL_CAP` (64), equal so every option can get a label. The
+The protocol option cap is `DECISION_MAX_CHOICE_OPTIONS` (255); the label-pool
+cap is `LABEL_POOL_CAP` (255), equal so every option can get a label. The
 REALIZED label pool is model-dependent: the tokenizer must resolve each label
-as one non-special token at the answer boundary, so a model may yield fewer
-than 64. The realized size is reported as `diagnostics.label_pool_size` and
+as a single token at the answer boundary, so a model may yield fewer than 255.
+The realized size is reported as `diagnostics.label_pool_size` and
 recorded in the calibration ledger. A request whose widest question needs more
-labels than the realized pool is a 422, never a truncated option set.
+labels than the realized pool is a 422, never a truncated option set and never
+a silent text-mode workaround: the user must pick a model whose tokenizer
+resolves enough single tokens (a capable model resolves the full 255-label pool
+over A-Z, a-z, 0-9, printable ASCII symbols, and accented Latin/Greek/Cyrillic
+single characters).
 
 ---
 

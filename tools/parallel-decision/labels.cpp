@@ -82,13 +82,53 @@ std::vector<int32_t> answer_label_path(const label_vocab & vocab, const std::str
 }
 
 std::vector<label> build_label_pool(const label_vocab & vocab, const std::string & tail, size_t cap) {
+    // Single-character candidates first, ordered for readability: A-Z, a-z, 0-9, the base64
+    // extras and safe ASCII symbols, then accented Latin, Greek and Cyrillic single characters.
+    // The two-character composed labels are the fallback for a tokenizer that cannot resolve
+    // enough single characters as single tokens. The realized pool is model-dependent: every
+    // kept label must resolve as a unique, non-special 1-2 token path at the answer boundary.
     std::vector<std::string> candidates;
     auto one = [&](char c) { candidates.push_back(std::string(1, c)); };
     for (char a = 'A'; a <= 'Z'; ++a) {
         one(a);
     }
+    for (char a = 'a'; a <= 'z'; ++a) {
+        one(a);
+    }
     for (char d = '0'; d <= '9'; ++d) {
         one(d);
+    }
+    // printable ASCII symbols that are unambiguous as a label and safe in the option line
+    for (char c : std::string("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")) {
+        one(c);
+    }
+    // accented Latin and common Greek/Cyrillic single characters, so a tokenizer that keeps them
+    // as single tokens can realize the full label pool
+    for (const char * s : {
+            "\xC3\x80","\xC3\x81","\xC3\x82","\xC3\x83","\xC3\x84","\xC3\x85","\xC3\x86","\xC3\x87",
+            "\xC3\x88","\xC3\x89","\xC3\x8A","\xC3\x8B","\xC3\x8C","\xC3\x8D","\xC3\x8E","\xC3\x8F",
+            "\xC3\x90","\xC3\x91","\xC3\x92","\xC3\x93","\xC3\x94","\xC3\x95","\xC3\x96","\xC3\x97",
+            "\xC3\x98","\xC3\x99","\xC3\x9A","\xC3\x9B","\xC3\x9C","\xC3\x9D","\xC3\x9E","\xC3\x9F",
+            "\xC3\xA0","\xC3\xA1","\xC3\xA2","\xC3\xA3","\xC3\xA4","\xC3\xA5","\xC3\xA6","\xC3\xA7",
+            "\xC3\xA8","\xC3\xA9","\xC3\xAA","\xC3\xAB","\xC3\xAC","\xC3\xAD","\xC3\xAE","\xC3\xAF",
+            "\xC3\xB0","\xC3\xB1","\xC3\xB2","\xC3\xB3","\xC3\xB4","\xC3\xB5","\xC3\xB6","\xC3\xB7",
+            "\xC3\xB8","\xC3\xB9","\xC3\xBA","\xC3\xBB","\xC3\xBC","\xC3\xBD","\xC3\xBE","\xC3\xBF",
+            "\xCE\x91","\xCE\x92","\xCE\x93","\xCE\x94","\xCE\x95","\xCE\x96","\xCE\x97","\xCE\x98",
+            "\xCE\x99","\xCE\x9A","\xCE\x9B","\xCE\x9C","\xCE\x9D","\xCE\x9E","\xCE\x9F","\xCE\xA0",
+            "\xCE\xA1","\xCE\xA3","\xCE\xA4","\xCE\xA5","\xCE\xA6","\xCE\xA7","\xCE\xA8","\xCE\xA9",
+            "\xCE\xB1","\xCE\xB2","\xCE\xB3","\xCE\xB4","\xCE\xB5","\xCE\xB6","\xCE\xB7","\xCE\xB8",
+            "\xCE\xB9","\xCE\xBA","\xCE\xBB","\xCE\xBC","\xCE\xBD","\xCE\xBE","\xCE\xBF","\xCF\x80",
+            "\xCF\x81","\xCF\x82","\xCF\x83","\xCF\x84","\xCF\x85","\xCF\x86","\xCF\x87","\xCF\x88",
+            "\xCF\x89","\xD0\x90","\xD0\x91","\xD0\x92","\xD0\x93","\xD0\x94","\xD0\x95","\xD0\x96",
+            "\xD0\x97","\xD0\x98","\xD0\x99","\xD0\x9A","\xD0\x9B","\xD0\x9C","\xD0\x9D","\xD0\x9E",
+            "\xD0\x9F","\xD0\xA0","\xD0\xA1","\xD0\xA2","\xD0\xA3","\xD0\xA4","\xD0\xA5","\xD0\xA6",
+            "\xD0\xA7","\xD0\xA8","\xD0\xA9","\xD0\xAA","\xD0\xAB","\xD0\xAC","\xD0\xAD","\xD0\xAE",
+            "\xD0\xAF","\xD0\xB0","\xD0\xB1","\xD0\xB2","\xD0\xB3","\xD0\xB4","\xD0\xB5","\xD0\xB6",
+            "\xD0\xB7","\xD0\xB8","\xD0\xB9","\xD0\xBA","\xD0\xBB","\xD0\xBC","\xD0\xBD","\xD0\xBE",
+            "\xD0\xBF","\xD1\x80","\xD1\x81","\xD1\x82","\xD1\x83","\xD1\x84","\xD1\x85","\xD1\x86",
+            "\xD1\x87","\xD1\x88","\xD1\x89","\xD1\x8A","\xD1\x8B","\xD1\x8C","\xD1\x8D","\xD1\x8E",
+            "\xD1\x8F" }) {
+        candidates.push_back(s);
     }
     auto two = [&](char a, char b) { candidates.push_back(std::string{ a, b }); };
     for (char a = 'A'; a <= 'Z'; ++a) {
@@ -144,13 +184,6 @@ std::vector<label> build_label_pool(const label_vocab & vocab, const std::string
         throw std::runtime_error("no suitable answer tokens in the vocabulary");
     }
     return pool;
-}
-
-bool check_boundary(const label_vocab & vocab,
-                    const std::string & prompt,
-                    const std::string & label,
-                    int32_t label_token) {
-    return answer_label_token(vocab, prompt, label) == label_token;
 }
 
 std::string safe_data(const std::string & text) {

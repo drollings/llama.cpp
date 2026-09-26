@@ -3412,7 +3412,7 @@ bool llama_model_classifier_supported(const llama_model * model, const char ** r
 }
 
 int32_t llama_model_classifier_rows(const llama_model * model, const llama_token * ids, int32_t count, float * dst, size_t dst_count, float * softcap, float * bias_dst) {
-    if (!model || !ids || !dst || !softcap || count < 1 || count > 64) return 0;
+    if (!model || !ids || !dst || !softcap || count < 1 || count > 255) return 0;
     if (!llama_model_classifier_supported(model, nullptr)) return 0;
     const auto * tensor = model->output;
     const auto width = tensor->ne[0];
