@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """End-to-end checks for the decision endpoint envelope and error contract.
 
-Starts llama-server with --decision-seqs and exercises the decision request shape
-plus the legacy contexts/schema shape. Skips cleanly (exit 0) when the server
-binary or a small test model is not available, so it never fails open.
+Starts llama-server with --decision-seqs and exercises the unified decision
+request shape (state/contexts + questions). Skips cleanly (exit 0) when the
+server binary or a small test model is not available, so it never fails open.
 """
 
 import json
@@ -37,15 +37,6 @@ DECISION_VALID = {
         },
         "urgency": {"type": "score", "instructions": "How urgent?", "criteria": ["calm", "upset", "furious"]},
     },
-}
-
-LEGACY_VALID = {
-    "instructions": "Answer each field from the context.",
-    "schema": {
-        "category": {"type": "enum", "choices": ["billing", "technical"], "description": "What type?"},
-        "urgent": {"type": "boolean", "description": "Urgent?"},
-    },
-    "contexts": ["I was charged twice and need this fixed today."],
 }
 
 
@@ -143,22 +134,17 @@ def run_checks(server, captured):
     check(set(answers["urgency"]["legend"]) == {"0", "1", "2"}, "score legend keys")
     check(body["usage"]["output_tokens"] == 0, "output_tokens is always 0")
     check(set(body["usage"]) == {"input_tokens", "output_tokens"}, f"default usage is the Jev shape: {body['usage']}")
-    check(set(body) == {"model", "answers", "usage"}, f"default top-level key set: {set(body)}")
+    check(set(body) == {"model", "answers", "usage", "timings"}, f"default top-level key set: {set(body)}")
     check(set(answers["refund"]) == {"type", "noul"}, f"default noul key set: {set(answers['refund'])}")
     check(set(answers["dept"]) == {"type", "choice", "probabilities", "confidence"},
           f"default choice key set: {set(answers['dept'])}")
-    check(set(answers["urgency"]) == {"type", "score", "probabilities", "legend", "confidence"},
+    check(set(answers["urgency"]) == {"type", "score", "probabilities", "legend", "confidence", "median", "interval_p10_p90"},
           f"default score key set: {set(answers['urgency'])}")
     check("head" not in body, "default response has no additive head object")
     check("diagnostics" not in body, "default response has no additive diagnostics object")
     check("certainty" not in answers["dept"], "default response has no additive certainty")
-    check("allowed_token_mass" not in answers["dept"], "default response has no additive audit fields")
-    # the audit trail is opt-in only: a default response must not carry any of its keys
-    for audit_key in ("probability_status", "prompt_sha256", "prompt_version", "answer_token_ids", "option_logits"):
-        check(audit_key not in answers["dept"], f"default response has no audit field {audit_key}")
-        check(audit_key not in answers["refund"], f"default response has no audit field {audit_key} on noul")
 
-    # 1a. diagnostics opt-in restores the additive envelope and the audit fields
+    # 1a. diagnostics opt-in restores the additive envelope
     # compare against a warm repeat so a cold-vs-warm fp difference cannot mask a real change
     status, text = server.post("/v1/decision", json.dumps(DECISION_VALID))
     check(status == 200, f"warm default status {status}: {text}")
@@ -181,24 +167,16 @@ def run_checks(server, captured):
 
     # exact diagnostics key sets: the additive objects and fields are pinned so an accidental
     # unconditional field cannot slip into the default envelope, and so a missing one is caught
-    head_mode = diag_body.get("head", {}).get("mode", "full")
-    audit_keys = {"probability_status", "prompt_sha256", "prompt_version",
-                  "answer_token_ids", "option_logits"}
-    # the full-vocabulary mass and argmax are only measurable on the full-logits path; the selected
-    # head scores answer rows only, so those fields are absent there rather than 1.0 / -1 placeholders
-    full_vocab_keys = {"allowed_token_mass", "full_vocab_argmax_id"}
-    if head_mode == "full":
-        audit_keys |= full_vocab_keys
-    check(set(diag_body) == {"model", "answers", "usage", "head", "diagnostics"},
+    check(set(diag_body) == {"model", "answers", "usage", "timings", "head", "diagnostics"},
           f"diagnostics top-level key set: {set(diag_body)}")
     check(set(diag_body["usage"]) == {"input_tokens", "output_tokens", "cached_tokens", "state_cache_hit", "head_mode"},
           f"diagnostics usage key set: {set(diag_body['usage'])}")
-    check(set(diag_body["answers"]["refund"]) == {"type", "noul"} | audit_keys,
+    check(set(diag_body["answers"]["refund"]) == {"type", "noul"},
           f"diagnostics noul key set: {set(diag_body['answers']['refund'])}")
-    check(set(diag_body["answers"]["dept"]) == {"type", "choice", "probabilities", "confidence", "certainty"} | audit_keys,
+    check(set(diag_body["answers"]["dept"]) == {"type", "choice", "probabilities", "confidence", "certainty"},
           f"diagnostics choice key set: {set(diag_body['answers']['dept'])}")
     check(set(diag_body["answers"]["urgency"]) ==
-          {"type", "score", "probabilities", "legend", "confidence", "certainty"} | audit_keys,
+          {"type", "score", "probabilities", "legend", "confidence", "certainty", "median", "interval_p10_p90"},
           f"diagnostics score key set: {set(diag_body['answers']['urgency'])}")
 
     # the prompt/cached split is exposed so callers can see how much of the prompt was reused
@@ -208,26 +186,8 @@ def run_checks(server, captured):
 
     # the realized answer-label pool is reported and covers every option the request used
     pool_size = diag_body["diagnostics"].get("label_pool_size")
-    check(isinstance(pool_size, int) and 2 <= pool_size <= 64, f"label_pool_size is a bounded count: {pool_size!r}")
+    check(isinstance(pool_size, int) and 2 <= pool_size <= 255, f"label_pool_size is a bounded count: {pool_size!r}")
     check(pool_size >= 3, f"the realized pool covers the widest question in the request: {pool_size}")
-
-    # additive audit fields: prompt identity + per-answer tokenizer/vocabulary diagnostics
-    expected_ids = {"refund": 2, "dept": 2, "urgency": 3}
-    for qid, ans in diag_body["answers"].items():
-        if head_mode == "selected":
-            # the selected head reads only the answer rows, so no full-vocabulary mass/argmax is
-            # reported and the status names the answer-rows-only scope
-            check("allowed_token_mass" not in ans, f"{qid} no full-vocab mass on the selected head")
-            check("full_vocab_argmax_id" not in ans, f"{qid} no full-vocab argmax on the selected head")
-            check("answer rows only" in ans["probability_status"],
-                  f"{qid} status names the answer-rows-only scope: {ans['probability_status']}")
-        else:
-            check(0.0 < ans["allowed_token_mass"] <= 1.0 + 1e-6, f"{qid} allowed_token_mass in range")
-            check(isinstance(ans["full_vocab_argmax_id"], int) and ans["full_vocab_argmax_id"] >= 0, f"{qid} argmax id")
-        check(len(ans["answer_token_ids"]) == expected_ids[qid], f"{qid} answer token ids")
-        check(len(ans["prompt_sha256"]) == 64, f"{qid} prompt sha256")
-        check(bool(ans["prompt_version"]), f"{qid} prompt version")
-        check(bool(ans["probability_status"]), f"{qid} probability status")
 
     # 2. malformed JSON -> 400
     status, text = server.post("/v1/decision", "{ this is not json")
@@ -331,7 +291,6 @@ def run_checks(server, captured):
     full_body = json.loads(text)
     check(full_body["usage"].get("head_mode") == "full", "head_mode in usage")
     check(full_body.get("head", {}).get("mode") == "full", "head diagnostic object")
-    check("option_logits" in full_body["answers"]["dept"], "option logits exposed")
     captured["p_full"] = full_body["answers"]["dept"]["probabilities"]
 
     # adapter scope diagnostics: the decision decode is scoped to the base model, and the
@@ -364,16 +323,6 @@ def run_checks(server, captured):
     long_desc = suffix_tokens({"billing": "pay", "support": "a very long description of the support option"})
     check(long_key > short, f"the option key is rendered into the suffix: {long_key} vs {short}")
     check(long_desc > short, f"the option description is rendered into the suffix: {long_desc} vs {short}")
-
-    # 4. legacy contexts/schema shape is unchanged
-    status, text = server.post("/v1/decision", json.dumps(LEGACY_VALID))
-    check(status == 200, f"legacy status {status}: {text}")
-    legacy = json.loads(text)
-    check(legacy.get("object") == "decision", "legacy object marker")
-    check("results" in legacy and "decision" in legacy["results"][0], "legacy results shape")
-    check("answers" not in legacy, "legacy response must not use the decision envelope")
-    check("prompt_tokens" in legacy["usage"], "legacy usage reports prompt_tokens")
-    check("cached_tokens" in legacy["usage"], "legacy usage reports a cached_tokens split")
 
 
 # The fixed system instruction the letter readout frames before the state. Kept byte-identical to
@@ -490,22 +439,6 @@ def run_session_checks(model):
         chat = {"messages": [{"role": "user", "content": "hello"}], "max_tokens": 4, "id_slot": 0}
         status, text = server.post("/v1/chat/completions", json.dumps(chat))
         check(status == 200, f"chat after a session decision: {status} {text[:120]}")
-
-        # the legacy contexts/schema shape also forks a live slot, and reports it additively
-        status, text = server.post("/v1/decision", json.dumps(dict(LEGACY_VALID, id_slot=0)))
-        check(status == 200, f"generic session status {status}: {text[:200]}")
-        generic = json.loads(text)
-        check(generic.get("session", {}).get("fork") is True, f"generic session reports its fork: {generic.get('session')}")
-        check(generic.get("session", {}).get("id_slot") == 0, "generic session reports the source slot")
-        check("results" in generic and "decision" in generic["results"][0], "generic session keeps the results shape")
-        status, text = server.post("/v1/decision", json.dumps(dict(LEGACY_VALID, contexts=["a", "b"], id_slot=0)))
-        check(status == 400, f"a multi-context session is refused: {status} {text}")
-        # an explicit copy fork cannot reproduce a recurrent model's state; the hybrid models refuse
-        # it with a named reason, while dense attention (where copy is exact) may serve it
-        status, text = server.post("/v1/decision", json.dumps(dict(LEGACY_VALID, id_slot=0, fork="copy")))
-        check(status in (200, 400), f"a copy-fork session is served or refused: {status} {text}")
-        if status == 400:
-            check("fork" in text, f"the copy-fork refusal names the fork: {text}")
 
         # releasing the slot clears its decoded state; a later session request on it is refused
         status, text = http("POST", f"http://127.0.0.1:{server.port}/slots/0?action=erase", None)

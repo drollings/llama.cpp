@@ -108,8 +108,8 @@ silently default).
   it is available and silently falls back to full logits otherwise; an explicit
   `head: "selected"` on an unavailable head is a client error (400).
 * `diagnostics` (optional, bool, default `false`): when `true`, the response
-  additionally carries the `head` object, the `diagnostics` object, per-answer
-  audit fields, `certainty`, and the extra `usage` counters
+  additionally carries the `head` object, the `diagnostics` object, `certainty`,
+  and the extra `usage` counters
   (`cached_tokens`, `state_cache_hit`, `head_mode`). The default `false` keeps
   the response to the strict Jev envelope (Section 3).
 * `confidence_profile` (optional, string, `"jev"` (default) or `"local"`): how
@@ -250,8 +250,8 @@ The default response is exactly the Jev envelope:
 ```
 
 With `diagnostics: true` the same answers are returned with additive fields:
-`certainty` on choice/score, the per-answer audit fields, the `head` and
-`diagnostics` objects, and the extra `usage` counters. The answers themselves
+`certainty` on choice/score, the `head` and `diagnostics` objects, and the
+  extra `usage` counters. The answers themselves
 are byte-identical either way.
 
 ```json
@@ -285,10 +285,10 @@ are byte-identical either way.
   is true. Both measure concentration of the answer distribution; they are not
   calibrated correctness and never gate admission, caching, routing, or
   persistence on their own.
-* `probabilities` are CONDITIONAL on the supplied options
-  (`probability_status: "conditional option score; uncalibrated as decision
-  confidence"`). `confidence`/`certainty` measure CONCENTRATION, not
-  correctness. Document this in every model card and API doc.
+* `probabilities` are CONDITIONAL on the supplied options (they are a
+  conditional option score, not a calibrated correctness). `confidence`/
+  `certainty` measure CONCENTRATION, not correctness. Document this in every
+  model card and API doc.
 * `usage.output_tokens` MUST be 0 (warmup/branch tokens are accounting-only).
   `usage.input_tokens` includes cache hits + warmup and counts a shared prefix
   ONCE. The default `usage` carries only `input_tokens` and `output_tokens`;
@@ -303,13 +303,6 @@ are byte-identical either way.
   (`prefill_ms`, `scoring_ms`, `suffix_tokens`, `common_suffix_tokens`). These
   are additive and never change an answer. The default response omits all of
   them.
-* Audit availability depends on the readout. `allowed_token_mass` and
-  `full_vocab_argmax_id` are full-vocabulary measurements; under
-  `head_mode: "selected"` only the K answer rows are read, so those two fields
-  are OMITTED (never emitted as placeholder `1.0`/`-1` values). `option_logits`,
-  `answer_token_ids`, and `probability_status` are available under both the
-  selected head and full logits. `usage.head_mode` and the `head` object report
-  which readout ran.
 
 ### 3.2 Worked example
 
@@ -343,7 +336,7 @@ Response (default envelope):
 ```
 
 The same request with `"diagnostics": true` keeps the answers byte-identical
-and adds `certainty`, the audit fields, the `head`/`diagnostics` objects, and
+and adds `certainty`, the `head`/`diagnostics` objects, and
 the extra usage counters:
 
 ```json
@@ -351,8 +344,7 @@ the extra usage counters:
  "answers": {
    "dept": {"type": "choice", "choice": "billing",
             "probabilities": {"billing": 0.9999, "support": 0.0001},
-            "confidence": 0.999, "certainty": 0.9999,
-            "probability_status": "conditional option score; uncalibrated as decision confidence"}},
+            "confidence": 0.999, "certainty": 0.9999}},
  "usage": {"input_tokens": 412, "output_tokens": 0,
            "cached_tokens": 180, "state_cache_hit": false,
            "head_mode": "selected"},
@@ -420,7 +412,7 @@ Notes:
   observable guarantee is that no partial answer is produced).
 * `x-decision-latency-ms` and `Server-Timing: prepare,prefill,branches` are
   proposed instrumentation, not currently emitted. Per-request timings are
-  available via the audit fields and the response `timings` object.
+  available via the response `timings` object.
 
 ---
 
@@ -455,8 +447,8 @@ labels than the realized pool is a 422, never a truncated option set.
 ## 6. Calibration and acceptance
 
 Two axes, never conflated:
-- CONFIDENCE (producer self-doubt): `certainty`, `allowed_token_mass`,
-  full-vocab argmax agreement. A model can be confident and still wrong.
+- CONFIDENCE (producer self-doubt): `certainty` and the winner share. A model
+  can be confident and still wrong.
 - TASK VALUE (outcome correctness/economy): `tree_max`, hoist length, wave
   packing, single-question bypass, dedup, temperature fit quality
   (NLL/Brier/ECE), permutation gain.
@@ -484,9 +476,7 @@ Rules:
   invalidates the claim.
 * Prompt-injection corpus for `safe_data`: `<|turn>`, `{REASON:`, `__media__`,
   backticks, and nested arrays/objects.
-* Diagnostics to log per request: `allowed_token_mass`
-  (mass on valid labels vs full vocab), `full_vocab_argmax` (detect
-  off-label winners), `prefix/suffix tokens`, `cache_hit`, `waves`,
+* Diagnostics to log per request: `prefix/suffix tokens`, `cache_hit`, `waves`,
   `queue_ms`. These catch prompt-drift and head-mismatch before users do.
 * Policy: the model's `confidence`/`certainty` NEVER gates admission,
   caching, routing, or persistence.
@@ -515,7 +505,3 @@ Rules:
 - **contract hash**: a hash over the tokenizer identity, the framed prompt
   template, and the label code. If it changes, any earlier calibration is
   stale. Logged at startup and returned as `diagnostics.contract_hash`.
-- **audit fields**: additive per-answer telemetry (`allowed_token_mass`,
-  `full_vocab_argmax_id`, `answer_token_ids`, `option_logits`,
-  `prompt_sha256`, `prompt_version`, `probability_status`). For inspection
-  only; they never change an answer.

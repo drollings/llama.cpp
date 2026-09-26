@@ -39,11 +39,6 @@ struct decision_field {
     int   scored_nodes = 0;
     float temperature  = 1.0f;
 
-    bool  audit_valid         = false;
-    float allowed_token_mass  = 1.0f;
-    int   full_vocab_argmax   = -1;
-    std::vector<float> audit_logits;
-
     decision_field(tokens_t s, std::vector<tokens_t> p) : suffix(std::move(s)), paths(std::move(p)) {
         for (int i = 0; i < (int) paths.size(); ++i) {
             active.push_back(i);
@@ -546,30 +541,6 @@ bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache, const std
 
 // Score each branch as its own sequence forked from its trunk; return each branch's last-token
 // logits restricted to its candidate tokens. Groups are bounded by free sequences and batch rows.
-// Full-vocab diagnostics at one scored position: share of the vocabulary mass that lands on the
-// allowed candidate tokens, and the id the unrestricted model would pick. Audit only.
-static void score_audit(const float * logits, int n_vocab, const tokens_t & cands,
-                        int & argmax_id, float & allowed_mass) {
-    int    best     = 0;
-    double lse_all  = -std::numeric_limits<double>::infinity();
-    double lse_cand = -std::numeric_limits<double>::infinity();
-    for (int t = 0; t < n_vocab; ++t) {
-        if (logits[t] > logits[best]) {
-            best = t;
-        }
-        const double x = logits[t];
-        const double m = std::max(lse_all, x);
-        lse_all = m == -std::numeric_limits<double>::infinity() ? m : m + std::log1p(std::exp(std::min(lse_all, x) - m));
-    }
-    for (llama_token t : cands) {
-        const double x = logits[t];
-        const double m = std::max(lse_cand, x);
-        lse_cand = m == -std::numeric_limits<double>::infinity() ? m : m + std::log1p(std::exp(std::min(lse_cand, x) - m));
-    }
-    argmax_id    = best;
-    allowed_mass = (float) std::exp(lse_cand - lse_all);
-}
-
 std::vector<engine::branch_score> engine::score_branches(const std::vector<branch> & branches, llama_seq_id first, int n_free,
                                                          const std::vector<saved_state> * parent_states,
                                                          bool allow_bypass) {
@@ -749,8 +720,6 @@ void engine::gather_candidates(int out_idx, const tokens_t & cands, branch_score
         const float * embd = llama_get_embeddings_ith(ctx, out_idx);
         if (embd != nullptr) {
             out.cand_logits = score_answer_rows(embd, *head_, cands);
-            out.full_vocab_argmax  = -1; // no full vocabulary on the fast path
-            out.allowed_token_mass = 1.0f;
             return;
         }
     }
@@ -762,9 +731,6 @@ void engine::gather_candidates(int out_idx, const tokens_t & cands, branch_score
     }
     for (llama_token t : cands) {
         out.cand_logits.push_back(logits[t]);
-    }
-    if (audit_) {
-        score_audit(logits, llama_vocab_n_tokens(vocab), cands, out.full_vocab_argmax, out.allowed_token_mass);
     }
 }
 
@@ -922,7 +888,6 @@ batch_result engine::decide_batch(const compiled_fields &          plan,
     select_fork(opt.fork);
     stop_  = opt.should_stop;
     yield_ = opt.yield;
-    audit_ = opt.audit;
     llama_synchronize(ctx); // drain any work left by the previous decision before reusing sequences
     check_cancel();
     const tokens_t shared = tokenize(shared_text, true);
@@ -1129,21 +1094,11 @@ void engine::run_trunk_wave(batch_result & out, const compiled_fields & plan, co
             auto & fd = state[i][f];
             if (fd.use_tree) {
                 tree_scores[i][f].push_back(scores[row].cand_logits);
-                if (!fd.audit_valid) {
-                    fd.allowed_token_mass = scores[row].allowed_token_mass;
-                    fd.full_vocab_argmax   = scores[row].full_vocab_argmax;
-                    fd.audit_logits        = scores[row].cand_logits;
-                    fd.audit_valid         = true;
-                }
             } else {
                 const auto & s    = scores[row].cand_logits;
                 const auto   p    = softmax(s, fd.temperature);
                 const int    best = (int) (std::max_element(s.begin(), s.end()) - s.begin());
                 fd.select(todo[row].cands[best], p[best]);
-                fd.allowed_token_mass = scores[row].allowed_token_mass;
-                fd.full_vocab_argmax   = scores[row].full_vocab_argmax;
-                fd.audit_logits        = scores[row].cand_logits;
-                fd.audit_valid         = true;
             }
         }
         if (first) {
@@ -1173,8 +1128,7 @@ void engine::run_trunk_wave(batch_result & out, const compiled_fields & plan, co
             if (fd.use_tree && fd.probs.empty()) {
                 fd.finish_tree({});
             }
-            scored.push_back({ fd.winner, fd.path_score, fd.scored_nodes, fd.use_tree, fd.probs,
-                               fd.allowed_token_mass, fd.full_vocab_argmax, std::move(fd.audit_logits) });
+            scored.push_back({ fd.winner, fd.path_score, fd.scored_nodes, fd.use_tree, fd.probs });
         }
         r.fields.resize(field_first.size());
         for (size_t f = 0; f < field_first.size(); ++f) {
@@ -1207,7 +1161,6 @@ batch_result engine::decide_batch_from_seq(llama_seq_id src, llama_pos base_pos,
     select_fork(opt.fork);
     stop_  = opt.should_stop;
     yield_ = opt.yield;
-    audit_ = opt.audit;
     llama_synchronize(ctx);
     check_cancel();
 

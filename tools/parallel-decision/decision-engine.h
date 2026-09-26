@@ -73,7 +73,6 @@ struct options {
     std::string cache_tag;               // optional: cache is only reused when the tag also matches
     std::string fork           = "auto"; // auto | copy | restore | hybrid: how branches fork the prefix
     bool        bypass         = true;   // skip the fork when a round has exactly one branch
-    bool        audit          = false;  // also collect full-vocab diagnostics at the scored position
     bool        optimize       = true;   // dedup identical fields and hoist a long common suffix head
     const classifier_head * head = nullptr; // optional: score candidates against these rows
     std::function<bool()> should_stop;   // optional: checked before every decode and between waves
@@ -118,9 +117,6 @@ struct field_result {
     int                scored_nodes = 0;
     bool               tree         = false;
     std::vector<float> probs;            // tree fields: probability of every allowed value
-    float              allowed_token_mass   = 1.0f; // share of full-vocab mass on the allowed tokens (audit)
-    int                full_vocab_argmax_id = -1;   // argmax over the full vocabulary (audit)
-    std::vector<float> logits;                      // raw logits of the allowed tokens at the scored node (audit)
 };
 
 struct result {
@@ -257,8 +253,6 @@ class engine {
     };
     struct branch_score {
         std::vector<float> cand_logits;
-        int                full_vocab_argmax   = -1;
-        float              allowed_token_mass  = 1.0f;
     };
 
     // copy shares the attention cells by metadata; restore reloads a full saved state; hybrid copies
@@ -292,7 +286,6 @@ class engine {
 
     std::function<bool()> stop_;
     std::function<void()> yield_;
-    bool                audit_ = false;
     const classifier_head * head_        = nullptr;
     bool                    head_active_ = false;
     std::string             head_reason_;

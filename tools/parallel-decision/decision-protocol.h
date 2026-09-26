@@ -111,7 +111,7 @@ struct decision_request {
     int                       permutations = 1;
     std::string               head;         // "" (auto) | "selected" | "full"
     std::string               confidence_profile = "jev"; // "jev" (certainty-based, Jev default) | "local" (1 - H/logK)
-    bool                      diagnostics = false; // emit additive and audit fields
+    bool                      diagnostics = false; // emit additive and diagnostics fields
     session_ref               session;
 };
 
@@ -160,23 +160,10 @@ temperature_profile parse_temperature_profile(const common_json & doc);
 // that does not match the running configuration. T=1.0 is always allowed.
 void validate_temperature_profile(const temperature_profile & profile, const temperature_provenance & current);
 
-// Per-answer audit trail. Additive only: it is reported for inspection and never
-// gates or changes an answer.
-struct answer_audit {
-    std::string                       prompt_sha256;
-    std::string                       prompt_version;
-    std::string                       probability_status;
-    bool                              full_vocab_audit = true; // false when only answer rows are measurable
-    std::vector<std::vector<int32_t>> answer_token_ids;      // per question, index-aligned with options
-    std::vector<float>                allowed_token_mass;    // per question
-    std::vector<int32_t>              full_vocab_argmax_id;  // per question
-    std::vector<std::vector<float>>   option_logits;         // per question, index-aligned with options
-};
-
-// Lowercase hex SHA-256 of the given bytes. Used for the prompt identity in the audit trail.
+// Lowercase hex SHA-256 of the given bytes. Used for the decision contract hash.
 std::string sha256_hex(const std::string & text);
 
-// Canonical decision response. Additive fields (certainty, audit, extra usage counters, and the
+// Canonical decision response. Additive fields (certainty, the extra usage counters, and the
 // optional `head`/`diagnostics` payload) are emitted only when `req.diagnostics` is set; `probs` is
 // index-aligned with req.questions and their options; a missing or empty entry falls back to a
 // uniform distribution. This assembler is the single owner of the default-vs-diagnostics envelope.
@@ -184,7 +171,6 @@ common_json assemble_decision_response(const decision_request & req,
                                   const std::vector<std::vector<float>> & probs,
                                   const std::string & model,
                                   const common_json & usage,
-                                  const answer_audit * audit = nullptr,
                                   const common_json * diagnostics = nullptr);
 
 } // namespace llama_decision

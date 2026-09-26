@@ -4922,7 +4922,7 @@ static common_json decision_cpu_oracle() {
     ofull.cache_tag = "cpu-oracle-full";
     llama_decision::letter_metrics mfull;
     const auto pfull = llama_decision::letter_readout(e_full, head_cache, *vocab, nullptr, false,
-                                                      rfull, pool, ofull, &mfull, nullptr);
+                                                      rfull, pool, ofull, &mfull);
     out["full"] = oracle_readout(mfull, pfull);
 
     // head="auto" on the shared full context cannot use the answer rows (it exposes logits, not
@@ -4933,7 +4933,7 @@ static common_json decision_cpu_oracle() {
     oauto.cache_tag = "cpu-oracle-auto";
     llama_decision::letter_metrics mauto;
     const auto pauto = llama_decision::letter_readout(e_full, head_cache, *vocab, nullptr, false,
-                                                      rauto, pool, oauto, &mauto, nullptr);
+                                                      rauto, pool, oauto, &mauto);
     out["auto_fallback"] = oracle_readout(mauto, pauto);
 
     out["head_selection"]  = oracle_head_selection(te_full, te_head, llama_model_get_vocab(te_full.model));
@@ -6136,14 +6136,12 @@ static void test_head_fallback_equivalence(testing & t) {
             llama_decision::options oa;
             oa.cache_tag = "head-auto";
             llama_decision::letter_metrics ma;
-            llama_decision::answer_audit   aa;
-            const auto pa = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, oa, &ma, &aa);
+            const auto pa = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, oa, &ma);
 
             llama_decision::options of;
             of.cache_tag = "head-full";
             llama_decision::letter_metrics mf;
-            llama_decision::answer_audit   af;
-            const auto pf = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf, &af);
+            const auto pf = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf);
 
             // Both runs read full logits here (the context exposes no hidden states), but they use
             // separate prefix caches, so a backend may reorder a reduction. The decisions, not the
@@ -6163,25 +6161,6 @@ static void test_head_fallback_equivalence(testing & t) {
             }
             fprintf(stderr, "head fallback agreement: max delta %.3e (informational)\n", worst);
             t.assert_true("auto and full heads agree on every winner", same);
-
-            bool logits_ok = af.option_logits.size() == pf.size();
-            for (size_t qi = 0; logits_ok && qi < pf.size(); ++qi) {
-                const auto & z = af.option_logits[qi];
-                logits_ok = z.size() == pf[qi].size();
-                if (!logits_ok) {
-                    break;
-                }
-                float mx = *std::max_element(z.begin(), z.end());
-                double sum = 0.0;
-                for (float x : z) {
-                    sum += std::exp((double) (x - mx));
-                }
-                for (size_t i = 0; logits_ok && i < z.size(); ++i) {
-                    const double p = std::exp((double) (z[i] - mx)) / sum;
-                    logits_ok = std::fabs(p - (double) pf[qi][i]) < 1e-5;
-                }
-            }
-            t.assert_true("option logits reproduce the probabilities", logits_ok);
 
             fprintf(stderr, "head fallback: auto %.3f ms, full %.3f ms (informational)\n",
                     ma.prefill_ms + ma.scoring_ms, mf.prefill_ms + mf.scoring_ms);
@@ -6237,13 +6216,13 @@ static void test_selected_equivalence_lfm(testing & t) {
             llama_decision::options of;
             of.cache_tag = "sel-full";
             llama_decision::letter_metrics mf;
-            const auto pf = llama_decision::letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf, nullptr);
+            const auto pf = llama_decision::letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf);
 
             req.head = "selected";
             llama_decision::options oh;
             oh.cache_tag = "sel-head";
             llama_decision::letter_metrics mh;
-            const auto ph = llama_decision::letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh, nullptr);
+            const auto ph = llama_decision::letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh);
 
             t.assert_true("the selected head was used", mh.head_active);
 
@@ -6315,13 +6294,13 @@ static void test_selected_equivalence_qwen2(testing & t) {
             llama_decision::options of;
             of.cache_tag = "q2-full";
             llama_decision::letter_metrics mf;
-            const auto pf = llama_decision::letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf, nullptr);
+            const auto pf = llama_decision::letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf);
 
             req.head = "selected";
             llama_decision::options oh;
             oh.cache_tag = "q2-head";
             llama_decision::letter_metrics mh;
-            const auto ph = llama_decision::letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh, nullptr);
+            const auto ph = llama_decision::letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh);
 
             t.assert_true("the selected head was used", mh.head_active);
             bool winners = pf.size() == ph.size();
@@ -6420,7 +6399,7 @@ static void test_classifier_only_readout(testing & t) {
             llama_decision::options opt;
             opt.cache_tag = "co-readout";
             llama_decision::letter_metrics m;
-            const auto p = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, opt, &m, nullptr);
+            const auto p = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, opt, &m);
             t.assert_true("the classifier context activates the selected head", m.head_active);
             t.assert_true("the readout reports its suffix accounting", m.suffix_tokens > 0);
             t.assert_equal("one probability vector per question", (size_t) req.questions.size(), p.size());
@@ -6467,14 +6446,14 @@ static void test_selected_fallback_lfm(testing & t) {
             llama_decision::options of;
             of.cache_tag = "fb-full";
             llama_decision::letter_metrics mf;
-            const auto pf = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf, nullptr);
+            const auto pf = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf);
 
             // the model can serve selected rows, but this context exposes no hidden states
             req.head = "selected";
             llama_decision::options oh;
             oh.cache_tag = "fb-selected";
             llama_decision::letter_metrics mh;
-            const auto ph = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh, nullptr);
+            const auto ph = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh);
 
             t.assert_true("the head did not activate", !mh.head_active);
             t.assert_true("a fallback reason is reported", !mh.head_reason.empty());
@@ -6541,7 +6520,7 @@ static void test_selected_explicit_error(testing & t) {
             llama_decision::engine eng(te.ctx, 2, 8);
             llama_decision::options o;
             o.cache_tag = "after-error";
-            const auto p = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, o, nullptr, nullptr);
+            const auto p = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, o, nullptr);
             t.assert_equal("auto still answers every question", req.questions.size(), p.size());
         } catch (const std::exception & e) {
             t.assert_true(std::string("auto after error: ") + e.what(), false);
@@ -6573,11 +6552,11 @@ static void test_permutations_real(testing & t) {
             llama_decision::options o;
             o.cache_tag = "perm";
             const auto p1  = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
-                                                            llama_decision::parse_decision_request(one), pool, o, nullptr, nullptr);
+                                                            llama_decision::parse_decision_request(one), pool, o, nullptr);
             const auto p2  = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
-                                                            llama_decision::parse_decision_request(two), pool, o, nullptr, nullptr);
+                                                            llama_decision::parse_decision_request(two), pool, o, nullptr);
             const auto p2b = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
-                                                            llama_decision::parse_decision_request(two), pool, o, nullptr, nullptr);
+                                                            llama_decision::parse_decision_request(two), pool, o, nullptr);
 
             // Two identical passes must land on bit-identical probabilities. This is a producer
             // bit-stability property, so on the known weak-quant GPU oracle it is skipped with a
@@ -6619,9 +6598,9 @@ static void test_permutations_real(testing & t) {
                 return body;
             };
             const auto p_ab = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
-                                                             llama_decision::parse_decision_request(make_pair(false)), pool, o, nullptr, nullptr);
+                                                             llama_decision::parse_decision_request(make_pair(false)), pool, o, nullptr);
             const auto p_ba = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
-                                                             llama_decision::parse_decision_request(make_pair(true)), pool, o, nullptr, nullptr);
+                                                             llama_decision::parse_decision_request(make_pair(true)), pool, o, nullptr);
             const double bill_a = p_ab[0][0]; // billing first
             const double bill_b = p_ba[0][1]; // billing second
             t.assert_true("the two-pass mean is invariant to option order", std::fabs(bill_a - bill_b) < 5e-2);
@@ -6669,8 +6648,8 @@ static void test_sha256(testing & t) {
 }
 
 // Builds the same request twice, once with diagnostics off (the default) and once on. The
-// additive answer/audit values are identical, so the only expected difference is the emitted
-// key set. Returns {default, diagnostics}.
+// additive certainty values are identical to the default answer, so the only expected difference
+// is the emitted key set. Returns {default, diagnostics}.
 static std::pair<common_json, common_json> assemble_default_and_diagnostics() {
     common_json usage = common_json::object();
     usage["input_tokens"]    = 12;
@@ -6679,20 +6658,11 @@ static std::pair<common_json, common_json> assemble_default_and_diagnostics() {
     usage["state_cache_hit"] = false;
     usage["head_mode"]       = "full";
 
-    llama_decision::answer_audit audit;
-    audit.prompt_sha256      = "deadbeef";
-    audit.prompt_version     = "letter-v1";
-    audit.probability_status = "uncalibrated";
-    audit.answer_token_ids      = { { 10, 11 }, { 20, 21, 22 }, { 30, 31, 32 } };
-    audit.allowed_token_mass    = { 0.9f, 0.8f, 0.7f };
-    audit.full_vocab_argmax_id  = { 5, 6, 7 };
-    audit.option_logits         = { { 1.0f, 2.0f }, { 1.0f, 2.0f, 3.0f }, { 1.0f, 2.0f, 3.0f } };
-
     const std::vector<std::vector<float>> probs = { { 0.25f, 0.75f }, { 0.6f, 0.3f, 0.1f }, { 0.2f, 0.3f, 0.5f } };
     llama_decision::decision_request req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-    const common_json plain = llama_decision::assemble_decision_response(req, probs, "m", usage, &audit);
+    const common_json plain = llama_decision::assemble_decision_response(req, probs, "m", usage);
     req.diagnostics = true;
-    const common_json diag = llama_decision::assemble_decision_response(req, probs, "m", usage, &audit);
+    const common_json diag = llama_decision::assemble_decision_response(req, probs, "m", usage);
     return { plain, diag };
 }
 
@@ -6713,7 +6683,7 @@ static void test_decision_default_envelope(testing & t) {
                        std::string("confidence,interval_p10_p90,legend,median,probabilities,score,type"), key_set(answers.at("urgency")));
     });
 
-    t.test("diagnostics opt-in adds the additive and audit key sets", [](testing & t) {
+    t.test("diagnostics opt-in adds the additive certainty", [](testing & t) {
         const auto out = assemble_default_and_diagnostics().second;
 
         t.assert_equal("top-level keys", std::string("answers,model,usage"), key_set(out));
@@ -6722,19 +6692,13 @@ static void test_decision_default_envelope(testing & t) {
                        key_set(out.at("usage")));
 
         const auto & answers = out.at("answers");
-        t.assert_equal("noul answer keys",
-                       std::string("allowed_token_mass,answer_token_ids,full_vocab_argmax_id,noul,option_logits,"
-                                   "probability_status,prompt_sha256,prompt_version,type"),
-                       key_set(answers.at("refund")));
+        // noul carries no certainty (it has no option distribution); choice and score gain it
+        t.assert_equal("noul answer keys", std::string("noul,type"), key_set(answers.at("refund")));
         t.assert_equal("choice answer keys",
-                       std::string("allowed_token_mass,answer_token_ids,certainty,choice,confidence,"
-                                   "full_vocab_argmax_id,option_logits,probabilities,probability_status,"
-                                   "prompt_sha256,prompt_version,type"),
+                       std::string("certainty,choice,confidence,probabilities,type"),
                        key_set(answers.at("dept")));
         t.assert_equal("score answer keys",
-                       std::string("allowed_token_mass,answer_token_ids,certainty,confidence,full_vocab_argmax_id,"
-                                   "interval_p10_p90,legend,median,option_logits,probabilities,probability_status,"
-                                   "prompt_sha256,prompt_version,score,type"),
+                       std::string("certainty,confidence,interval_p10_p90,legend,median,probabilities,score,type"),
                        key_set(answers.at("urgency")));
     });
 
@@ -6758,69 +6722,6 @@ static void test_decision_default_envelope(testing & t) {
     });
 }
 
-static void test_audit_envelope(testing & t) {
-    t.test("audit fields are additive and attached to every answer", [](testing & t) {
-        auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-        req.diagnostics = true;
-        common_json usage = common_json::object();
-        usage["input_tokens"]  = 0;
-        usage["output_tokens"] = 0;
-
-        llama_decision::answer_audit audit;
-        audit.prompt_sha256      = "deadbeef";
-        audit.prompt_version     = "letter-v1";
-        audit.probability_status = "uncalibrated";
-        audit.answer_token_ids      = { { 10, 11 }, { 20, 21, 22 }, { 30, 31, 32 } };
-        audit.allowed_token_mass    = { 0.9f, 0.8f, 0.7f };
-        audit.full_vocab_argmax_id  = { 5, 6, 7 };
-
-        const std::vector<std::vector<float>> probs = { { 0.25f, 0.75f }, { 0.6f, 0.3f, 0.1f }, { 0.2f, 0.3f, 0.5f } };
-        const common_json out = llama_decision::assemble_decision_response(req, probs, "m", usage, &audit);
-
-        const auto & refund = out.at("answers").at("refund");
-        t.assert_equal("prompt hash", std::string("deadbeef"), refund.at("prompt_sha256").get<std::string>());
-        t.assert_equal("prompt version", std::string("letter-v1"), refund.at("prompt_version").get<std::string>());
-        t.assert_equal("probability status", std::string("uncalibrated"), refund.at("probability_status").get<std::string>());
-        t.assert_equal("answer ids", (size_t) 2, refund.at("answer_token_ids").size());
-        assert_close(t, "allowed mass", 0.9, refund.at("allowed_token_mass").get<double>(), 1e-6);
-        t.assert_equal("full vocab argmax", 5, refund.at("full_vocab_argmax_id").get<int>());
-
-        const common_json plain = llama_decision::assemble_decision_response(req, probs, "m", usage);
-        t.assert_true("audit is additive only", !plain.at("answers").at("refund").contains("prompt_sha256"));
-    });
-
-    t.test("head mode marks the full-vocabulary audit fields as unavailable", [](testing & t) {
-        auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-        req.diagnostics = true;
-        common_json usage = common_json::object();
-        usage["input_tokens"]  = 0;
-        usage["output_tokens"] = 0;
-
-        llama_decision::answer_audit audit;
-        audit.prompt_sha256       = "deadbeef";
-        audit.prompt_version      = "letter-v1";
-        audit.full_vocab_audit    = false;
-        audit.probability_status  = "conditional option score over quantized weights; uncalibrated as decision confidence; "
-                                    "full-vocabulary mass and argmax are not measurable under the selected head (answer rows only)";
-        audit.answer_token_ids     = { { 10, 11 }, { 20, 21, 22 }, { 30, 31, 32 } };
-        audit.allowed_token_mass   = { 1.0f, 1.0f, 1.0f };   // placeholders, never real
-        audit.full_vocab_argmax_id = { -1, -1, -1 };         // placeholders, never real
-        audit.option_logits        = { { 0.1f, 0.2f }, { 0.1f, 0.2f, 0.3f }, { 0.1f, 0.2f, 0.3f } };
-
-        const std::vector<std::vector<float>> probs = { { 0.25f, 0.75f }, { 0.6f, 0.3f, 0.1f }, { 0.2f, 0.3f, 0.5f } };
-        const common_json out = llama_decision::assemble_decision_response(req, probs, "m", usage, &audit);
-
-        const auto & refund = out.at("answers").at("refund");
-        t.assert_true("the 1.0 mass placeholder is not emitted as a real measurement",
-                      !refund.contains("allowed_token_mass"));
-        t.assert_true("the -1 argmax placeholder is not emitted as a real measurement",
-                      !refund.contains("full_vocab_argmax_id"));
-        t.assert_true("the status names the answer-rows-only scope",
-                      refund.at("probability_status").get<std::string>().find("answer rows only") != std::string::npos);
-        t.assert_true("the answer rows are still audited",
-                      refund.contains("answer_token_ids") && refund.contains("option_logits"));
-    });
-}
 
 // Confidence and its telemetry are producer self-doubt: they may be reported, but no gating path
 // may read them. The scorer and the server must not name them at all, and the per-answer audit
@@ -6837,46 +6738,6 @@ static void test_confidence_never_gates_envelope(testing & t) {
         t.assert_true("the head never reads confidence", engine_h.find("confidence") == std::string::npos);
         t.assert_true("the server never reads confidence", server.find("confidence") == std::string::npos);
         t.assert_true("the server never reads certainty", server.find("certainty") == std::string::npos);
-    });
-
-    t.test("changing the audit telemetry never changes an answer", [](testing & t) {
-        auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-        req.diagnostics = true;
-        common_json usage = common_json::object();
-        usage["input_tokens"]  = 0;
-        usage["output_tokens"] = 0;
-        const std::vector<std::vector<float>> probs = { { 0.2f, 0.8f }, { 0.5f, 0.3f, 0.2f }, { 0.1f, 0.2f, 0.7f } };
-
-        llama_decision::answer_audit low;
-        low.prompt_sha256         = "a";
-        low.prompt_version        = "letter-v1";
-        low.probability_status    = "conditional option score";
-        low.allowed_token_mass    = { 0.01f, 0.01f, 0.01f };
-        low.full_vocab_argmax_id  = { 0, 0, 0 };
-        low.answer_token_ids      = { { 1, 2 }, { 3, 4, 5 }, { 6, 7, 8 } };
-        low.option_logits         = { { 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f } };
-
-        llama_decision::answer_audit high = low;
-        high.allowed_token_mass   = { 0.999f, 0.999f, 0.999f };
-        high.full_vocab_argmax_id = { 42, 43, 44 };
-
-        const common_json a = llama_decision::assemble_decision_response(req, probs, "m", usage, &low);
-        const common_json b = llama_decision::assemble_decision_response(req, probs, "m", usage, &high);
-
-        const char * answer_keys[] = { "type", "noul", "choice", "score", "probabilities", "legend", "confidence", "certainty" };
-        bool identical = true;
-        for (const auto & e : a.at("answers").items()) {
-            const auto & other = b.at("answers").at(e.key());
-            for (const char * key : answer_keys) {
-                if (e.value().contains(key)) {
-                    identical = identical && other.contains(key) && e.value().at(key).dump() == other.at(key).dump();
-                }
-            }
-        }
-        t.assert_true("the answer values are identical under different audit telemetry", identical);
-        t.assert_true("the audit telemetry itself differs",
-                      a.at("answers").at("dept").at("allowed_token_mass").dump() !=
-                      b.at("answers").at("dept").at("allowed_token_mass").dump());
     });
 }
 
@@ -6919,126 +6780,6 @@ static void test_verify_letter_request(testing & t) {
     });
 }
 
-static void test_letter_audit_real(testing & t) {
-    t.test("the letter readout reports additive audit fields on a real model", [](testing & t) {
-        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
-            return;
-        }
-        test_engine te;
-        if (!te.load(path)) {
-            t.assert_true("model loads", false);
-            return;
-        }
-        try {
-            auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
-            llama_decision::engine eng(te.ctx, 2, 8);
-            auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-            req.diagnostics = true;
-
-            llama_decision::letter_metrics metrics;
-            llama_decision::answer_audit   audit;
-            const auto probs = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool,
-                                                              llama_decision::options{}, &metrics, &audit);
-
-            t.assert_equal("prompt hash is a sha256", (size_t) 64, audit.prompt_sha256.size());
-            t.assert_equal("prompt version is set", std::string(llama_decision::LETTER_PROMPT_VERSION), audit.prompt_version);
-            t.assert_true("probability status is set", !audit.probability_status.empty());
-            t.assert_equal("audit size matches questions", req.questions.size(), audit.allowed_token_mass.size());
-            t.assert_equal("the readout reports the realized label pool", pool.size(), metrics.label_pool_size);
-
-            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(te.model));
-            bool ok = true;
-            for (size_t qi = 0; qi < req.questions.size(); ++qi) {
-                ok = ok && audit.answer_token_ids[qi].size() == req.questions[qi].options.size();
-                ok = ok && audit.allowed_token_mass[qi] > 0.0f && audit.allowed_token_mass[qi] <= 1.0f + 1e-6f;
-                ok = ok && audit.full_vocab_argmax_id[qi] >= 0 && audit.full_vocab_argmax_id[qi] < n_vocab;
-            }
-            t.assert_true("audit values are in range", ok);
-
-            common_json usage = common_json::object();
-            usage["input_tokens"]  = 0;
-            usage["output_tokens"] = 0;
-            const common_json out = llama_decision::assemble_decision_response(req, probs, "m", usage, &audit);
-            t.assert_true("envelope carries the audit",
-                          out.at("answers").at("refund").contains("allowed_token_mass") &&
-                          out.at("answers").at("refund").contains("full_vocab_argmax_id"));
-        } catch (const std::exception & e) {
-            t.assert_true(std::string("audit run: ") + e.what(), false);
-        }
-    });
-}
-
-// The audit sink is observability only: collecting it must not move a single score, so a caller
-// can leave it off without changing the answer.
-static void test_audit_does_not_move_probs(testing & t) {
-    t.test("a null audit sink yields the same readout probabilities", [](testing & t) {
-        const std::string path = decision_cpu_model_path();
-        if (path.empty()) {
-            t.skip("no generated model; run the generate-models fixture");
-            return;
-        }
-        cpu_test_engine te;
-        if (!te.load(path, 512, false, false)) {
-            t.assert_true("the CPU decision scaffold loads the model", false);
-            return;
-        }
-        auto                   vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-        const auto             pool  = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
-        llama_decision::engine eng(te.ctx, 2, 8);
-        const auto             req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-
-        auto run = [&](llama_decision::answer_audit * audit, double * scoring_ms) {
-            llama_decision::options opt;
-            opt.cache_tag   = "audit-property";
-            opt.allow_cache = false;
-            llama_decision::letter_metrics    metrics;
-            llama_decision::answer_head_cache head_cache;
-            auto probs = llama_decision::letter_readout(eng, head_cache, *vocab, nullptr, false, req, pool, opt,
-                                                        &metrics, audit);
-            if (scoring_ms != nullptr) {
-                *scoring_ms = metrics.scoring_ms;
-            }
-            return probs;
-        };
-
-        const auto                   without = run(nullptr, nullptr);
-        llama_decision::answer_audit audit;
-        const auto                   with = run(&audit, nullptr);
-
-        t.assert_equal("the readout returns the same question count", without.size(), with.size());
-        bool same = without.size() == with.size();
-        for (size_t q = 0; same && q < without.size(); ++q) {
-            same = without[q].size() == with[q].size();
-            for (size_t i = 0; same && i < without[q].size(); ++i) {
-                same = without[q][i] == with[q][i];  // bit-identical: the sink must not perturb the math
-            }
-        }
-        t.assert_true("the audit sink does not move any probability", same);
-        t.assert_true("the audit sink was filled", !audit.prompt_sha256.empty());
-
-        // record the collection cost: min of a few runs so warm-up noise does not dominate the delta
-        auto best_of = [&](llama_decision::answer_audit * sink) {
-            double best = std::numeric_limits<double>::max();
-            for (int i = 0; i < 3; ++i) {
-                double ms = 0.0;
-                (void) run(sink, &ms);
-                best = std::min(best, ms);
-            }
-            return best;
-        };
-        const double off_ms = best_of(nullptr);
-        const double on_ms  = best_of(&audit);
-        printf("readout audit scoring_ms: off=%.3f on=%.3f delta=%.3f\n", off_ms, on_ms, on_ms - off_ms);
-    });
-}
-
-// ---- calibration: measured thresholds for the heuristics the batching stage gates on ----
-//
-// These tests only MEASURE heuristics and record the verdict. No row here gates a request:
-// every row carries production_gate:false, and the confidence rows are advisory-only.
 
 static size_t token_lcp(const std::vector<llama_token> & a, const std::vector<llama_token> & b) {
     size_t n = 0;
@@ -7724,13 +7465,13 @@ static common_json calibration_model_measurement(const char * path) {
             hopt.cache_tag = "cal-head";
             llama_decision::letter_metrics hm;
             const auto ph = llama_decision::letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, hreq,
-                                                           pool, hopt, &hm, nullptr);
+                                                           pool, hopt, &hm);
             hreq.head     = "full";
             llama_decision::options fopt;
             fopt.cache_tag = "cal-full";
             llama_decision::letter_metrics fm;
             const auto pf = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false, hreq, pool,
-                                                           fopt, &fm, nullptr);
+                                                           fopt, &fm);
             out["head_vs_full_available"] = hm.head_active;
             if (hm.head_active && pf.size() == ph.size()) {
                 bool agree = true;
@@ -7937,7 +7678,7 @@ static void test_calibration_selected_head_lfm(testing & t) {
             of.cache_tag = "cal-full";
             of.optimize  = false; // isolate the projection: the suffix hoist changes batch numerics
             llama_decision::letter_metrics mf;
-            const auto pf = llama_decision::letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, rfull, pool, of, &mf, nullptr);
+            const auto pf = llama_decision::letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, rfull, pool, of, &mf);
 
             llama_decision::decision_request rhead = req;
             rhead.head = "selected";
@@ -7945,7 +7686,7 @@ static void test_calibration_selected_head_lfm(testing & t) {
             oh.cache_tag = "cal-head";
             oh.optimize  = false;
             llama_decision::letter_metrics mh;
-            const auto ph = llama_decision::letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, rhead, pool, oh, &mh, nullptr);
+            const auto ph = llama_decision::letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, rhead, pool, oh, &mh);
 
             t.assert_true("the head fires on LFM2", mh.head_active);
 
@@ -8567,9 +8308,9 @@ static void test_calibration_determinism_variance(testing & t) {
             llama_decision::options o;
             o.cache_tag = "producer-variance";
             const auto p1 = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
-                                                           llama_decision::parse_decision_request(two), pool, o, nullptr, nullptr);
+                                                           llama_decision::parse_decision_request(two), pool, o, nullptr);
             const auto p2 = llama_decision::letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
-                                                           llama_decision::parse_decision_request(two), pool, o, nullptr, nullptr);
+                                                           llama_decision::parse_decision_request(two), pool, o, nullptr);
 
             bool stable = p1.size() == p2.size();
             for (size_t qi = 0; stable && qi < p1.size(); ++qi) {
@@ -9125,11 +8866,8 @@ int main(int argc, char ** argv) {
         test_selected_fallback_lfm(t);
         test_selected_explicit_error(t);
         test_sha256(t);
-        test_audit_envelope(t);
         test_confidence_never_gates_envelope(t);
         test_verify_letter_request(t);
-        test_letter_audit_real(t);
-        test_audit_does_not_move_probs(t);
         test_sequence_partition(t);
         test_calibration_hoist(t);
         test_calibration_dedup(t);

@@ -160,7 +160,6 @@ void verify_letter_request(const label_vocab & vocab, const std::string & tail,
 
 // One probability vector per question, index-aligned with q.options. Throws
 // semantic_error when a question needs more labels than the pool provides.
-// When `audit` is non-null the per-question diagnostics are filled in.
 std::vector<std::vector<float>> letter_readout(engine & eng,
                                                answer_head_cache & head_cache,
                                                const label_vocab & vocab,
@@ -168,8 +167,7 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
                                                const decision_request & req,
                                                const std::vector<label> & labels,
                                                const options & opt,
-                                               letter_metrics * metrics = nullptr,
-                                               answer_audit * audit = nullptr);
+                                               letter_metrics * metrics = nullptr);
 
 // A live chat sequence to answer about instead of a stateless prompt. The readout forks `seq` at
 // `base_pos` and appends only the decision turn, so the transcript is never re-prefilled and the
@@ -203,14 +201,13 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
                                                const decision_request & req,
                                                const std::vector<label> & labels,
                                                const options & opt,
-                                               letter_metrics * metrics = nullptr,
-                                               answer_audit * audit = nullptr);
+                                               letter_metrics * metrics = nullptr);
 
 // The multi-context form: the same questions scored against every context of a `contexts`
 // request (or the single `state`, when that is set) in one batched pass. Returns one
 // probability matrix per context (question x option), in request order. `metrics` is batch
-// level; `per_context_tokens` reports each context's token count. `audit` describes the first
-// context and is additive only. A session fork scores exactly one context.
+// level; `per_context_tokens` reports each context's token count. A session fork scores exactly
+// one context.
 std::vector<std::vector<std::vector<float>>> letter_readout_multi(const readout_sources & sources,
                                                                   answer_head_cache & head_cache,
                                                                   const label_vocab & vocab,
@@ -218,7 +215,6 @@ std::vector<std::vector<std::vector<float>>> letter_readout_multi(const readout_
                                                                   const decision_request & req,
                                                                   const std::vector<label> & labels,
                                                                   const options & opt,
-                                                                  letter_metrics * metrics = nullptr,
-                                                                  answer_audit * audit = nullptr);
+                                                                  letter_metrics * metrics = nullptr);
 
 } // namespace llama_decision

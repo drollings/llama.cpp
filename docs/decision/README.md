@@ -73,12 +73,8 @@ refuses the decision path.  The default response is the strict Jev envelope
 (`model`, `answers`, `usage` with only input/output tokens); passing
 `"diagnostics": true` adds the `head` object, the `diagnostics` identity
 (contract_hash, prompt_version, timings, and the provenance of the readout),
-`certainty`, and the per-answer audit trail, so callers can see exactly how an
-answer was produced without changing the answers themselves.  Because the
-selected answer head reads only the K answer rows, the full-vocabulary audit
-fields `allowed_token_mass` and `full_vocab_argmax_id` are omitted under
-`head_mode: "selected"` rather than reported as placeholder values; the
-answer-row fields stay available.  The classifier-only context can be bounded with
+and `certainty`, so callers can see exactly how an answer was produced without
+changing the answers themselves.  The classifier-only context can be bounded with
 `--decision-ctx-size N`; a request whose peak KV use does not fit is rejected
 with 422 before anything is decoded.
 

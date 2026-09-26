@@ -224,8 +224,8 @@ decisions on one scheduler thread. This implementation adds:
 - A classifier-only context and answer head, with a capability probe and an
   automatic fallback to full logits; an explicit `head=selected` request is
   refused when the model cannot serve it.
-- Diagnostics: contract hash, template hash, head fallback reason, adapter
-  scope, and an opt-in audit block.
+- Diagnostics: contract hash, template hash, head fallback reason, and adapter
+  scope, plus `certainty` on choice/score.
 - Adapter scoping: the head path is refused with adapters configured, and the
   full path reads base-scope logits.
 
@@ -258,7 +258,7 @@ behind it. Concretely:
 4. **Adopt the reference's lean engine surface as the single core.** The
    reference's `decide`/`decide_batch`, `score_branches`, `compile_schema`, and
    `render_prompt` are the right shape. Keep the additions (fork axis,
-   letter readout, head, audit) as options on that core, not as parallel code.
+   letter readout, head) as options on that core, not as parallel code.
 
 5. **Keep the hardening.** Cancellation, yielding, cleanup on every exit, the
    head capability probe and fallback, and the adapter scope guard are the

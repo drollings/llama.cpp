@@ -341,9 +341,8 @@ std::vector<std::vector<std::vector<float>>> letter_readout_multi(const readout_
                                                                    const common_chat_templates * tmpls, bool use_jinja,
                                                                    const decision_request & req,
                                                                    const std::vector<label> & labels,
-                                                                   const options & opt,
-                                                                   letter_metrics * metrics,
-                                                                   answer_audit * audit) {
+const options & opt,
+                                                                    letter_metrics * metrics) {
     if (sources.full == nullptr) {
         throw std::invalid_argument("the letter readout needs a full-logits engine");
     }
@@ -413,7 +412,6 @@ std::vector<std::vector<std::vector<float>>> letter_readout_multi(const readout_
     readout_opt.tree_max       = text_mode ? max_options : labels.size();
     readout_opt.split_boundary = false;
     readout_opt.cache_tag      = make_prefix_tag(system_text, split.second, prompt_version);
-    readout_opt.audit          = (audit != nullptr);
 
     // The selected head is a fallback-safe fast path: it is used when the model exposes usable
     // answer rows and the classifier context covers every candidate, and the shared full-logits
@@ -532,45 +530,6 @@ std::vector<std::vector<std::vector<float>>> letter_readout_multi(const readout_
         all.push_back(std::move(probs));
     }
 
-    if (audit != nullptr) {
-        // A stateless prompt hashes the rendered text; a session prompt's transcript lives on the
-        // source sequence, so it identifies the fork instead of a text that was never rendered.
-        audit->prompt_sha256      = session
-            ? sha256_hex(std::string("session|") + std::to_string(sources.session->seq) + "|" +
-                         std::to_string(sources.session->base_pos) + "|" + system_text)
-            : sha256_hex(split.first + states[0] + split.second);
-        audit->prompt_version     = prompt_version;
-        audit->probability_status = "conditional option score over quantized weights; uncalibrated as decision confidence";
-        audit->full_vocab_audit   = !b.head_active;
-        if (b.head_active) {
-            // the answer head scores answer rows only; a full-vocabulary mass or argmax cannot be
-            // measured, so the audit says so instead of reporting a placeholder 1.0 / -1
-            audit->probability_status += "; full-vocabulary mass and argmax are not measurable under the selected head (answer rows only)";
-        }
-        audit->answer_token_ids.assign(req.questions.size(), {});
-        audit->allowed_token_mass.assign(req.questions.size(), 1.0f);
-        audit->full_vocab_argmax_id.assign(req.questions.size(), -1);
-        audit->option_logits.assign(req.questions.size(), {});
-        for (size_t qi = 0; qi < req.questions.size(); ++qi) {
-            const decision_question & q = req.questions[qi];
-            const std::string tail = letter_answer_tail(after);
-            for (size_t i = 0; i < q.options.size(); ++i) {
-                // the scored path: the label tokens for the letter readout, the option text's
-                // path for the text readout
-                const std::vector<int32_t> path = text_mode
-                    ? answer_label_path(vocab, tail, q.options[i].key, LETTER_TEXT_MAX_PATH)
-                    : labels[i].tokens;
-                for (const int32_t tok : path) {
-                    audit->answer_token_ids[qi].push_back(tok);
-                }
-            }
-            // the audit describes the identity pass; the answer itself averages all passes
-            const size_t f0 = qi * (size_t) n_perm;
-            audit->allowed_token_mass[qi]    = b.items[0].fields[f0].allowed_token_mass;
-            audit->full_vocab_argmax_id[qi]  = b.items[0].fields[f0].full_vocab_argmax_id;
-            audit->option_logits[qi]         = b.items[0].fields[f0].logits;
-        }
-    }
     return all;
 }
 
@@ -581,9 +540,8 @@ std::vector<std::vector<float>> letter_readout(const readout_sources & sources,
                                                const decision_request & req,
                                                const std::vector<label> & labels,
                                                const options & opt,
-                                               letter_metrics * metrics,
-                                               answer_audit * audit) {
-    auto all = letter_readout_multi(sources, head_cache, vocab, tmpls, use_jinja, req, labels, opt, metrics, audit);
+                                               letter_metrics * metrics) {
+    auto all = letter_readout_multi(sources, head_cache, vocab, tmpls, use_jinja, req, labels, opt, metrics);
     return all.empty() ? std::vector<std::vector<float>>{} : std::move(all[0]);
 }
 
@@ -594,8 +552,7 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
                                                const decision_request & req,
                                                const std::vector<label> & labels,
                                                const options & opt,
-                                               letter_metrics * metrics,
-                                               answer_audit * audit) {
+                                               letter_metrics * metrics) {
     readout_sources sources;
     sources.full = &eng;
     if (eng.classifier_only()) {
@@ -605,7 +562,7 @@ std::vector<std::vector<float>> letter_readout(engine & eng,
         // same reason the engine itself reports for a head on a non-classifier context
         sources.classifier_unavailable = "the decision context does not expose hidden states";
     }
-    return letter_readout(sources, head_cache, vocab, tmpls, use_jinja, req, labels, opt, metrics, audit);
+    return letter_readout(sources, head_cache, vocab, tmpls, use_jinja, req, labels, opt, metrics);
 }
 
 } // namespace llama_decision

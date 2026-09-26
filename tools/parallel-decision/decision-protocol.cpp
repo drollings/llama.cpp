@@ -619,7 +619,6 @@ common_json assemble_decision_response(const decision_request & req,
                                   const std::vector<std::vector<float>> & probs,
                                   const std::string & model,
                                   const common_json & usage,
-                                  const answer_audit * audit,
                                   const common_json * diagnostics) {
     const auto uniform = uniform_probs(req);
 
@@ -677,25 +676,6 @@ const common_json conc = concentration_metrics(p, req.confidence_profile);
                 a["interval_p10_p90"] = band;
                 a["probabilities"] = probs_obj;
                 a["legend"]        = legend;
-            }
-        }
-        if (req.diagnostics && audit != nullptr) {
-            a["probability_status"] = audit->probability_status;
-            a["prompt_sha256"]      = audit->prompt_sha256;
-            a["prompt_version"]     = audit->prompt_version;
-            if (qi < audit->answer_token_ids.size()) {
-                a["answer_token_ids"] = audit->answer_token_ids[qi];
-            }
-            // under the selected head the full-vocabulary mass and argmax are not measurable, so do
-            // not emit the 1.0 / -1 placeholders as if they were real measurements
-            if (audit->full_vocab_audit && qi < audit->allowed_token_mass.size()) {
-                a["allowed_token_mass"] = (double) audit->allowed_token_mass[qi];
-            }
-            if (audit->full_vocab_audit && qi < audit->full_vocab_argmax_id.size()) {
-                a["full_vocab_argmax_id"] = audit->full_vocab_argmax_id[qi];
-            }
-            if (qi < audit->option_logits.size()) {
-                a["option_logits"] = audit->option_logits[qi];
             }
         }
         answers[q.id] = a;

@@ -178,7 +178,7 @@ is empty. Unknown top-level request fields are ignored; unknown fields inside a 
 
 By default the response is the strict Jev envelope: `answers` plus
 `usage{input_tokens,output_tokens:0}`. Pass `"diagnostics": true` to additionally get `certainty`,
-the per-answer audit fields, the `head` and `diagnostics` objects, and the extra usage counters
+the `head` and `diagnostics` objects, and the extra usage counters
 (`cached_tokens`, `state_cache_hit`, `head_mode`). The answers themselves are identical either way.
 
 Both shapes are served by `POST /v1/decision`, the canonical route. `POST /decision` is a deprecated
@@ -227,21 +227,13 @@ unavailable instead of silently scoring without it. A zero bias is kept and adds
 treated as "no bias". `head: "auto"` falls back to full logits when the head is unavailable; an
 explicit `head: "selected"` on an incompatible model is a 400.
 
-### Usage and audit
+### Usage and diagnostics
 
 `usage` always reports `input_tokens` (state + cached prefix) and `output_tokens` (always 0, nothing
 is generated). With `"diagnostics": true` it also reports `cached_tokens`, `state_cache_hit`, and
-`head_mode`; every answer additionally carries the audit fields `answer_token_ids`,
-`option_logits`, `allowed_token_mass`, `full_vocab_argmax_id`, `prompt_sha256`, `prompt_version`,
-`probability_status`, and `certainty`, and the response carries `diagnostics.contract_hash` (see
-below) and a `head` object describing the readout path. These are for inspection only; they never
-change an answer, and they are omitted from the default envelope.
-
-`allowed_token_mass` and `full_vocab_argmax_id` are full-vocabulary measurements. When the answer
-head is selected (`head_mode: "selected"`), only the K answer rows are read, so those two fields are
-not measurable and are omitted instead of emitted as placeholder `1.0`/`-1` values. The answer-row
-fields (`option_logits`, `answer_token_ids`, `probability_status`) stay available in both modes;
-`head_mode` in `usage` says which one ran.
+`head_mode`; every answer additionally carries `certainty`, and the response carries
+`diagnostics.contract_hash` (see below) and a `head` object describing the readout path. These are
+for inspection only; they never change an answer, and they are omitted from the default envelope.
 
 ### Contract hash and diagnostics
 

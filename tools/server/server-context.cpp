@@ -2489,9 +2489,9 @@ private:
             if (!body.contains("permutations") || body.at("permutations").is_null()) {
                 req.permutations = params_base.n_decision_permutations;
             }
-            // the audit trail and the additive diagnostics object are opt-in; the default envelope
-            // must stay the strict Jev shape and must not pay to collect them
-            const bool                              want_audit = req.diagnostics;
+            // the additive diagnostics object (head mode, contract identity, provenance) is opt-in;
+            // the default envelope must stay the strict Jev shape
+            const bool                              want_diagnostics = req.diagnostics;
             const decision_session                  sess = resolve_session(req.session);
             if (sess.slot != nullptr && req.head == "selected") {
                 throw std::invalid_argument(
@@ -2628,7 +2628,6 @@ private:
                     "\" would not reproduce the slot state");
             }
             llama_decision::letter_metrics metrics;
-            llama_decision::answer_audit   audit;
             std::vector<std::vector<std::vector<float>>> all_probs;
             // run inside a yield so metrics/slot requests are served while the decision computes
             queue_tasks.yield_to_queue([&]() {
@@ -2637,7 +2636,7 @@ private:
                 all_probs = llama_decision::letter_readout_multi(sources, decision.decision_head_cache,
                                                                  *decision.decision_label_vocab, chat_params.tmpls.get(),
                                                                  chat_params.use_jinja, req, decision.decision_labels, jopt,
-                                                                 &metrics, want_audit ? &audit : nullptr);
+                                                                 &metrics);
             });
 
             const bool multi = !req.contexts.empty();
@@ -2662,7 +2661,7 @@ private:
             const std::string echo = (req.model.empty() || req.model == "jev-latest" || req.model == "jev-preview")
                 ? model_name : req.model;
             json decision_diagnostics = json::object();
-            if (want_audit) {
+            if (want_diagnostics) {
                 // the fast path is optional; report how the answer was actually read out
                 const bool head_fallback = req.head != "full" && !metrics.head_active;
                 decision_diagnostics["head"] = json::object();
@@ -2701,11 +2700,11 @@ private:
                 decision_diagnostics["source_slot"]  = sess.slot->id;
                 decision_diagnostics["session_pos"]  = (long long) sess.pos;
             }
-            const bool emit_diagnostics = want_audit || sess.slot != nullptr;
+            const bool emit_diagnostics = want_diagnostics || sess.slot != nullptr;
             if (!multi) {
                 json out = llama_decision::assemble_decision_response(
                     req, all_probs.empty() ? std::vector<std::vector<float>>{} : all_probs[0],
-                    echo, usage, want_audit ? &audit : nullptr, emit_diagnostics ? &decision_diagnostics : nullptr);
+                    echo, usage, emit_diagnostics ? &decision_diagnostics : nullptr);
                 out["timings"] = timings;
                 return out;
             }
@@ -2721,7 +2720,7 @@ private:
                 cusage["state_cache_hit"] = metrics.cache_hit;
                 cusage["head_mode"]       = metrics.head_active ? "selected" : "full";
                 json ans = llama_decision::assemble_decision_response(
-                    req, all_probs[ci], echo, cusage, want_audit ? &audit : nullptr, nullptr);
+                    req, all_probs[ci], echo, cusage, nullptr);
                 contexts_resp.push_back({ { "answers", ans.at("answers") }, { "usage", ans.at("usage") } });
             }
             json out = json::object();
