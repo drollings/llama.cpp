@@ -70,6 +70,7 @@ struct server_decision_context {
             case COMMON_DECISION_TYPE_KEV:
             case COMMON_DECISION_TYPE_NIMBLE:
             case COMMON_DECISION_TYPE_PPLX_DECIDER:
+            case COMMON_DECISION_TYPE_LFM2_D1:
                 return true;
             default:
                 return false;
@@ -87,6 +88,7 @@ struct server_decision_context {
             case COMMON_DECISION_TYPE_OPENJEV:
             case COMMON_DECISION_TYPE_CLEF:
             case COMMON_DECISION_TYPE_PPLX_DECIDER:
+            case COMMON_DECISION_TYPE_LFM2_D1:
                 return true;
             default:
                 return false;
@@ -157,6 +159,8 @@ private:
             size_t variant,
             size_t n_images) const;
     size_t n_outputs(const server_decision_question & question) const;
+    // LFM2_D1: label text and tokens of each option
+    void d1_labels(const server_decision_question & question, std::vector<std::string> & texts, std::vector<llama_tokens> & groups) const;
     void fill_task_laya(llama_tokens & tokens, const server_decision_question & question, server_task & task) const;
 
     float get_temperature(const server_decision_question & question) const;
@@ -166,26 +170,28 @@ private:
 // free functions
 //
 
-// the two halves of a body, both refuse with server_invalid_request naming the field. decision_parse_state appends the images to files
+// the two halves of a body, both refuse with server_invalid_request naming the field. decision_parse_state appends the images to files. allow_null_state is only for models that answer without a state (lfm2-d1 with images only)
 std::vector<server_decision_question> decision_parse_questions(const json & body, const decision_model_traits & traits);
-json                                  decision_parse_state(const json & body, std::vector<raw_buffer> & files);
+json                                  decision_parse_state(const json & body, std::vector<raw_buffer> & files, bool allow_null_state = false);
 
-// the options of one question in template order. Variant 1 is the reverse order, so the model cannot prefer a position over an option
+// the options of one question in template order. Variant 1 is the reverse order, so the model cannot prefer a position over an option. d1_texts carries the per-question label texts of lfm2-d1, null for every other model
 json decision_template_options(
         common_decision_type             type,
         const decision_model_traits &    traits,
         const server_decision_question & question,
-        size_t                           variant);
+        size_t                           variant,
+        const std::vector<std::string> * d1_texts = nullptr);
 
 // what one prompt is rendered from. A struct, so two counts of the same type cannot be swapped non-owning: only a temporary for one decision_template_input() call, never stored
 struct decision_prompt {
-    common_decision_type                       type     = COMMON_DECISION_TYPE_NONE;
+    common_decision_type                       type      = COMMON_DECISION_TYPE_NONE;
     const decision_model_traits &              traits;
     const json &                               state;
     const std::vector<server_decision_question> & questions;
     const server_decision_question &           question;
-    size_t                                     variant  = 0;
-    size_t                                     n_images = 0;
+    size_t                                     variant   = 0;
+    size_t                                     n_images  = 0;
+    const std::vector<std::string> *           d1_labels = nullptr; // lfm2-d1 per-question labels, null otherwise
 };
 
 // the globals the "systemone" template is given for one variant of one question of one request
