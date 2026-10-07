@@ -509,6 +509,17 @@ void llama_adapter_lora_free(llama_adapter_lora * adapter) {
     delete adapter;
 }
 
+uint64_t llama_adapter_lora_buf_size(const struct llama_adapter_lora * adapter) {
+    if (adapter == nullptr) {
+        return 0;
+    }
+    uint64_t size = 0;
+    for (const auto & buf : adapter->bufs) {
+        size += ggml_backend_buffer_get_size(buf.get());
+    }
+    return size;
+}
+
 uint64_t llama_adapter_get_alora_n_invocation_tokens(const struct llama_adapter_lora * adapter) {
     if (!adapter) {
         return 0;

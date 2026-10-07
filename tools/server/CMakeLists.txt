@@ -17,6 +17,13 @@ add_library(${TARGET} STATIC
     server-decision.h
     server-context.cpp
     server-context.h
+    server-instances.cpp
+    server-instances.h
+    server-instances-lifecycle.cpp
+    server-instances-snapshot.cpp
+    server-instances-adapters.cpp
+    server-snapshot.cpp
+    server-snapshot.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp

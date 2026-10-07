@@ -450,6 +450,18 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+// one named context ("instance") sharing a pool's loaded weights
+// all instances of a pool share the same weights; only KV + compute buffers differ
+struct common_instance {
+    std::string name;     // instance name, e.g. "swarm0"
+    std::string group;    // group name, e.g. "swarm"; empty => group == name
+    int32_t ctx_size = 0; // 0 = inherit base n_ctx (which may itself be 0 = model default)
+    int32_t parallel = 0; // 0 = 1 (never inherits the global --parallel)
+    bool pinned     = false; // advisory only; never enforced
+    bool is_default = false; // target of <base> alone
+    std::vector<std::pair<std::string, float>> lora; // adapter path -> scale (empty = inherit base --lora)
+};
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -576,6 +588,7 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
+    bool kv_unified_explicit = false; // kv_unified was set on the command line or via env (not defaulted)
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
@@ -656,6 +669,12 @@ struct common_params {
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
+
+    // multi-instance mode
+    int32_t instance_wait_seconds = 60; // how long a group-targeted request waits for a free instance before returning 503
+
+    // named contexts sharing the loaded weights (empty = legacy single-context mode)
+    std::vector<common_instance> instances;
 
     std::vector<std::string> api_keys;
 
@@ -768,6 +787,34 @@ struct common_params {
 // call once at the start of a program if it uses libcommon
 // initializes the logging system and prints info about the build
 void common_init();
+
+// copy `base` and apply per-instance overrides; never carries `instances`
+// into the copy; parallel defaults to 1, NOT base.n_parallel
+common_params common_instance_params(const common_params & base, const common_instance & inst);
+
+// reject an instance whose name/group would break the model-id grammar or the filesystem
+// (restricted to [A-Za-z0-9._-]). Throws std::invalid_argument.
+void common_instance_validate(const common_instance & inst);
+
+// canonical instance grammar, single source for help texts and comments:
+// name[:group=G][:ctx=N][:parallel=M][:pinned][:default][:lora=PATH[:SCALE]...]
+// comma-separated lists accepted; duplicate names and name/group collisions rejected.
+constexpr const char * COMMON_INSTANCES_GRAMMAR =
+    "name[:group=G][:ctx=N][:parallel=M][:pinned][:default][:lora=PATH[:SCALE]...]";
+
+// parse the instance grammar (see COMMON_INSTANCES_GRAMMAR above).
+// Throws std::invalid_argument on bad input.
+std::vector<common_instance> common_instances_parse(const std::string & spec);
+
+// validate a whole instance list (e.g. accumulated across repeated flags):
+// duplicate names and name/group collisions over the full list, plus the
+// name/group character class per entry. common_instances_parse applies it to
+// each spec; callers that accumulate lists by other means apply it to the
+// final list. Throws std::invalid_argument.
+void common_instances_validate_all(const std::vector<common_instance> & instances);
+
+// canonical serialization of instances (used for logging and the round-trip test)
+std::string common_instances_to_string(const std::vector<common_instance> & instances);
 
 void common_params_print_info(const common_params & params, bool print_devices = true);
 std::string common_params_get_system_info(const common_params & params);
@@ -951,6 +998,10 @@ bool common_is_tty(FILE * file);
 
 struct common_sampler;
 
+struct common_init_result;
+
+using common_init_result_ptr = std::unique_ptr<common_init_result>;
+
 // typed decision models, see "<arch>.decision.type" in the model metadata
 enum common_decision_type {
     COMMON_DECISION_TYPE_NONE,    // not a decision model
@@ -983,19 +1034,39 @@ struct common_init_result {
     std::vector<llama_adapter_lora_ptr> & lora();
 
 private:
+    // create context + samplers from an existing model (owned or borrowed)
+    void init_from_model(common_params & params, struct llama_context_params & cparams, llama_model * model);
+
+    // borrow an externally owned model; the result must not free it
+    common_init_result(common_params & params, llama_model * model);
+
+    friend common_init_result_ptr common_init_from_model_params(common_params & params, llama_model * model);
+
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
 
-using common_init_result_ptr = std::unique_ptr<common_init_result>;
-
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
 
-struct llama_model_params   common_model_params_to_llama  (      common_params & params);
-struct llama_context_params common_context_params_to_llama(const common_params & params);
+// create a context from an externally owned model (borrowed: the result must not free it)
+common_init_result_ptr common_init_from_model_params(common_params & params, llama_model * model);
 
-// clear LoRA adapters from context, then apply new list of adapters
-void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
+struct llama_model_params     common_model_params_to_llama  (      common_params & params);
+struct llama_context_params   common_context_params_to_llama(const common_params & params);
+
+// clear LoRA adapters from context, then apply new list of adapters. Returns the
+// llama_set_adapters_lora status: 0 when the requested scope is installed, non-zero when it could
+// not be. An entry with a non-zero scale and no loaded adapter can never be installed, so it is
+// refused here instead of being handed to the context.
+int common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
+
+// fill the report-only task_name / prompt_prefix fields from the adapter's
+// loaded GGUF metadata. la.ptr must be non-null.
+void common_adapter_lora_fill_meta(common_adapter_lora_info & la);
+
+// short stable hash of the sorted (path, scale) adapter set; "" when empty.
+// used to fingerprint snapshots so a restore under a different adapter set is rejected.
+std::string common_lora_fingerprint(const std::vector<common_adapter_lora_info> & loras);
 
 // model endpoint from env
 std::string common_get_model_endpoint();

@@ -99,7 +99,7 @@ enum class list_kind {
 // a narrow path uses the active code page on Windows, so every crossing between
 // a std::string (always UTF-8 here) and fs::path is converted explicitly
 static fs::path path_from_utf8(const std::string & s) {
-    return fs::u8path(s);
+    return fs::path((const char8_t *) s.c_str());
 }
 
 // '/' separators on every platform: Windows accepts them, the web UI needs them
@@ -1783,7 +1783,7 @@ void server_tool::stream::push(const std::string & chunk) {
 
 struct server_tools_res : server_http_res {
     std::thread worker;
-    server_response * qr = nullptr; // set only for streaming responses
+    server_result_queue<server_task_result_ptr> * qr = nullptr; // set only for streaming responses
     int id = -1;
 
     ~server_tools_res() override {

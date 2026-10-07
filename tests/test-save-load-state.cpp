@@ -591,6 +591,156 @@ static bool test_state_roundtrip(struct llama_model * model, const struct common
     return true;
 }
 
+// Test 9: format separation
+// - save the same sequence as a device blob and then as a host blob
+// - each blob must restore to its own content from a cleared cache
+// a state whose format is tracked by the value, not by a stale global flag, cannot mix the two
+static bool test_format_separation(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_ctx      = 256;
+    params_ctx.n_seq_max  = 2;
+    params_ctx.kv_unified = true;
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+
+    LOG("\n=== Test 9: format separation ===\n");
+
+    if (llama_decode(ctx.get(), llama_batch_get_one(const_cast<llama_token *>(tokens.data()), (int32_t) tokens.size()))) {
+        LOG_ERR("\n%s: failed to decode prompt\n", __func__);
+        return false;
+    }
+
+    const auto read_host = [&]() {
+        std::vector<uint8_t> buf(llama_state_seq_get_size(ctx.get(), 0));
+        const size_t n = llama_state_seq_get_data(ctx.get(), buf.data(), buf.size(), 0);
+        buf.resize(n);
+        return buf;
+    };
+    const std::vector<uint8_t> reference = read_host();
+    if (reference.empty()) {
+        LOG_ERR("\n%s: the host state is empty\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> device_blob(llama_state_seq_get_size_ext(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
+    if (device_blob.empty() ||
+        llama_state_seq_get_data_ext(ctx.get(), device_blob.data(), device_blob.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != device_blob.size()) {
+        LOG_ERR("\n%s: failed to save the device format\n", __func__);
+        return false;
+    }
+
+    // a host save after a device save must still write the host format
+    std::vector<uint8_t> host_blob(llama_state_seq_get_size(ctx.get(), 0));
+    if (host_blob.empty() || llama_state_seq_get_data(ctx.get(), host_blob.data(), host_blob.size(), 0) != host_blob.size()) {
+        LOG_ERR("\n%s: failed to save the host format\n", __func__);
+        return false;
+    }
+
+    const auto restore_and_compare = [&](const std::vector<uint8_t> & blob, llama_state_seq_flags flags, const char * what) {
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
+        const size_t nset = flags == LLAMA_STATE_SEQ_FLAGS_ON_DEVICE
+            ? llama_state_seq_set_data_ext(ctx.get(), blob.data(), blob.size(), 0, flags)
+            : llama_state_seq_set_data(ctx.get(), blob.data(), blob.size(), 0);
+        if (nset != blob.size()) {
+            LOG_ERR("\n%s: %s restore wrote %zu of %zu bytes\n", __func__, what, nset, blob.size());
+            return false;
+        }
+        if (read_host() != reference) {
+            LOG_ERR("\n%s: %s restore does not reproduce the saved state\n", __func__, what);
+            return false;
+        }
+        return true;
+    };
+
+    if (!restore_and_compare(device_blob, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE, "device")) {
+        return false;
+    }
+    if (!restore_and_compare(host_blob, LLAMA_STATE_SEQ_FLAGS_NONE, "host")) {
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+// Test 10: device byte-cursor read path
+// - decode a prompt into seq 0 (several KV cells)
+// - save the device-format state blob
+// - delete a middle cell so the restore's read-side ranges differ from the write-side ranges
+// - restore the blob and assert the re-saved state is byte-identical
+// exercises llama_io_read_device's byte walk and the single-synchronize staging; the CPU backend
+// falls back to a blocking copy, so this runs in CI without a GPU
+static bool test_device_byte_cursor(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_ctx      = 256;
+    params_ctx.n_seq_max  = 2;
+    params_ctx.kv_unified = true;
+
+    LOG("\n=== Test 10: device byte-cursor read path ===\n");
+
+    // a middle-cell deletion needs a cell-level KV cache; recurrent memory cannot erase a
+    // partial middle range, so the non-same-chunking read path does not apply there
+    if (llama_model_is_recurrent(model) || llama_model_is_hybrid(model)) {
+        LOG("SKIP: middle-cell deletion is not supported on recurrent memory\n");
+        return true;
+    }
+
+    const size_t n_tokens = tokens.size() < 64 ? tokens.size() : 64;
+    if (n_tokens < 4) {
+        LOG_ERR("%s: need at least 4 tokens\n", __func__);
+        return false;
+    }
+
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+    if (!ctx) {
+        LOG_ERR("%s: failed to create context\n", __func__);
+        return false;
+    }
+
+    {
+        common_batch batch(ctx.get());
+        for (size_t i = 0; i < n_tokens; ++i) {
+            batch.add(tokens[i], (llama_pos) i, { 0 }, i == n_tokens - 1);
+        }
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            LOG_ERR("%s: failed to decode prompt\n", __func__);
+            return false;
+        }
+    }
+
+    std::vector<uint8_t> blob(llama_state_seq_get_size_ext(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
+    if (blob.empty() ||
+        llama_state_seq_get_data_ext(ctx.get(), blob.data(), blob.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != blob.size()) {
+        LOG_ERR("%s: failed to save the device-format state\n", __func__);
+        return false;
+    }
+
+    // drop one middle cell so the read-side ranges no longer match the write-side ranges
+    const llama_pos mid = (llama_pos) n_tokens / 2;
+    if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, mid, mid)) {
+        LOG_ERR("%s: failed to remove the middle cell\n", __func__);
+        return false;
+    }
+
+    if (llama_state_seq_set_data_ext(ctx.get(), blob.data(), blob.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != blob.size()) {
+        LOG_ERR("%s: failed to restore the device-format state\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> reblob(llama_state_seq_get_size_ext(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
+    if (reblob.empty() ||
+        llama_state_seq_get_data_ext(ctx.get(), reblob.data(), reblob.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != reblob.size()) {
+        LOG_ERR("%s: failed to re-save the restored state\n", __func__);
+        return false;
+    }
+    if (reblob != blob) {
+        LOG_ERR("%s: restored state differs from the saved state (%zu vs %zu bytes)\n",
+                __func__, reblob.size(), blob.size());
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
 
 // overwrite the tensor data with 0xff bytes (NaN when read as f16/f32), so that the restore fails
 static bool corrupt_state(std::vector<uint8_t> & data) {
@@ -604,7 +754,7 @@ static bool corrupt_state(std::vector<uint8_t> & data) {
 }
 
 
-// Test 9: state restore failure
+// Test 11: state restore failure
 // a failed restore must leave the sequence empty and must not change the logits of other sequences
 static bool test_state_restore_failure(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
     auto params_ctx = common_context_params_to_llama(params);
@@ -621,7 +771,7 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
         return false;
     }
 
-    LOGV(LOG_LEVEL_INFO, "\n=== Test 9: state restore failure ===\n");
+    LOGV(LOG_LEVEL_INFO, "\n=== Test 11: state restore failure ===\n");
 
     llama_memory_t mem = llama_get_memory(ctx.get());
     if (mem == nullptr) {
@@ -747,12 +897,12 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
 }
 
 
-// Test 10: state rotation
+// Test 12: state rotation
 // a KV state saved with attention rotation enabled must restore only into a context with the same setting;
 // note: rotation is only active for quantized KV caches with a head size that is a multiple of 64,
 //       for other models the restore into the rotation-disabled context is valid and the test passes vacuously
 static bool test_state_rotation(struct llama_model * model, const struct common_params & params) {
-    LOGV(LOG_LEVEL_INFO, "\n=== Test 10: state rotation ===\n");
+    LOGV(LOG_LEVEL_INFO, "\n=== Test 12: state rotation ===\n");
 
     const std::string attn_rot_disable = common_get_env("LLAMA_ATTN_ROT_DISABLE");
     const auto make_context = [&](ggml_type type_k, ggml_type type_v, bool disable_rotation) {
@@ -843,10 +993,10 @@ struct test_suite {
 
 // column headers for the --models table, one per test, in the order they are run
 static const std::vector<const char *> test_names = {
-    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "rf", "rot",
+    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "fmt_sep", "dev_cur", "rf", "rot",
 };
 
-// Run the full save/load test suite (tests 1-10) for a single model.
+// Run the full save/load test suite (tests 1-12) for a single model.
 // Returns the per-test results.
 static test_suite run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     test_suite suite;
@@ -922,11 +1072,19 @@ static test_suite run_save_load_tests_for_model(const std::string & model_path, 
     // Test 8: state blob round-trip
     suite.results.push_back(test_state_roundtrip(model, params, tokens) ? test_status::PASS : test_status::FAIL);
 
-    // Test 9: state restore failure
+    // Test 9: device and host formats are distinct and each round-trips
+    suite.results.push_back(test_format_separation(model, params, tokens) ? test_status::PASS : test_status::FAIL);
+
+    // Test 10: device byte-cursor read path survives a middle-cell gap
+    suite.results.push_back(test_device_byte_cursor(model, params, tokens) ? test_status::PASS : test_status::FAIL);
+
+    // Test 11: state restore failure
     suite.results.push_back(test_state_restore_failure(model, params, tokens) ? test_status::PASS : test_status::FAIL);
 
-    // Test 10: state rotation
+    // Test 12: state rotation
     suite.results.push_back(test_state_rotation(model, params) ? test_status::PASS : test_status::FAIL);
+
+    LOG("\nAll tests passed.\n");
 
     return suite;
 }

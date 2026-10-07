@@ -64,6 +64,11 @@ struct cache_buffer_collector : llama_io_write_i {
         size += n;
     }
 
+    void write_tensor_strided(ggml_tensor * tensor, size_t, size_t row_size, size_t n_rows, size_t) override {
+        buffers.insert(tensor->buffer);
+        size += row_size * n_rows;
+    }
+
     size_t n_bytes() override {
         return size;
     }
@@ -155,7 +160,8 @@ static test_status test_multi_seq_split_replay(const common_params & params, lla
     }
 
     if (llama_n_rs_seq(ctx_roll.get()) < n_rollback) {
-        LOG_INF("%s: skipping because n_rs_seq is too small\n", __func__);
+        LOG_INF("%s : SKIP: n_rs_seq is too small to exercise the recurrent rollback machinery; "
+                        "this run is NOT green\n", __func__);
         return test_status::SKIP;
     }
 
@@ -322,7 +328,8 @@ static test_status test_rollback(const common_params & params, llama_model * mod
     }
 
     if (llama_n_rs_seq(ctx_src.get()) == 0) {
-        LOG_INF("%s: skipping because n_rs_seq is disabled\n", __func__);
+        LOG_INF("%s : SKIP: n_rs_seq is disabled on this model; the recurrent rollback "
+                        "machinery was not exercised and this run is NOT green\n", __func__);
         return test_status::SKIP;
     }
 
@@ -335,7 +342,8 @@ static test_status test_rollback(const common_params & params, llama_model * mod
     const uint32_t n_rs_seq = llama_n_rs_seq(ctx_src.get());
     constexpr uint32_t n_rollback = 3;
     if (n_rs_seq < n_rollback) {
-        LOG_INF("%s: skipping because n_rs_seq is too small\n", __func__);
+        LOG_INF("%s : SKIP: n_rs_seq (%u) is too small to exercise the recurrent rollback "
+                        "machinery; this run is NOT green\n", __func__, n_rs_seq);
         return test_status::SKIP;
     }
     if (tokens.empty()) {
@@ -647,6 +655,7 @@ int main(int argc, char ** argv) {
             filtered_argv.push_back(argv[i]);
         }
     }
+
     filtered_argv.push_back(nullptr);
     const int fargc = (int)filtered_argv.size() - 1;
 

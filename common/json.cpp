@@ -258,6 +258,7 @@ bool common_json::is_string()         const { return as_json(this).is_string(); 
 bool common_json::is_boolean()        const { return as_json(this).is_boolean(); }
 bool common_json::is_number()         const { return as_json(this).is_number(); }
 bool common_json::is_number_integer() const { return as_json(this).is_number_integer(); }
+bool common_json::is_number_unsigned() const { return as_json(this).is_number_unsigned(); }
 bool common_json::is_number_float()   const { return as_json(this).is_number_float(); }
 
 bool   common_json::empty() const { return as_json(this).empty(); }

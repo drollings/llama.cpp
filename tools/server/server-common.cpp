@@ -69,12 +69,32 @@ json format_error_response(const std::string & message, const enum error_type ty
             type_str = "exceed_context_size_error";
             code = 400;
             break;
+        case ERROR_TYPE_INVALID_REQUEST_SEMANTIC:
+            type_str = "invalid_request_error";
+            code = 422;
+            break;
+        case ERROR_TYPE_PAYLOAD_TOO_LARGE:
+            type_str = "payload_too_large";
+            code = 413;
+            break;
+        case ERROR_TYPE_CLIENT_CLOSED:
+            type_str = "client_closed_request";
+            code = 499;
+            break;
+        case ERROR_TYPE_OVERLOADED:
+            type_str = "overloaded_error";
+            code = 529;
+            break;
     }
     return json {
         {"code", code},
         {"message", message},
         {"type", type_str},
     };
+}
+
+int error_status(const enum error_type type) {
+    return json_value(format_error_response("", type), "code", 500);
 }
 
 //
@@ -237,6 +257,20 @@ bool are_lora_equal(
     for (size_t i = 0; i < l1.size(); ++i) {
         // we don't check lora.path to reduce the time complexity
         if (l1[i].scale != l2[i].scale || l1[i].ptr != l2[i].ptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool are_lora_sets_identical(
+        const std::vector<common_adapter_lora_info> & l1,
+        const std::vector<common_adapter_lora_info> & l2) {
+    if (l1.size() != l2.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < l1.size(); ++i) {
+        if (l1[i].path != l2[i].path || l1[i].scale != l2[i].scale || l1[i].ptr != l2[i].ptr) {
             return false;
         }
     }
