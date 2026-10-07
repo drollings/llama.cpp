@@ -70,6 +70,9 @@ enum error_type {
     ERROR_TYPE_INVALID_REQUEST_SEMANTIC,  // custom error: valid syntax, invalid semantics
     ERROR_TYPE_RATE_LIMITED,              // custom error: a server limit refused the request
     ERROR_TYPE_REQUEST_TOO_LARGE,         // custom error: valid request, more work than the server renders
+    ERROR_TYPE_PAYLOAD_TOO_LARGE,         // custom error: request body over the configured cap
+    ERROR_TYPE_CLIENT_CLOSED,             // custom error: client disconnected mid-evaluation
+    ERROR_TYPE_OVERLOADED,                // custom error: server overloaded
     ERROR_TYPE_COUNT,
 };
 
@@ -82,18 +85,21 @@ struct server_error_info {
 // the one place the (code, type) pair of an error kind is written. 400 is shared on purpose; a client tells the 400 kinds apart by their "type" string
 inline server_error_info error_type_info(error_type type) {
     switch (type) {
-        case ERROR_TYPE_INVALID_REQUEST:         return { 400, "invalid_request_error" };
-        case ERROR_TYPE_AUTHENTICATION:          return { 401, "authentication_error" };
-        case ERROR_TYPE_SERVER:                  return { 500, "server_error" };
-        case ERROR_TYPE_NOT_FOUND:               return { 404, "not_found_error" };
-        case ERROR_TYPE_PERMISSION:              return { 403, "permission_error" };
-        case ERROR_TYPE_UNAVAILABLE:             return { 503, "unavailable_error" };
-        case ERROR_TYPE_NOT_SUPPORTED:           return { 501, "not_supported_error" };
-        case ERROR_TYPE_EXCEED_CONTEXT_SIZE:     return { 400, "exceed_context_size_error" };
-        case ERROR_TYPE_EXCEED_BATCH_SIZE:       return { 400, "exceed_batch_size_error" };
+        case ERROR_TYPE_INVALID_REQUEST:          return { 400, "invalid_request_error" };
+        case ERROR_TYPE_AUTHENTICATION:           return { 401, "authentication_error" };
+        case ERROR_TYPE_SERVER:                   return { 500, "server_error" };
+        case ERROR_TYPE_NOT_FOUND:                return { 404, "not_found_error" };
+        case ERROR_TYPE_PERMISSION:               return { 403, "permission_error" };
+        case ERROR_TYPE_UNAVAILABLE:              return { 503, "unavailable_error" };
+        case ERROR_TYPE_NOT_SUPPORTED:            return { 501, "not_supported_error" };
+        case ERROR_TYPE_EXCEED_CONTEXT_SIZE:      return { 400, "exceed_context_size_error" };
+        case ERROR_TYPE_EXCEED_BATCH_SIZE:        return { 400, "exceed_batch_size_error" };
         case ERROR_TYPE_INVALID_REQUEST_SEMANTIC: return { 422, "unprocessable_entity_error" };
-        case ERROR_TYPE_RATE_LIMITED:            return { 429, "rate_limit_error" };
-        case ERROR_TYPE_REQUEST_TOO_LARGE:       return { 413, "request_too_large_error" };
+        case ERROR_TYPE_RATE_LIMITED:             return { 429, "rate_limit_error" };
+        case ERROR_TYPE_REQUEST_TOO_LARGE:        return { 413, "request_too_large_error" };
+        case ERROR_TYPE_PAYLOAD_TOO_LARGE:       return { 413, "payload_too_large" };
+        case ERROR_TYPE_CLIENT_CLOSED:           return { 499, "client_closed_request" };
+        case ERROR_TYPE_OVERLOADED:              return { 529, "overloaded_error" };
         case ERROR_TYPE_COUNT: break;
     }
     return { 500, "server_error" }; // answer the caller, do not die over an unknown kind

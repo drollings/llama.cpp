@@ -97,15 +97,43 @@ enum class list_kind {
 };
 
 // a narrow path uses the active code page on Windows, so every crossing between
-// a std::string (always UTF-8 here) and fs::path is converted explicitly
+// a std::string (always UTF-8 here) and fs::path is converted explicitly.
+// C++17 only: no char8_t / u8string (those are C++20).
 static fs::path path_from_utf8(const std::string & s) {
-    return fs::u8path(s);
+#if defined(_WIN32)
+    if (s.empty()) {
+        return fs::path();
+    }
+    const int wide_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int) s.size(), nullptr, 0);
+    if (wide_len <= 0) {
+        return fs::path(s); // fallback: active code page
+    }
+    std::wstring wide(wide_len, L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int) s.size(), wide.data(), wide_len);
+    return fs::path(wide);
+#else
+    // POSIX: path bytes are passed through unchanged
+    return fs::path(s);
+#endif
 }
 
 // '/' separators on every platform: Windows accepts them, the web UI needs them
 static std::string path_to_utf8(const fs::path & p) {
-    const auto s = p.generic_u8string();
-    return std::string(s.begin(), s.end());
+#if defined(_WIN32)
+    const std::wstring wide = p.generic_wstring();
+    if (wide.empty()) {
+        return std::string();
+    }
+    const int utf8_len = WideCharToMultiByte(CP_UTF8, 0, wide.data(), (int) wide.size(), nullptr, 0, nullptr, nullptr);
+    if (utf8_len <= 0) {
+        return p.generic_string(); // fallback: active code page
+    }
+    std::string utf8(utf8_len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.data(), (int) wide.size(), utf8.data(), utf8_len, nullptr, nullptr);
+    return utf8;
+#else
+    return p.generic_string();
+#endif
 }
 
 // home directory, read once at first use (getenv is not thread safe against setenv)

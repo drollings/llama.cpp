@@ -98,21 +98,28 @@ static void test_status_error_carries_its_kind() {
 
 // 413 reports that the request asks for more work than this server will render. It has to be
 // recognizable on its own: a client must not confuse it with the 429 that says the server is busy,
-// so no other kind may share its status, and its type string must stay the one the client reads.
-// 400 is shared by two kinds on purpose, so this is asserted for this kind and not for the switch
+// so no other kind except the body-cap sibling may share its status, and its type string must stay
+// the one the client reads. 413 is shared by the two "too large" kinds on purpose (body over the
+// configured cap vs valid request asking for more work than rendered); a client tells them apart by
+// their "type" string, like the two 400 kinds. 400 sharing stays asserted for the switch, not here.
 static void test_request_too_large_is_its_own_kind() {
     const server_error_info too_large = error_type_info(ERROR_TYPE_REQUEST_TOO_LARGE);
     GGML_ASSERT(too_large.code == 413);
     GGML_ASSERT(std::string(too_large.type) == "request_too_large_error");
 
     for (size_t i = 0; i < ERROR_TYPE_COUNT; i++) {
-        if (i == ERROR_TYPE_REQUEST_TOO_LARGE) {
+        if (i == ERROR_TYPE_REQUEST_TOO_LARGE || i == ERROR_TYPE_PAYLOAD_TOO_LARGE) {
             continue;
         }
         const server_error_info other = error_type_info((error_type) i);
         GGML_ASSERT(other.code != too_large.code);
         GGML_ASSERT(std::string(other.type) != too_large.type);
     }
+
+    // the sibling shares the status but never the type string
+    const server_error_info payload = error_type_info(ERROR_TYPE_PAYLOAD_TOO_LARGE);
+    GGML_ASSERT(payload.code == too_large.code);
+    GGML_ASSERT(std::string(payload.type) != std::string(too_large.type));
 }
 
 
