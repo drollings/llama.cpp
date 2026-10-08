@@ -163,9 +163,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # the target only exists when tools/ adds tools/server, so the same condition guards the test
     if (LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER)
         llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+        target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
         target_link_libraries(test-chat PRIVATE server-context)
     endif()
-    llama_build_and_test(test-json-schema-to-grammar.cpp)
+    llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
