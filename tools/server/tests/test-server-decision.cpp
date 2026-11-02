@@ -1023,9 +1023,9 @@ static server_task decision_task(int id, size_t n_tokens, llama_token first = 0)
 }
 
 // a group is its parent followed by its children, so flattening gives the tasks as they were given
-static std::vector<int> flattened_ids(const server_decision_tasks & grouped) {
+static std::vector<int> flattened_ids(const std::vector<server_task> & grouped) {
     std::vector<int> ids;
-    for (const auto & task : grouped.tasks) {
+    for (const auto & task : grouped) {
         ids.push_back(task.id);
         for (const auto & child : task.child_tasks) {
             ids.push_back(child.id);
@@ -1036,15 +1036,24 @@ static std::vector<int> flattened_ids(const server_decision_tasks & grouped) {
 
 // the number of prompt tokens the batch actually evaluates, read off the grouped tasks: the parent
 // pays for its whole prompt, each child only for the tokens past the prefix it inherits
-static int32_t tokens_evaluated(const server_decision_tasks & grouped) {
+static int32_t tokens_evaluated(const std::vector<server_task> & grouped) {
     int32_t n = 0;
-    for (const auto & task : grouped.tasks) {
+    for (const auto & task : grouped) {
         n += task.n_tokens();
         for (const auto & child : task.child_tasks) {
             n += child.n_tokens() - task.n_tokens_shared;
         }
     }
     return n;
+}
+
+// n_shared for a grouped vector, as build_tasks() sums it for the usage discount
+static int32_t group_n_shared(const std::vector<server_task> & grouped) {
+    size_t n = 0;
+    for (const auto & task : grouped) {
+        n = decision_saturating_add(n, decision_saturating_mul((size_t) task.n_tokens_shared, task.child_tasks.size()));
+    }
+    return n > (size_t) std::numeric_limits<int32_t>::max() ? std::numeric_limits<int32_t>::max() : (int32_t) n;
 }
 
 // the shared prefix must be discounted exactly once per child that inherits it: what the route
@@ -1060,19 +1069,19 @@ static void test_grouping_counts_the_prefix_once() {
             tasks.push_back(decision_task((int) i, 2 + rng() % 8));
         }
 
-        const server_decision_tasks grouped = server_decision_group_tasks(std::move(tasks), n_slots);
+        const std::vector<server_task> grouped = server_decision_group_tasks(std::move(tasks), n_slots);
 
         int32_t reported = 0;
-        for (const auto & task : grouped.tasks) {
+        for (const auto & task : grouped) {
             reported += task.n_tokens();
             for (const auto & child : task.child_tasks) {
                 reported += child.n_tokens();
             }
         }
 
-        GGML_ASSERT(reported - grouped.n_shared == tokens_evaluated(grouped));
+        GGML_ASSERT(reported - group_n_shared(grouped) == tokens_evaluated(grouped));
         // the two never disagree because neither is allowed to go negative
-        GGML_ASSERT(grouped.n_shared <= reported);
+        GGML_ASSERT(group_n_shared(grouped) <= reported);
     }
 }
 
@@ -1082,8 +1091,8 @@ static void test_grouping_empty_prompt_shares_nothing() {
     tasks.push_back(decision_task(0, 0));
     tasks.push_back(decision_task(1, 0));
     tasks.push_back(decision_task(2, 5));
-    const server_decision_tasks grouped = server_decision_group_tasks(std::move(tasks), 3);
-    GGML_ASSERT(grouped.n_shared == 0);
+    const std::vector<server_task> grouped = server_decision_group_tasks(std::move(tasks), 3);
+    GGML_ASSERT(group_n_shared(grouped) == 0);
     GGML_ASSERT(flattened_ids(grouped).size() == 3);
     GGML_ASSERT(tokens_evaluated(grouped) == 5);
 }
@@ -1123,10 +1132,10 @@ static void test_budget_sees_pre_group_billing_sees_post_group() {
     for (const auto & task : tasks) {
         pre_group += task.n_tokens();
     }
-    const server_decision_tasks grouped = server_decision_group_tasks(std::move(tasks), 3);
-    GGML_ASSERT(grouped.tasks.size() == 1);
-    const size_t billed = decision_usage_input_tokens((size_t) pre_group, (size_t) grouped.n_shared);
-    GGML_ASSERT(pre_group - (int32_t) billed == grouped.n_shared);
+    const std::vector<server_task> grouped = server_decision_group_tasks(std::move(tasks), 3);
+    GGML_ASSERT(grouped.size() == 1);
+    const size_t billed = decision_usage_input_tokens((size_t) pre_group, (size_t) group_n_shared(grouped));
+    GGML_ASSERT(pre_group - (int32_t) billed == group_n_shared(grouped));
     GGML_ASSERT(billed == (size_t) tokens_evaluated(grouped));
 }
 
@@ -1157,16 +1166,16 @@ static void test_grouping_respects_n_slots() {
                 tasks.push_back(decision_task((int) i, 4 + i % 3));
             }
 
-            const server_decision_tasks grouped = server_decision_group_tasks(std::move(tasks), n_slots);
+            const std::vector<server_task> grouped = server_decision_group_tasks(std::move(tasks), n_slots);
 
             // the width a group can reach is the slot count, or one task when there are no slots
             const size_t width    = std::max(n_slots, (size_t) 1);
             const size_t expected = (n_tasks + width - 1) / width;
-            GGML_ASSERT(grouped.tasks.size() == expected);
+            GGML_ASSERT(grouped.size() == expected);
 
             // no task is lost or duplicated, and no group is wider than the slots allow
             GGML_ASSERT(flattened_ids(grouped).size() == n_tasks);
-            for (const auto & task : grouped.tasks) {
+            for (const auto & task : grouped) {
                 GGML_ASSERT(task.child_tasks.size() < width);
                 if (task.child_tasks.empty()) {
                     GGML_ASSERT(!task.is_parent());
@@ -1186,7 +1195,7 @@ static void test_grouping_respects_n_slots() {
     for (size_t i = 0; i < 5; i++) {
         five.push_back(decision_task((int) i, 5));
     }
-    GGML_ASSERT(server_decision_group_tasks(std::move(five), SIZE_MAX).tasks.size() == 1);
+    GGML_ASSERT(server_decision_group_tasks(std::move(five), SIZE_MAX).size() == 1);
 }
 
 // a task always keeps at least one token of its own, so a prompt of one token can never be a child,
@@ -1197,21 +1206,21 @@ static void test_grouping_needs_a_token_of_its_own() {
     tasks.push_back(decision_task(1, 1));
     tasks.push_back(decision_task(2, 6));
     tasks.push_back(decision_task(3, 1));
-    const server_decision_tasks grouped = server_decision_group_tasks(std::move(tasks), 4);
-    for (const auto & task : grouped.tasks) {
+    const std::vector<server_task> grouped = server_decision_group_tasks(std::move(tasks), 4);
+    for (const auto & task : grouped) {
         for (const auto & child : task.child_tasks) {
             GGML_ASSERT(child.n_tokens() > 1);
         }
     }
-    GGML_ASSERT(grouped.n_shared == 0);
-    GGML_ASSERT(grouped.tasks.size() == 4);
+    GGML_ASSERT(group_n_shared(grouped) == 0);
+    GGML_ASSERT(grouped.size() == 4);
 }
 
 static void test_grouping_degenerate_cases() {
     // one task has nothing to share with
     std::vector<server_task> single;
     single.push_back(decision_task(0, 5));
-    GGML_ASSERT(server_decision_group_tasks(std::move(single), 4).n_shared == 0);
+    GGML_ASSERT(group_n_shared(server_decision_group_tasks(std::move(single), 4)) == 0);
 
     // without slots there is no group to fill, so every task runs on its own
     for (size_t n_slots : { (size_t) 0, (size_t) 1 }) {
@@ -1219,9 +1228,9 @@ static void test_grouping_degenerate_cases() {
         for (size_t i = 0; i < 4; i++) {
             tasks.push_back(decision_task((int) i, 5));
         }
-        const server_decision_tasks grouped = server_decision_group_tasks(std::move(tasks), n_slots);
-        GGML_ASSERT(grouped.n_shared == 0);
-        GGML_ASSERT(grouped.tasks.size() == 4);
+        const std::vector<server_task> grouped = server_decision_group_tasks(std::move(tasks), n_slots);
+        GGML_ASSERT(group_n_shared(grouped) == 0);
+        GGML_ASSERT(grouped.size() == 4);
     }
 
     // prompts that share nothing share nothing, whatever the first token is
@@ -1229,17 +1238,17 @@ static void test_grouping_degenerate_cases() {
     for (size_t i = 0; i < 3; i++) {
         disjoint.push_back(decision_task((int) i, 5, (llama_token) (100 * (i + 1))));
     }
-    GGML_ASSERT(server_decision_group_tasks(std::move(disjoint), 3).n_shared == 0);
+    GGML_ASSERT(group_n_shared(server_decision_group_tasks(std::move(disjoint), 3)) == 0);
 
     // identical prompts share all but their last token
     std::vector<server_task> same;
     for (size_t i = 0; i < 3; i++) {
         same.push_back(decision_task((int) i, 7));
     }
-    const server_decision_tasks identical = server_decision_group_tasks(std::move(same), 3);
-    GGML_ASSERT(identical.n_shared == 6 * 2);
-    GGML_ASSERT(identical.tasks.size() == 1);
-    GGML_ASSERT(identical.tasks[0].child_tasks.size() == 2);
+    const std::vector<server_task> identical = server_decision_group_tasks(std::move(same), 3);
+    GGML_ASSERT(group_n_shared(identical) == 6 * 2);
+    GGML_ASSERT(identical.size() == 1);
+    GGML_ASSERT(identical[0].child_tasks.size() == 2);
 }
 
 // a model that cannot continue from another task's prompt is posted as it is, so the route can
@@ -1588,7 +1597,7 @@ static void test_post_tasks_registers_ids() {
     const std::unordered_set<int> expected = server_task::get_list_id(tasks);
     GGML_ASSERT(expected.size() == 4);
 
-    reader.post_tasks(std::move(tasks), false);
+    reader.post_tasks(std::move(tasks));
 
     GGML_ASSERT(reader.id_tasks == expected);
     GGML_ASSERT(reader.states.size() == expected.size());
@@ -1853,7 +1862,7 @@ static void test_duplicate_task_id_throws() {
     }
     bool threw = false;
     try {
-        reader.post_tasks(std::move(tasks), false);
+        reader.post_tasks(std::move(tasks));
     } catch (const std::runtime_error &) {
         threw = true;
     }

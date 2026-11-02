@@ -242,14 +242,16 @@ struct server_response_reader {
 
     // if front = true, the task will be posted to the front of the queue (high priority)
     void post_task(server_task && task, bool front = false);
-    void post_tasks(std::vector<server_task> && tasks, bool front = false);
+    void post_tasks(std::vector<server_task> && tasks, const common_chat_session & session = {}, bool front = false);
 
     // post_tasks(), refused when counted_type is already at cap (0 is unlimited). The ids registered before the post are removed on refusal; *depth_at_refusal is the locked depth
+    // session is last so existing try_post_tasks(tasks, type, cap, front, depth) calls keep compiling; decision tasks pass the default
     bool try_post_tasks(std::vector<server_task> && tasks,
                         server_task_type            counted_type,
                         size_t                      cap,
                         bool                        front            = false,
-                        size_t *                    depth_at_refusal = nullptr);
+                        size_t *                    depth_at_refusal = nullptr,
+                        const common_chat_session & session          = {});
     bool has_next() const;
 
     // return nullptr if should_stop() is true before receiving a result
@@ -268,5 +270,5 @@ struct server_response_reader {
 
   private:
     // assign an index and a state per task and child, and register every id for a result. Call before posting, no lock held
-    void register_tasks(std::vector<server_task> & tasks);
+    void register_tasks(std::vector<server_task> & tasks, const common_chat_session & session = {});
 };
