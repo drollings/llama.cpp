@@ -259,6 +259,7 @@ public:
     // same as recv(), but have timeout in seconds
     // if timeout is reached, nullptr is returned
     T recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_results);
 
@@ -266,7 +267,7 @@ public:
                 return res;
             }
 
-            std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
+            std::cv_status cr_res = condition_results.wait_until(lock, deadline);
             if (!running) {
                 RES_DBG("%s : queue result stop\n", __func__);
                 std::terminate(); // we cannot return here since the caller is HTTP code
@@ -324,6 +325,11 @@ public:
     }
 };
 
+// legacy alias: upstream code (e.g. server-realtime) still names the concrete
+// production queue server_response. keep it so new upstream files compile
+// without edits while the generic template is the implementation.
+using server_response = server_result_queue<server_task_result_ptr>;
+
 // polling cadence for scheduler waits through server_response_reader
 constexpr int HTTP_POLLING_SECONDS = 1;
 
@@ -355,7 +361,7 @@ struct server_response_reader {
 
     // if front = true, the task will be posted to the front of the queue (high priority)
     void post_task(server_task && task, bool front = false);
-    void post_tasks(std::vector<server_task> && tasks, bool front = false);
+    void post_tasks(std::vector<server_task> && tasks, const common_chat_session & session = {}, bool front = false);
     bool has_next() const;
 
     // return nullptr if should_stop() is true before receiving a result

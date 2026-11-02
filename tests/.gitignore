@@ -4,6 +4,7 @@
 !fusion/
 !fixtures/
 !fixtures/**
+!llama-context/
 *.o
 ggml-common.h
 **/*.swp
