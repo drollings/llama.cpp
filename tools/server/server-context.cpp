@@ -1087,6 +1087,17 @@ public:
         metrics.reset_bucket();
     }
 
+    // idle-slot snapshot for serving /slots while sleeping without waking.
+    // only_metrics=true avoids detokenizing (no ctx deref), safe on the
+    // sleep-enter path and after a failed wake when ctx is null.
+    json snapshot_slots_json() const {
+        json arr = json::array();
+        for (const auto & slot : slots) {
+            arr.push_back(slot.to_json(true));
+        }
+        return arr;
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -1198,6 +1209,11 @@ private:
 
     bool sleeping = false;
 
+    // last wake attempt failed (e.g. OOM): model pointers are null, serve
+    // retriable 503 until the next wake retry instead of aborting the process
+    bool wake_failed = false;
+    int64_t last_wake_fail_ms = 0;
+
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
@@ -1232,8 +1248,18 @@ private:
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
+            wake_failed = false;
             if (!load_model(params_base)) {
-                GGML_ABORT("failed to reload model after sleeping");
+                // graceful failure: stay alive so the router can evict LRU models
+                // and the next wake retries. never abort here: the failed alloc
+                // alone can pin the GPU at 100% and abort turns it into a crash loop.
+                SRV_ERR("%s", "failed to reload model after sleeping, staying alive for retry\n");
+                destroy();
+                wake_failed = true;
+                last_wake_fail_ms = ggml_time_ms();
+                if (callback_state) {
+                    callback_state(SERVER_STATE_SLEEPING, {});
+                }
             }
         }
         sleeping = new_state;
@@ -3126,6 +3152,56 @@ private:
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
+        }
+
+        // model is null after entering sleep or a failed wake reload (OOM).
+        // read-only tasks stay servable; everything needing the model fails
+        // fast with a retriable error instead of crashing on a null context.
+        // reload retries are rate-limited so a persistent OOM does not hot-loop
+        // the allocator (which alone pins the GPU at 100%).
+        if (ctx_tgt == nullptr || model_tgt == nullptr) {
+            switch (task.type) {
+                case SERVER_TASK_TYPE_METRICS:
+                case SERVER_TASK_TYPE_SLOT_GET:
+                case SERVER_TASK_TYPE_CANCEL:
+                case SERVER_TASK_TYPE_NEXT_RESPONSE:
+                case SERVER_TASK_TYPE_CONTROL:
+                    break;
+                default: {
+                    const int64_t now = ggml_time_ms();
+                    if (wake_failed && (now - last_wake_fail_ms) < 5000) {
+                        send_error(task, "model is unloaded after a failed reload (likely out of memory), retry later", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    last_wake_fail_ms = now;
+                    if (!load_model(params_base)) {
+                        SRV_ERR("%s", "on-demand reload failed, staying alive for retry\n");
+                        destroy();
+                        wake_failed = true;
+                        if (callback_state) {
+                            callback_state(SERVER_STATE_SLEEPING, {});
+                        }
+                        send_error(task, "failed to reload model (likely out of memory), retry later", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    wake_failed = false;
+                    break;
+                }
+            }
+            // retried-and-failed tasks already answered above; read-only tasks
+            // fall through to the normal switch below
+            if (ctx_tgt == nullptr || model_tgt == nullptr) {
+                switch (task.type) {
+                    case SERVER_TASK_TYPE_METRICS:
+                    case SERVER_TASK_TYPE_SLOT_GET:
+                    case SERVER_TASK_TYPE_CANCEL:
+                    case SERVER_TASK_TYPE_NEXT_RESPONSE:
+                    case SERVER_TASK_TYPE_CONTROL:
+                        break;
+                    default:
+                        return true;
+                }
+            }
         }
 
         switch (task.type) {
@@ -6156,9 +6232,40 @@ void server_routes::init_routes() {
     };
 
     this->get_slots = [this](const server_http_req & req) {
-        auto res = create_response();
+        // bypass_sleep=true so observability never wakes a sleeping model:
+        // a /slots scrape must not materialize a window (same contract as
+        // /metrics, /props, /health, /models). while sleeping, serve the
+        // snapshot taken on sleep-enter; only explicit generation/management
+        // endpoints wake.
+        auto res = create_response(true);
         if (!params.endpoint_slots) {
             res->error(format_error_response("This server does not support slots endpoint. Start it with `--slots`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        if (queue_tasks.is_sleeping()) {
+            json cached;
+            {
+                std::unique_lock<std::mutex> lock(mutex_cache);
+                cached = cached_slots;
+            }
+            if (!req.get_param("fail_on_no_slot").empty()) {
+                int n_idle = 0;
+                if (cached.is_array()) {
+                    for (const auto & s : cached) {
+                        if (!json_value(s, "is_processing", true)) {
+                            n_idle++;
+                        }
+                    }
+                }
+                if (n_idle == 0) {
+                    // sleeping and no idle slot in the snapshot: report
+                    // unavailable rather than waking for a read-only poll
+                    res->error(format_error_response("no slot available", ERROR_TYPE_UNAVAILABLE));
+                    return res;
+                }
+            }
+            res->ok(cached);
             return res;
         }
 
@@ -7546,6 +7653,7 @@ void server_routes::update_cached_responses(bool is_sleeping) {
         cached_models  = get_res_models(*meta);
         cached_props   = get_res_props(*meta, params, true);
         cached_metrics = ctx_server.get_metrics();
+        cached_slots   = ctx_server.snapshot_slots_json();
 
         should_reset_buckets = false;
 

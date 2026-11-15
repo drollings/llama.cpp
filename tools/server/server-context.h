@@ -299,6 +299,7 @@ private:
     std::mutex     mutex_cache;
     json           cached_models  = nullptr;
     json           cached_props   = nullptr;
+    json           cached_slots   = json::array();
     server_metrics cached_metrics;
     // set when a scrape during sleep already reported the throughput buckets
     bool           should_reset_buckets = false;

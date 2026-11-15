@@ -1607,6 +1607,33 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
         return false; // ready for taking requests
     }
     if (!stopping && meta->status == SERVER_MODEL_STATUS_SLEEPING) {
+        // Wake must favor the model in current demand: the child reloads its
+        // weights/VRAM on the next proxied request with no memory check of its
+        // own. Evict idle LRU models first (count and, when enabled, memory
+        // margin) so the wake has room. The queue entry protects us from being
+        // picked as a victim while we make room. If everything else is busy,
+        // make_room is a no-op and the child fails the wake with a retriable
+        // 503 instead of aborting (see handle_sleeping_state).
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            auto it = mapping.find(name);
+            if (it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_SLEEPING) {
+                sched->join(lk, name);
+                sched->tick(lk);
+            } else {
+                return false;
+            }
+        }
+        try {
+            sched->make_room(name);
+        } catch (const std::exception & e) {
+            SRV_WRN("wake make_room for name=%s failed: %s\n", name.c_str(), e.what());
+        }
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            sched->leave(lk, name);
+            sched->tick(lk);
+        }
         return false; // child is sleeping but still running; new request will wake it up
     }
 
