@@ -458,7 +458,7 @@ static bool decision_is_payload(const json & val) {
 
 // single source for question parsing: hardening (422/413, id, count, content) plus new-model branches.
 // type defaults to NONE so existing tests that pass only (body, traits) keep compiling; production passes the model type.
-std::vector<server_decision_question> decision_parse_questions(const json & body, const decision_model_traits & traits, common_decision_type type) {
+std::vector<server_decision_question> decision_parse_questions(const json & body, const decision_model_traits & traits, common_decision_type type, bool support_audio_input) {
     if (!body.contains("questions") || !body.at("questions").is_object() || body.at("questions").empty()) {
         throw server_invalid_request("\"questions\" must be a non-empty object");
     }
@@ -502,8 +502,8 @@ std::vector<server_decision_question> decision_parse_questions(const json & body
         if (traits.strict_payload && (!decision_is_payload(instructions) || instructions == "")) {
             throw err("\"instructions\" must be non-empty text, an object or an array");
         }
-        if (type == COMMON_DECISION_TYPE_LFM3_D1 && decision_is_spoken(instructions)) {
-            throw err("spoken instructions need a model with audio input");
+        if ((type != COMMON_DECISION_TYPE_LFM3_D1_OMNI || !support_audio_input) && decision_is_spoken(instructions)) {
+            throw err("spoken instructions are only supported by lfm3-d1-omni with audio input");
         }
 
         server_decision_question question;
@@ -518,8 +518,9 @@ std::vector<server_decision_question> decision_parse_questions(const json & body
             if (!criteria.is_object() || criteria.empty()) {
                 throw err("\"criteria\" must be a non-empty object");
             }
-            // refuse before copying, so a huge criteria cannot force an allocation to learn it is huge
-            if (criteria.size() > traits.n_options_max) {
+            // refuse before copying, so a huge criteria cannot force an allocation to learn it is huge.
+            // ocr-jev is exempt: its classes are fixed, the exact shape is checked below without the model limits
+            if (type != COMMON_DECISION_TYPE_MINICPM_OCR_JEV && criteria.size() > traits.n_options_max) {
                 throw err(string_format("\"criteria\" has %zu options, at most %zu are supported",
                                         criteria.size(),
                                         traits.n_options_max));
@@ -615,19 +616,19 @@ std::vector<server_decision_question> decision_parse_questions(const json & body
     return questions;
 }
 
-server_decision_request server_decision_context::parse_request(const json & body) const {
+server_decision_request server_decision_context::parse_request(const json & body, bool support_audio_input) const {
     // before any dump() or recursive walk below, which are only safe once depth is bounded
     decision_check_json_depth(body);
     // lfm2-d1, lfm2-d1-omni, lfm3-d1 and vllm-d3 accept a null state, for example to ask about images only
     const bool allow_null = type == COMMON_DECISION_TYPE_LFM2_D1 || type == COMMON_DECISION_TYPE_LFM2_D1_OMNI || type == COMMON_DECISION_TYPE_VLLM_D3 || type == COMMON_DECISION_TYPE_LFM3_D1 || type == COMMON_DECISION_TYPE_LFM3_D1_OMNI;
     server_decision_request request;
-    request.questions = decision_parse_questions(body, traits, type);
+    request.questions = decision_parse_questions(body, traits, type, support_audio_input);
     request.state     = prepare_state(decision_parse_state(body, request.files, allow_null, type));
     return request;
 }
 
 // member wrappers: single source is the free functions above (422/413 taxonomy), members adapt direct state to traits
-std::vector<server_decision_question> server_decision_context::parse_questions(const json & body) const {
+std::vector<server_decision_question> server_decision_context::parse_questions(const json & body, bool support_audio_input) const {
     // state checks mirror parse_request's null-state rule; questions share the free implementation
     const bool allow_null = type == COMMON_DECISION_TYPE_LFM2_D1 || type == COMMON_DECISION_TYPE_LFM2_D1_OMNI || type == COMMON_DECISION_TYPE_VLLM_D3 || type == COMMON_DECISION_TYPE_LFM3_D1 || type == COMMON_DECISION_TYPE_LFM3_D1_OMNI;
     if (!body.contains("state") || (body.at("state").is_null() && !allow_null)) {
@@ -636,7 +637,7 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
     if (traits.strict_payload && body.contains("state") && !body.at("state").is_null() && !decision_is_payload(body.at("state"))) {
         throw server_invalid_request("\"state\" must be text, an object or an array");
     }
-    return decision_parse_questions(body, traits, type);
+    return decision_parse_questions(body, traits, type, support_audio_input);
 }
 
 json server_decision_context::parse_state(const json & body, std::vector<raw_buffer> & files) const {
@@ -1842,6 +1843,72 @@ void server_decision_context::fill_task_d1omni(
 //
 
 // given to the template: text between the pieces of the prompt, and at the start of the span of a question or of an option
+// lfm3-d1 packs the questions of a state as d1 attention.py pack_set does
+static const std::string D1_HEAD   = "<|startoftext|><|im_start|>user\n";
+static const std::string D1_HEADER = "QUESTION:\n";
+
+size_t server_decision_context::set_size(const std::vector<server_decision_question> & questions) const {
+    if (!is_lfm3_d1()) {
+        return 0;
+    }
+    // TODO: pack spoken questions
+    for (const auto & question : questions) {
+        if (decision_is_spoken(question.instructions)) {
+            return 0;
+        }
+    }
+    return COMMON_DECISION_LFM3_D1_SET_SIZE;
+}
+
+void server_decision_context::fill_task_set(
+        const json & state,
+        const std::vector<server_decision_question> & questions,
+        const std::vector<raw_buffer> & files,
+        mtmd_context * mctx,
+        const mtmd_helper_init_opt & init_opt,
+        server_task & task) const {
+    GGML_ASSERT(!questions.empty());
+
+    std::string head = D1_HEAD;
+    for (size_t i = 0; i < files.size(); i++) {
+        head += get_media_marker();
+    }
+    auto suffix = [&](const server_decision_question & question) {
+        const std::string lone = render(json(), questions, question, 0, files.size());
+        if (!string_starts_with(lone, head)) {
+            throw std::runtime_error("unexpected layout of the decision prompt");
+        }
+        return lone.substr(head.size());
+    };
+
+    // the first question is its lone prompt
+    fill_task(state, questions, questions[0], 0, files, mctx, init_opt, task);
+    const size_t n_first = common_tokenize(vocab, suffix(questions[0]), false, true).size();
+    if (n_first >= task.tokens.size()) {
+        throw std::runtime_error("unexpected layout of the decision prompt");
+    }
+    task.decision.group.assign(task.tokens.size(), 0);
+    std::fill(task.decision.group.end() - n_first, task.decision.group.end(), 1);
+    task.decision.label_pos.assign(task.decision.label_groups.size(), task.tokens.size() - 1);
+
+    for (size_t k = 1; k < questions.size(); k++) {
+        const std::string text = (state.is_null() ? "" : D1_HEADER) + suffix(questions[k]);
+        for (const llama_token token : common_tokenize(vocab, text, false, true)) {
+            task.tokens.push_back(token);
+            task.decision.group.push_back(k + 1);
+        }
+
+        std::vector<std::string>  texts;
+        std::vector<llama_tokens> groups;
+        d1_labels(questions[k], texts, groups);
+        for (const auto & group : groups) {
+            task.decision.labels.insert(task.decision.labels.end(), group.begin(), group.end());
+            task.decision.label_groups.push_back(group.size());
+            task.decision.label_pos.push_back(task.tokens.size() - 1);
+        }
+    }
+}
+
 static const std::string CLEF_MARKER        = "<<clef:";
 static const std::string CLEF_SEP           = "<<clef:sep>>";
 static const std::string CLEF_MARK_QUESTION = "<<clef:question>>";
@@ -2036,14 +2103,30 @@ server_decision_tasks server_decision_context::build_tasks(
         return { std::move(tasks), 0 };
     }
 
-    for (const auto & question : request.questions) {
-        for (size_t variant = 0; variant < n_variants(question); variant++) {
+    // lfm3-d1 packs the questions of a state after it, up to set_size() of them per prompt
+    const size_t n_set = set_size(request.questions);
+    if (n_set > 0) {
+        for (size_t i = 0; i < request.questions.size(); i += n_set) {
+            const std::vector<server_decision_question> set(
+                request.questions.begin() + i,
+                request.questions.begin() + std::min(request.questions.size(), i + n_set));
             server_task task = server_task(SERVER_TASK_TYPE_DECISION);
             task.id          = next_id();
-            fill_task(request.state, request.questions, question, variant, request.files, mctx, init_opt, task);
-            refuse_empty(task, "questions." + question.id);
+            fill_task_set(request.state, set, request.files, mctx, init_opt, task);
+            refuse_empty(task, "questions");
             count_prompt(task);
             tasks.push_back(std::move(task));
+        }
+    } else {
+        for (const auto & question : request.questions) {
+            for (size_t variant = 0; variant < n_variants(question); variant++) {
+                server_task task = server_task(SERVER_TASK_TYPE_DECISION);
+                task.id          = next_id();
+                fill_task(request.state, request.questions, question, variant, request.files, mctx, init_opt, task);
+                refuse_empty(task, "questions." + question.id);
+                count_prompt(task);
+                tasks.push_back(std::move(task));
+            }
         }
     }
 
@@ -2352,6 +2435,11 @@ size_t decision_task_budget(int cap, int n_parallel, int n_ctx_slot) {
 size_t server_decision_context::count_tasks(const server_decision_request & request) const {
     if (is_joint()) {
         return 1;
+    }
+    // one task holds every packed set of questions
+    const size_t n_set = set_size(request.questions);
+    if (n_set > 0) {
+        return (request.questions.size() + n_set - 1) / n_set;
     }
     size_t n = 0;
     for (const auto & question : request.questions) {

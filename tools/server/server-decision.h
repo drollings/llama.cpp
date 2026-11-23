@@ -113,7 +113,8 @@ struct server_decision_context {
     }
 
     // what the request asks for, checked against the limits of this model. The only entry point for parsing a body
-    server_decision_request parse_request(const json & body) const;
+    // support_audio_input: false if the server has no audio encoder, a spoken question is then rejected
+    server_decision_request parse_request(const json & body, bool support_audio_input = false) const;
 
     // false for a decision-only model, it serves no text generation
     bool can_generate() const {
@@ -122,7 +123,8 @@ struct server_decision_context {
     }
 
     // throw std::invalid_argument on bad input
-    std::vector<server_decision_question> parse_questions(const json & body) const;
+    // support_audio_input: false if the server has no audio encoder, a spoken question is then rejected
+    std::vector<server_decision_question> parse_questions(const json & body, bool support_audio_input) const;
 
     // the state as the model reads it, done once per request; returns the state for most models
     json prepare_state(const json & state) const;
@@ -155,7 +157,19 @@ struct server_decision_context {
             const mtmd_helper_init_opt & init_opt,
             server_task & task) const;
 
-    // one task per pass of each question, or the single task that answers every question at once, grouped so a shared prefix is evaluated once. next_id hands out the task ids. max_tasks bounds the tasks before any render (0 is unlimited); max_prompt_tokens bounds the rendered tokens.
+    // lfm3-d1: max questions per prompt, 0 if each question has its own prompt
+    size_t set_size(const std::vector<server_decision_question> & questions) const;
+
+    // set the prompt of these questions packed after their state, the result has the scores of all their options
+    void fill_task_set(
+            const json & state,
+            const std::vector<server_decision_question> & questions,
+            const std::vector<raw_buffer> & files,
+            mtmd_context * mctx,
+            const mtmd_helper_init_opt & init_opt,
+            server_task & task) const;
+
+    // one task per pass of each question, or the single task that answers every question at once, or one task per packed set of questions, grouped so a shared prefix is evaluated once. next_id hands out the task ids. max_tasks bounds the tasks before any render (0 is unlimited); max_prompt_tokens bounds the rendered tokens.
     server_decision_tasks build_tasks(
             const server_decision_request & request,
             const std::function<int()> &    next_id,
@@ -165,8 +179,9 @@ struct server_decision_context {
             size_t                          max_tasks,
             size_t                          max_prompt_tokens) const;
 
-    // how many tasks the request builds: one for a joint head, else one per variant of each question. Pure: no render, no tokenizer, so build_tasks() refuses on it before rendering.
+    // how many tasks the request builds: one for a joint head, one per packed set, else one per variant of each question. Pure: no render, no tokenizer, so build_tasks() refuses on it before rendering.
     size_t count_tasks(const server_decision_request & request) const;
+
     // scores: the raw model outputs of each variant
     json format_answer(const server_decision_question & question, const std::vector<std::vector<float>> & scores, bool has_media = false) const;
 
@@ -239,7 +254,8 @@ private:
 
 // the two halves of a body, both refuse with server_invalid_request naming the field. decision_parse_state appends the images to files. allow_null_state is only for models that answer without a state (lfm2-d1 with images only)
 // type defaults to NONE so existing tests that pass only (body, traits) keep compiling; production passes the model type for new-model branches
-std::vector<server_decision_question> decision_parse_questions(const json & body, const decision_model_traits & traits, common_decision_type type = COMMON_DECISION_TYPE_NONE);
+// support_audio_input: false if the server has no audio encoder, a spoken question of lfm3-d1-omni is then rejected
+std::vector<server_decision_question> decision_parse_questions(const json & body, const decision_model_traits & traits, common_decision_type type = COMMON_DECISION_TYPE_NONE, bool support_audio_input = false);
 json                                  decision_parse_state(const json & body, std::vector<raw_buffer> & files, bool allow_null_state = false, common_decision_type type = COMMON_DECISION_TYPE_NONE);
 
 // the options of one question in template order. Variant 1 is the reverse order, so the model cannot prefer a position over an option. d1_texts carries the per-question label texts of lfm2-d1, null for every other model
