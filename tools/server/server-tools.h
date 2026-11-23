@@ -21,12 +21,13 @@ struct server_tool {
     virtual std::string type() const { return "server"; }
 
     struct stream {
-        server_result_queue<server_task_result_ptr> & qr;
+        server_response & qr;
         int id;
         std::function<bool()> alive;
         void push(const std::string & chunk);
     };
-    virtual json invoke(json params, stream * st = nullptr) const = 0;
+    // should_stop: true once the caller stopped waiting, e.g. the client dropped the connection; a null should_stop means "never stop"
+    virtual json invoke(json params, stream * st = nullptr, const std::function<bool()> & should_stop = nullptr) const = 0;
 
     json to_json() const;
 };
@@ -37,7 +38,7 @@ struct server_tools {
     std::vector<std::unique_ptr<server_tool>> tools;
 
     // for streaming
-    server_result_queue<server_task_result_ptr> queue_res;
+    server_response queue_res;
     std::atomic<int> res_id{0};
 
     // set when --tools-runtime is configured; routes every tool call through an isolate

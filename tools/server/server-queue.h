@@ -29,6 +29,7 @@ private:
     bool sleeping = false;
     bool req_stop_sleeping = false;
     int64_t time_last_task = 0;
+    int n_inflight = 0; // requests that keep the server awake, see wait_until_no_sleep()
 
     // queues
     std::deque<server_task> queue_tasks;
@@ -77,7 +78,11 @@ public:
 
     // if sleeping, request exiting sleep state and wait until it is done
     // returns immediately if not sleeping
+    // the server then stays awake until the caller calls release_inflight()
     void wait_until_no_sleep();
+
+    // let the server sleep again once the caller no longer uses the server state
+    void release_inflight();
 
     bool is_sleeping() {
         std::unique_lock<std::mutex> lock(mutex_tasks);
@@ -159,15 +164,9 @@ private:
     void worker_stop();
 };
 
-// result queue for scheduler tasks: holds any result handle whose element type
-// exposes the task id it answers (broadcast additionally needs clone(), and is
-// only compiled when called). server_task_result_ptr is the production handle.
-template <typename T>
-struct server_result_queue {
-    // the queued handle must expose the task id it answers
-    static_assert(std::is_same_v<decltype(std::declval<typename T::element_type>().id), int>,
-                  "server_result_queue element type must have an int id field");
-
+// struct for managing server responses
+// in most cases, use server_response_reader to retrieve results
+struct server_response {
 private:
     bool running = true;
 
@@ -175,171 +174,55 @@ private:
     std::unordered_set<int> waiting_task_ids;
 
     // the main result queue (using ptr for polymorphism)
-    std::vector<T> queue_results;
+    std::vector<server_task_result_ptr> queue_results;
 
     std::mutex mutex_results;
     std::condition_variable condition_results;
 
 public:
     // add the id_task to the list of tasks waiting for response
-    void add_waiting_task_id(int id_task) {
-        RES_DBG("add task %d to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting_task_ids.size());
+    void add_waiting_task_id(int id_task);
 
-        std::unique_lock<std::mutex> lock(mutex_results);
-        waiting_task_ids.insert(id_task);
-    }
-
-    void add_waiting_task_ids(const std::unordered_set<int> & id_tasks) {
-        std::unique_lock<std::mutex> lock(mutex_results);
-
-        for (const auto & id_task : id_tasks) {
-            RES_DBG("add task %d to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting_task_ids.size());
-            waiting_task_ids.insert(id_task);
-        }
-    }
+    void add_waiting_task_ids(const std::unordered_set<int> & id_tasks);
 
     // when the request is finished, we can remove task associated with it
-    void remove_waiting_task_id(int id_task) {
-        RES_DBG("remove task %d from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting_task_ids.size());
-
-        std::unique_lock<std::mutex> lock(mutex_results);
-        waiting_task_ids.erase(id_task);
-        // make sure to clean up all pending results
-        queue_results.erase(
-            std::remove_if(queue_results.begin(), queue_results.end(), [id_task](const T & res) {
-                return res->id == id_task;
-            }),
-            queue_results.end());
-    }
+    void remove_waiting_task_id(int id_task);
 
     // remove multiple tasks from waiting list
-    void remove_waiting_task_ids(const std::unordered_set<int> & id_tasks) {
-        std::unique_lock<std::mutex> lock(mutex_results);
-
-        for (const auto & id_task : id_tasks) {
-            RES_DBG("remove task %d from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting_task_ids.size());
-            waiting_task_ids.erase(id_task);
-        }
-    }
+    void remove_waiting_task_ids(const std::unordered_set<int> & id_tasks);
 
     // This function blocks the thread until there is a response for one of the id_tasks
-    // locked scan-and-take shared by recv() and recv_with_timeout(): removes
-    // and returns the first queued result for one of the tasks, or nullptr
-    // when none is queued. caller holds mutex_results.
-    T take_locked(const std::unordered_set<int> & id_tasks) {
-        for (size_t i = 0; i < queue_results.size(); i++) {
-            if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
-                T res = std::move(queue_results[i]);
-                queue_results.erase(queue_results.begin() + i);
-                return res;
-            }
-        }
-        return nullptr;
-    }
-
-    T recv(const std::unordered_set<int> & id_tasks) {
-        while (true) {
-            std::unique_lock<std::mutex> lock(mutex_results);
-            condition_results.wait(lock, [&]{
-                if (!running) {
-                    RES_DBG("%s : queue result stop\n", "recv");
-                    std::terminate(); // we cannot return here since the caller is HTTP code
-                }
-                return !queue_results.empty();
-            });
-
-            if (T res = take_locked(id_tasks)) {
-                return res;
-            }
-        }
-
-        // should never reach here
-    }
+    server_task_result_ptr recv(const std::unordered_set<int> & id_tasks);
 
     // same as recv(), but have timeout in seconds
     // if timeout is reached, nullptr is returned
-    T recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
-        while (true) {
-            std::unique_lock<std::mutex> lock(mutex_results);
-
-            if (T res = take_locked(id_tasks)) {
-                return res;
-            }
-
-            std::cv_status cr_res = condition_results.wait_until(lock, deadline);
-            if (!running) {
-                RES_DBG("%s : queue result stop\n", __func__);
-                std::terminate(); // we cannot return here since the caller is HTTP code
-            }
-            if (cr_res == std::cv_status::timeout) {
-                return nullptr;
-            }
-        }
-
-        // should never reach here
-    }
+    server_task_result_ptr recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout);
 
     // single-task version of recv()
-    T recv(int id_task) {
-        std::unordered_set<int> id_tasks = {id_task};
-        return recv(id_tasks);
-    }
+    server_task_result_ptr recv(int id_task);
 
-    // Send a new result to a waiting id_task. a result with no waiter means
-    // the waiter went away (a lost add_waiting_task_id or a timed-out reader):
-    // loud on purpose, so a dropped response can never vanish silently.
-    void send(T && result) {
-        RES_DBG("sending result for task id = %d\n", result->id);
-
-        std::unique_lock<std::mutex> lock(mutex_results);
-        for (const auto & id_task : waiting_task_ids) {
-            if (result->id == id_task) {
-                RES_DBG("task id = %d pushed to result queue\n", result->id);
-
-                queue_results.emplace_back(std::move(result));
-                condition_results.notify_all();
-                return;
-            }
-        }
-        RES_WRN("no waiter for task id = %d, result dropped\n", result->id);
-    }
+    // Send a new result to a waiting id_task
+    void send(server_task_result_ptr && result);
 
     // broadcast a new result to all waiting tasks
     // (used by router mode)
-    void broadcast(T && result) {
-        std::unique_lock<std::mutex> lock(mutex_results);
-        for (const auto & id_task : waiting_task_ids) {
-            RES_DBG("task id = %d pushed to result queue\n", id_task);
-            T res_copy(result->clone());
-            res_copy->id = id_task; // override id with target task id
-            queue_results.emplace_back(std::move(res_copy));
-        }
-        condition_results.notify_all();
-    }
+    void broadcast(server_task_result_ptr && result);
 
     // terminate the waiting loop
-    void terminate() {
-        running = false;
-        condition_results.notify_all();
-    }
+    void terminate();
 };
 
-// legacy alias: upstream code (e.g. server-realtime) still names the concrete
-// production queue server_response. keep it so new upstream files compile
-// without edits while the generic template is the implementation.
-using server_response = server_result_queue<server_task_result_ptr>;
 
 // polling cadence for scheduler waits through server_response_reader
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-// RAII wrapper to make working with server_queue and server_result_queue easier
+// RAII wrapper to make working with server_queue and server_response easier
 // it provides a generator-like API for server responses
 // support pooling connection state and aggregating multiple results
 struct server_response_reader {
     std::unordered_set<int> id_tasks;
     server_queue & queue_tasks;
-    server_result_queue<server_task_result_ptr> & queue_results;
+    server_response & queue_results;
     size_t received_count = 0;
     bool cancelled = false;
     int polling_interval_seconds;
@@ -349,7 +232,7 @@ struct server_response_reader {
     std::vector<task_result_state> states;
 
     // should_stop function will be called each polling_interval_seconds
-    server_response_reader(server_queue & queue_tasks, server_result_queue<server_task_result_ptr> & queue_results, int polling_interval_seconds)
+    server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds)
         : queue_tasks(queue_tasks), queue_results(queue_results), polling_interval_seconds(polling_interval_seconds) {}
     ~server_response_reader() {
         stop();

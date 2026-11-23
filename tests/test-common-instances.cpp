@@ -1217,7 +1217,7 @@ static void test_instances_envelope_built_unbuilt(const common_params & base) {
 static void test_queue_stop_cancels_pending() {
     static_assert(HTTP_POLLING_SECONDS == 1, "polling cadence for scheduler waits");
     server_queue                                queue;
-    server_result_queue<server_task_result_ptr> response;
+    server_response response;
     std::atomic<bool> executed{false};
     queue.on_new_task([&](server_task && task, bool) -> bool {
         if (task.type == SERVER_TASK_TYPE_INSTANCE_OP) {
@@ -1243,18 +1243,6 @@ static void test_queue_stop_cancels_pending() {
     assert(!executed.load());
     assert(rd.next([]() { return true; }) == nullptr);
 }
-
-#if 0
-// compile check (keep disabled): a result handle whose element type has no int
-// id must fail on the queue's static_assert (uncomment to verify)
-struct test_queue_result_bad_id {
-    std::string id;
-};
-static void test_queue_wrong_type_rejected() {
-    server_result_queue<std::unique_ptr<test_queue_result_bad_id>> queue;
-    (void) queue;
-}
-#endif
 
 // a timed-out manager-to-scheduler task must not run late: with the scheduler
 // held by a blocking op, a short-deadline swap times out, and after the

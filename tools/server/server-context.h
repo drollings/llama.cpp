@@ -14,6 +14,7 @@
 #include <set>
 
 struct server_context_impl; // private implementation
+struct mtmd_helper_video_decoder; // see mtmd-helper.h
 
 struct server_context_meta {
     std::string build_info;
@@ -29,6 +30,7 @@ struct server_context_meta {
     bool has_cap_chat;
     bool has_cap_tts;
     bool has_audio_stream; // realtime transcription, see mtmd_support_audio_stream()
+    std::vector<std::string> tts_voices; // predefined voices of the audio generation model
     json json_ui_settings;
     int slot_n_ctx;
     enum llama_pooling_type pooling_type;
@@ -93,6 +95,10 @@ struct server_context {
 
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
+
+    // decode video with a custom decoder instead of ffmpeg, the decoder must outlive the server
+    // note: must be set before load_model() is called
+    void set_video_decoder(const mtmd_helper_video_decoder * decoder);
 
     // adjust the advertised model name / aliases after load (multi-instance mode);
     // not thread-safe, only used by the manager during setup
@@ -172,6 +178,7 @@ private:
     // scheduler answers 503 with the instance intact instead of wedging the
     // management plane (which is held across the call).
     server_task_result_ptr abort_slots(const std::string & reason, int64_t deadline_ms = -1);
+
 };
 
 
@@ -263,6 +270,7 @@ struct server_routes {
     server_http_context::handler_t post_embeddings_oai;
     server_http_context::handler_t post_rerank;
     server_http_context::handler_t post_tts;
+    server_http_context::handler_t post_speech_oai;
     server_http_context::handler_t post_systemone;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
@@ -283,6 +291,7 @@ private:
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
     std::unique_ptr<server_res_generator> handle_rerank_impl(const server_http_req & req);
+    std::unique_ptr<server_res_generator> handle_tts_impl(const server_http_req & req, json body);
     std::unique_ptr<server_res_generator> handle_count_tokens(const server_http_req & req, task_response_type res_type);
 
     // using unique_ptr to allow late initialization of const
@@ -292,7 +301,7 @@ private:
     server_context_impl & ctx_server;
 
     server_queue & queue_tasks;
-    server_result_queue<server_task_result_ptr> & queue_results;
+    server_response & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
 
     // cached responses, to be used during sleep
