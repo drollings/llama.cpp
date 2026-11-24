@@ -96,67 +96,16 @@ std::filesystem::path get_server_exec_path() {
 }
 
 json format_error_response(const std::string & message, const enum error_type type) {
-    std::string type_str;
-    int code = 500;
-    switch (type) {
-        case ERROR_TYPE_INVALID_REQUEST:
-            type_str = "invalid_request_error";
-            code = 400;
-            break;
-        case ERROR_TYPE_AUTHENTICATION:
-            type_str = "authentication_error";
-            code = 401;
-            break;
-        case ERROR_TYPE_NOT_FOUND:
-            type_str = "not_found_error";
-            code = 404;
-            break;
-        case ERROR_TYPE_SERVER:
-            type_str = "server_error";
-            code = 500;
-            break;
-        case ERROR_TYPE_PERMISSION:
-            type_str = "permission_error";
-            code = 403;
-            break;
-        case ERROR_TYPE_NOT_SUPPORTED:
-            type_str = "not_supported_error";
-            code = 501;
-            break;
-        case ERROR_TYPE_UNAVAILABLE:
-            type_str = "unavailable_error";
-            code = 503;
-            break;
-        case ERROR_TYPE_EXCEED_CONTEXT_SIZE:
-            type_str = "exceed_context_size_error";
-            code = 400;
-            break;
-        case ERROR_TYPE_INVALID_REQUEST_SEMANTIC:
-            type_str = "invalid_request_error";
-            code = 422;
-            break;
-        case ERROR_TYPE_PAYLOAD_TOO_LARGE:
-            type_str = "payload_too_large";
-            code = 413;
-            break;
-        case ERROR_TYPE_CLIENT_CLOSED:
-            type_str = "client_closed_request";
-            code = 499;
-            break;
-        case ERROR_TYPE_OVERLOADED:
-            type_str = "overloaded_error";
-            code = 529;
-            break;
-    }
-    return json {
-        {"code", code},
-        {"message", message},
-        {"type", type_str},
+    const server_error_info info = error_type_info(type);
+    return json{
+        { "code",    info.code },
+        { "message", message   },
+        { "type",    info.type },
     };
 }
 
 int error_status(const enum error_type type) {
-    return json_value(format_error_response("", type), "code", 500);
+    return error_type_info(type).code;
 }
 
 //
